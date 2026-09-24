@@ -1,0 +1,71 @@
+# ─── Build outputs ────────────────────────────────────────────────────────────
+build/
+cmake-build-*/
+compile_commands.json
+
+# ─── C++ artifacts ────────────────────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+*.d
+
+# ─── TLS certificates (generated locally, never commit) ──────────────────────
+certs/*.crt
+certs/*.key
+certs/*.pem
+certs/*.csr
+
+# ─── Exported ML models (generated, large) ───────────────────────────────────
+models/*.onnx
+models/*.cpp
+models/*.bin
+models/*.pkl
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+*.ipynb_checkpoints/
+
+# ─── ML data (large datasets, download via scripts) ──────────────────────────
+ml/data/*.csv
+ml/data/*.txt
+ml/data/*.json
+ml/data/*.pcap
+ml/data/*.gz
+!ml/data/README.md
+
+# ─── Logs & runtime ─────────────────────────────────────────────────────────
+*.log
+*.jsonl
+/run/
+
+# ─── Benchmark results (regenerated, keep scripts) ──────────────────────────
+bench/plots/*.png
+bench/plots/*.pdf
+bench/plots/*.svg
+bench/results/
+
+# ─── IDE / editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+
+# ─── OS junk ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Fuzz corpus & crashes ───────────────────────────────────────────────────
+tests/fuzz/corpus/
+tests/fuzz/crashes/
+tests/fuzz/artifacts/

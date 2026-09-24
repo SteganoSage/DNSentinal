@@ -1,0 +1,88 @@
+listen:
+  udp: "0.0.0.0:53"
+  tcp: "0.0.0.0:53"
+  dot:
+    addr: "0.0.0.0:853"
+    cert: certs/server.crt
+    key: certs/server.key
+  doh:
+    addr: "0.0.0.0:443"
+    path: "/dns-query"
+    cert: certs/server.crt
+    key: certs/server.key
+
+access:
+  allow:
+    - "127.0.0.0/8"
+    - "192.168.0.0/16"
+    - "10.0.0.0/8"
+
+resolver:
+  mode: recursive        # recursive | forward
+  root_hints: config/named.root
+  qname_minimisation: true
+  edns_buffer: 1232
+  use_0x20: true
+  max_upstream_queries: 30
+  max_referral_depth: 16
+  max_cname_chain: 8
+  query_timeout_ms: 800
+  overall_deadline_ms: 5000
+
+cache:
+  max_memory_mb: 256
+  shards: 16
+  min_ttl: 0
+  max_ttl: 86400
+  serve_stale:
+    enabled: true
+    stale_ttl: 30
+    max_stale_age: 86400
+  prefetch:
+    enabled: true
+    threshold_pct: 10    # trigger when <10% TTL remaining
+
+policy:
+  blocklists:
+    - config/lists/ads.txt
+    - config/lists/trackers.txt
+    - config/lists/malware.txt
+  allowlist: config/lists/allow.txt
+  check_cname_chain: true
+  rebinding_protection:
+    enabled: true
+    exempt_tlds: ["home", "lan", "local"]
+  block_response: null_ip  # null_ip | nxdomain
+  block_ttl: 60
+
+rate_limit:
+  per_client:
+    qps: 100
+    burst: 200
+  rrl:
+    responses_per_second: 10
+    slip: 2
+    window_seconds: 1
+
+ml:
+  mode: monitor           # monitor | enforce
+  dga:
+    model: models/dga_rf.cpp
+    threshold: 0.9
+    skip_top_n: 100000
+    cache_verdicts: true
+  analyzer_socket: /run/dnsentinel/events.sock
+  risk_thresholds:
+    low: 0.3
+    medium: 0.6
+    high: 0.9
+
+telemetry:
+  prometheus:
+    addr: "127.0.0.1:9153"
+  query_log:
+    enabled: true
+    path: /var/log/dnsentinel/queries.jsonl
+    retention_days: 7
+    anonymise_clients: false
+    ring_buffer_size: 8192
