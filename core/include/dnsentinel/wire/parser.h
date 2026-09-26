@@ -23,12 +23,19 @@ enum class ParseError {
     SectionOverflow,       // more records claimed than bytes available
     RDataLengthMismatch,   // declared RDLENGTH vs actual parsed content
     MalformedRData,
+    InvalidOpt,            // OPT outside additional, non-root owner, or duplicated
 };
 
 [[nodiscard]] std::string parse_error_to_string(ParseError e);
 
 /// Parse a complete DNS message from raw wire bytes.
 /// Returns the parsed Message or a ParseError.
+///
+/// - Header counts are as they appeared on the wire, so arcount includes
+///   the OPT record even though it is moved into Message::edns.
+/// - Every RR gets TrustRank::Additional (the lowest). Ranking needs the AA
+///   flag and bailiwick, which the resolver applies.
+/// - Bytes after the last record are ignored.
 [[nodiscard]]
 std::expected<Message, ParseError> parse(std::span<const uint8_t> data);
 

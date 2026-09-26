@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(dnsentinel VERSION 0.1.0 LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)  # std::expected
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -34,14 +34,26 @@ if(DNSENTINEL_SANITIZERS)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
+# ─── Fuzzing instrumentation ─────────────────────────────────────────────────
+# libFuzzer needs coverage feedback from the code under test, not just from
+# the fuzz target, so everything below is instrumented (googletest above is not).
+if(DNSENTINEL_ENABLE_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "DNSENTINEL_ENABLE_FUZZ needs clang: -DCMAKE_CXX_COMPILER=clang++")
+    endif()
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined
+                        -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
 # ─── Core library ────────────────────────────────────────────────────────────
 # Uncomment each source as its module lands (build order: implementation plan §1).
 add_library(dnsentinel_core STATIC
     # Wire format
-    # core/wire/parser.cpp
-    # core/wire/builder.cpp
+    core/wire/parser.cpp
+    core/wire/builder.cpp
     core/wire/name.cpp
-    # core/wire/edns.cpp
+    core/wire/edns.cpp
 
     # Networking
     # core/net/event_loop.cpp
@@ -113,8 +125,9 @@ endif()
 if(DNSENTINEL_ENABLE_TESTS)
     add_executable(dnsentinel_tests
         tests/unit/test_types.cpp
-        # tests/unit/wire/test_parser.cpp
-        # tests/unit/wire/test_builder.cpp
+        tests/unit/wire/test_parser.cpp
+        tests/unit/wire/test_builder.cpp
+        tests/unit/wire/test_edns.cpp
         tests/unit/wire/test_name.cpp
         # tests/unit/cache/test_cache.cpp
         # tests/unit/cache/test_negative_cache.cpp
@@ -136,6 +149,5 @@ endif()
 if(DNSENTINEL_ENABLE_FUZZ)
     add_executable(fuzz_parser tests/fuzz/fuzz_parser.cpp)
     target_link_libraries(fuzz_parser PRIVATE dnsentinel_core)
-    target_compile_options(fuzz_parser PRIVATE -fsanitize=fuzzer,address,undefined)
-    target_link_options(fuzz_parser PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_options(fuzz_parser PRIVATE -fsanitize=fuzzer)  # libFuzzer's main()
 endif()
