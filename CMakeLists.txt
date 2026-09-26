@@ -66,7 +66,7 @@ add_library(dnsentinel_core STATIC
     # core/resolver/qname_minimisation.cpp
 
     # Cache
-    # core/cache/cache.cpp
+    core/cache/cache.cpp
     # core/cache/negative_cache.cpp
     # core/cache/serve_stale.cpp
 
@@ -131,7 +131,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/wire/test_name.cpp
         tests/unit/net/test_event_loop.cpp
         tests/unit/net/test_udp_listener.cpp
-        # tests/unit/cache/test_cache.cpp
+        tests/unit/cache/test_cache.cpp
         # tests/unit/cache/test_negative_cache.cpp
         # tests/unit/security/test_bailiwick.cpp
         # tests/unit/security/test_zero_x20.cpp

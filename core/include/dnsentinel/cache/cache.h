@@ -4,9 +4,11 @@
 
 #include "dnsentinel/types.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -39,8 +41,10 @@ struct CacheConfig {
 
 struct CacheKey {
     Name     name;
-    uint16_t qtype;
+    uint16_t qtype  = 0;
     uint16_t qclass = 1;
+
+    bool operator==(const CacheKey&) const = default;  // name compares case-insensitively
 };
 
 /// Result of a cache lookup
@@ -53,10 +57,14 @@ struct LookupResult {
 /// Thread-safe sharded LRU DNS cache.
 class Cache {
 public:
-    explicit Cache(const CacheConfig& config);
+    using ClockFn = std::function<TimePoint()>;
+
+    /// `clock` exists so tests can control time; production uses the default.
+    explicit Cache(const CacheConfig& config, ClockFn clock = Clock::now);
     ~Cache();
 
-    /// Look up a cache entry. Returns nullopt on miss.
+    /// Look up a cache entry. Returns nullopt on miss. On a hit, each
+    /// record's TTL is the time remaining, in whole seconds.
     [[nodiscard]] LookupResult lookup(const CacheKey& key);
 
     /// Insert or update a cache entry. Respects trust ranking —
@@ -80,6 +88,10 @@ private:
     struct Shard;
     std::vector<std::unique_ptr<Shard>> shards_;
     CacheConfig config_;
+    ClockFn     clock_;
+    size_t      shard_budget_;  // max_memory_bytes split evenly across shards
+    std::atomic<uint64_t> hits_{0};
+    std::atomic<uint64_t> misses_{0};
 
     [[nodiscard]] size_t shard_for(const CacheKey& key) const;
 };
