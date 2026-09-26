@@ -231,4 +231,24 @@ std::vector<uint8_t> build_tcp(const Message& msg, const BuildOptions& opts) {
     return out;
 }
 
+Message make_response(const Message& query, RCode rcode) {
+    const auto code = static_cast<uint16_t>(rcode);
+
+    Message response;
+    response.header.id     = query.header.id;
+    response.header.qr     = true;
+    response.header.opcode = query.header.opcode;
+    response.header.rd     = query.header.rd;
+    response.header.ra     = true;
+    response.header.cd     = query.header.cd;
+    response.header.rcode  = static_cast<uint8_t>(code & 0x0F);
+    response.questions     = query.questions;
+    if (query.edns) {
+        response.edns = EdnsInfo{.udp_payload_size = kEdnsUdpPayloadSize,
+                                 .extended_rcode   = static_cast<uint8_t>(code >> 4),
+                                 .dnssec_ok        = query.edns->dnssec_ok};
+    }
+    return response;
+}
+
 }  // namespace dnsentinel::wire

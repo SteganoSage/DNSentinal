@@ -245,3 +245,32 @@ TEST(Builder, TcpFramingAndNoUdpLimit) {
     EXPECT_FALSE(parsed.header.tc);
     EXPECT_EQ(parsed.answers.size(), 100u);
 }
+
+// ─── make_response ──────────────────────────────────────────────────────────
+
+TEST(MakeResponse, EchoesQueryIdentity) {
+    Message query;
+    query.header.id = 0xBEEF;
+    query.header.rd = true;
+    query.header.cd = true;
+    query.questions.push_back({name("wWw.Example.com"), 28, 1});
+
+    Message r = make_response(query, RCode::NXDomain);
+    EXPECT_EQ(r.header.id, 0xBEEF);
+    EXPECT_TRUE(r.header.qr && r.header.ra && r.header.rd && r.header.cd);
+    EXPECT_FALSE(r.header.aa || r.header.tc || r.header.ad);
+    EXPECT_EQ(r.header.rcode, static_cast<uint8_t>(RCode::NXDomain));
+    EXPECT_EQ(r.questions, query.questions);
+    EXPECT_EQ(r.qname().original_case, query.qname().original_case);  // 0x20 echo
+    EXPECT_FALSE(r.edns.has_value());
+}
+
+TEST(MakeResponse, AnswersEdnsWithOurBufferAndDoBit) {
+    Message query;
+    query.questions.push_back({name("example.com"), 1, 1});
+    query.edns = EdnsInfo{.udp_payload_size = 4096, .dnssec_ok = true};
+
+    Message r = make_response(query);
+    ASSERT_TRUE(r.edns.has_value());
+    EXPECT_EQ(*r.edns, (EdnsInfo{.udp_payload_size = kEdnsUdpPayloadSize, .dnssec_ok = true}));
+}

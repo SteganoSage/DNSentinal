@@ -37,4 +37,12 @@ std::vector<uint8_t> build(const Message& msg, const BuildOptions& opts = {});
 [[nodiscard]]
 std::vector<uint8_t> build_tcp(const Message& msg, const BuildOptions& opts = {});
 
+/// Start a response to `query`: same ID, opcode, RD and CD bits and
+/// question section, with QR and RA set and the given rcode. If the query
+/// carried EDNS the response does too, advertising our payload size and
+/// echoing the DO bit (RFC 3225 §3). Rcodes above 15 go in the OPT's
+/// extended-rcode bits, so they need a query with EDNS.
+[[nodiscard]]
+Message make_response(const Message& query, RCode rcode = RCode::NoError);
+
 }  // namespace dnsentinel::wire

@@ -56,8 +56,8 @@ add_library(dnsentinel_core STATIC
     core/wire/edns.cpp
 
     # Networking
-    # core/net/event_loop.cpp
-    # core/net/udp_listener.cpp
+    core/net/event_loop.cpp
+    core/net/udp_listener.cpp
     # core/net/tcp_listener.cpp
 
     # Resolver
@@ -129,6 +129,8 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/wire/test_builder.cpp
         tests/unit/wire/test_edns.cpp
         tests/unit/wire/test_name.cpp
+        tests/unit/net/test_event_loop.cpp
+        tests/unit/net/test_udp_listener.cpp
         # tests/unit/cache/test_cache.cpp
         # tests/unit/cache/test_negative_cache.cpp
         # tests/unit/security/test_bailiwick.cpp
