@@ -35,45 +35,46 @@ if(DNSENTINEL_SANITIZERS)
 endif()
 
 # ─── Core library ────────────────────────────────────────────────────────────
+# Uncomment each source as its module lands (build order: implementation plan §1).
 add_library(dnsentinel_core STATIC
     # Wire format
-    core/wire/parser.cpp
-    core/wire/builder.cpp
+    # core/wire/parser.cpp
+    # core/wire/builder.cpp
     core/wire/name.cpp
-    core/wire/edns.cpp
+    # core/wire/edns.cpp
 
     # Networking
-    core/net/event_loop.cpp
-    core/net/udp_listener.cpp
-    core/net/tcp_listener.cpp
+    # core/net/event_loop.cpp
+    # core/net/udp_listener.cpp
+    # core/net/tcp_listener.cpp
 
     # Resolver
-    core/resolver/recursive_resolver.cpp
-    core/resolver/server_selection.cpp
-    core/resolver/qname_minimisation.cpp
+    # core/resolver/recursive_resolver.cpp
+    # core/resolver/server_selection.cpp
+    # core/resolver/qname_minimisation.cpp
 
     # Cache
-    core/cache/cache.cpp
-    core/cache/negative_cache.cpp
-    core/cache/serve_stale.cpp
+    # core/cache/cache.cpp
+    # core/cache/negative_cache.cpp
+    # core/cache/serve_stale.cpp
 
     # Security
-    core/security/randomisation.cpp
-    core/security/zero_x20.cpp
-    core/security/bailiwick.cpp
-    core/security/rrl.cpp
+    # core/security/randomisation.cpp
+    # core/security/zero_x20.cpp
+    # core/security/bailiwick.cpp
+    # core/security/rrl.cpp
 
     # Policy
-    core/policy/acl.cpp
-    core/policy/blocklist_trie.cpp
-    core/policy/cname_check.cpp
-    core/policy/rebinding.cpp
-    core/policy/rate_limiter.cpp
+    # core/policy/acl.cpp
+    # core/policy/blocklist_trie.cpp
+    # core/policy/cname_check.cpp
+    # core/policy/rebinding.cpp
+    # core/policy/rate_limiter.cpp
 
     # Telemetry
-    core/telemetry/event_bus.cpp
-    core/telemetry/metrics.cpp
-    core/telemetry/query_log.cpp
+    # core/telemetry/event_bus.cpp
+    # core/telemetry/metrics.cpp
+    # core/telemetry/query_log.cpp
 )
 
 target_include_directories(dnsentinel_core PUBLIC
@@ -88,39 +89,40 @@ target_link_libraries(dnsentinel_core PUBLIC
 
 # ─── DoT listener ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_DOT)
-    target_sources(dnsentinel_core PRIVATE core/net/dot_listener.cpp)
+    # target_sources(dnsentinel_core PRIVATE core/net/dot_listener.cpp)
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_DOT=1)
 endif()
 
 # ─── DoH listener ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_DOH)
-    target_sources(dnsentinel_core PRIVATE core/net/doh_listener.cpp)
+    # target_sources(dnsentinel_core PRIVATE core/net/doh_listener.cpp)
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_DOH=1)
 endif()
 
 # ─── ML fast-path ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_ML)
-    target_sources(dnsentinel_core PRIVATE core/ml/dga_classifier.cpp)
+    # target_sources(dnsentinel_core PRIVATE core/ml/dga_classifier.cpp)
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_ML=1)
 endif()
 
 # ─── Main executable ────────────────────────────────────────────────────────
-add_executable(dnsentinel core/main.cpp)
-target_link_libraries(dnsentinel PRIVATE dnsentinel_core)
+# add_executable(dnsentinel core/main.cpp)
+# target_link_libraries(dnsentinel PRIVATE dnsentinel_core)
 
 # ─── Tests ───────────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_TESTS)
     add_executable(dnsentinel_tests
-        tests/unit/wire/test_parser.cpp
-        tests/unit/wire/test_builder.cpp
+        tests/unit/test_types.cpp
+        # tests/unit/wire/test_parser.cpp
+        # tests/unit/wire/test_builder.cpp
         tests/unit/wire/test_name.cpp
-        tests/unit/cache/test_cache.cpp
-        tests/unit/cache/test_negative_cache.cpp
-        tests/unit/security/test_bailiwick.cpp
-        tests/unit/security/test_zero_x20.cpp
-        tests/unit/policy/test_blocklist_trie.cpp
-        tests/unit/policy/test_rebinding.cpp
-        tests/unit/ml/test_dga_classifier.cpp
+        # tests/unit/cache/test_cache.cpp
+        # tests/unit/cache/test_negative_cache.cpp
+        # tests/unit/security/test_bailiwick.cpp
+        # tests/unit/security/test_zero_x20.cpp
+        # tests/unit/policy/test_blocklist_trie.cpp
+        # tests/unit/policy/test_rebinding.cpp
+        # tests/unit/ml/test_dga_classifier.cpp
     )
     target_link_libraries(dnsentinel_tests PRIVATE
         dnsentinel_core
