@@ -61,7 +61,9 @@ add_library(dnsentinel_core STATIC
     # core/net/tcp_listener.cpp
 
     # Resolver
-    # core/resolver/recursive_resolver.cpp
+    core/resolver/recursive_resolver.cpp
+    core/resolver/root_hints.cpp
+    core/resolver/upstream.cpp
     # core/resolver/server_selection.cpp
     # core/resolver/qname_minimisation.cpp
 
@@ -73,7 +75,7 @@ add_library(dnsentinel_core STATIC
     # Security
     # core/security/randomisation.cpp
     # core/security/zero_x20.cpp
-    # core/security/bailiwick.cpp
+    core/security/bailiwick.cpp
     # core/security/rrl.cpp
 
     # Policy
@@ -132,8 +134,11 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/net/test_event_loop.cpp
         tests/unit/net/test_udp_listener.cpp
         tests/unit/cache/test_cache.cpp
+        tests/unit/resolver/test_root_hints.cpp
+        tests/unit/resolver/test_upstream.cpp
+        tests/unit/resolver/test_recursive_resolver.cpp
         # tests/unit/cache/test_negative_cache.cpp
-        # tests/unit/security/test_bailiwick.cpp
+        tests/unit/security/test_bailiwick.cpp
         # tests/unit/security/test_zero_x20.cpp
         # tests/unit/policy/test_blocklist_trie.cpp
         # tests/unit/policy/test_rebinding.cpp
@@ -142,6 +147,9 @@ if(DNSENTINEL_ENABLE_TESTS)
     target_link_libraries(dnsentinel_tests PRIVATE
         dnsentinel_core
         GTest::gtest_main
+    )
+    target_compile_definitions(dnsentinel_tests PRIVATE
+        DNSENTINEL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"  # tests read config/named.root
     )
     include(GoogleTest)
     gtest_discover_tests(dnsentinel_tests)

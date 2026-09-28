@@ -10,6 +10,7 @@
 /// from the socket or timer callback.
 
 #include "dnsentinel/cache/cache.h"
+#include "dnsentinel/resolver/root_hints.h"
 #include "dnsentinel/types.h"
 
 #include <cstdint>
@@ -37,18 +38,25 @@ enum class ResolveError {
 [[nodiscard]] std::string resolve_error_to_string(ResolveError e);
 
 struct ResolverConfig {
-    std::string root_hints_path = "config/named.root";
-    bool     qname_minimisation   = true;
-    bool     use_0x20             = true;
+    std::string root_hints_path = "config/named.root";  // loaded by the caller: see RootHints
+    bool     qname_minimisation   = true;   // not implemented yet (plan §6.1)
+    bool     use_0x20             = true;   // not implemented yet (plan §5.2)
     uint16_t edns_buffer          = 1232;
-    uint32_t max_upstream_queries = 30;
+    uint32_t max_upstream_queries = 30;     // per client query, sub-queries included
     uint16_t max_referral_depth   = 16;
     uint8_t  max_cname_chain      = 8;
-    uint32_t query_timeout_ms     = 800;
+    uint8_t  max_glueless_ns      = 5;      // NXNSAttack cap: NS names resolved per zone
+    uint32_t query_timeout_ms     = 800;    // first try; doubles after each timeout
+    uint32_t max_query_timeout_ms = 3000;
     uint32_t overall_deadline_ms  = 5000;
+    uint16_t upstream_port        = 53;     // tests and the lab only
 };
 
-/// Result of a successful resolution
+/// Result of a resolution that reached a definite outcome. That includes
+/// "the name does not exist" (response.header.rcode == NXDOMAIN) and "no
+/// records of this type" (NOERROR with no answers); the SOA that proves it
+/// is in response.authority. The answers start with any CNAMEs followed.
+/// A ResolveError means no outcome could be reached (answer SERVFAIL).
 struct ResolveResult {
     Message  response;
     uint32_t upstream_queries_used = 0;
@@ -61,8 +69,11 @@ using PrimeCallback   = std::function<void(std::expected<void, ResolveError>)>;
 /// The recursive resolver engine. Use it only from the loop's thread.
 class RecursiveResolver {
 public:
-    /// `loop` and `cache` must outlive the resolver.
-    RecursiveResolver(const ResolverConfig& config, net::EventLoop& loop, cache::Cache& cache);
+    /// `loop` and `cache` must outlive the resolver. `hints` come from
+    /// load_root_hints(config.root_hints_path), loaded by the caller so a
+    /// bad file fails at startup.
+    RecursiveResolver(const ResolverConfig& config, RootHints hints, net::EventLoop& loop,
+                      cache::Cache& cache);
 
     /// Abandons resolutions still in progress: their callbacks are never
     /// called. Callers that may outlive the resolver must not rely on them.

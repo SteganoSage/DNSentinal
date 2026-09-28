@@ -51,6 +51,14 @@ struct Name {
     /// Wire-format length (sum of 1+len per label, plus trailing 0x00)
     [[nodiscard]] size_t wire_length() const;
 
+    /// True if this name is `zone` itself or below it, comparing whole
+    /// labels case-insensitively: "www.example.com" is under "example.com"
+    /// and under the root, but "notexample.com" is not under "example.com".
+    [[nodiscard]] bool is_subdomain_of(const Name& zone) const;
+
+    /// This name without its leftmost label; the root's parent is the root.
+    [[nodiscard]] Name parent() const;
+
     /// Hash of the canonical form; consistent with operator==.
     [[nodiscard]] size_t hash() const noexcept;
 

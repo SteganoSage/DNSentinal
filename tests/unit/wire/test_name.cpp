@@ -152,3 +152,25 @@ TEST(Name, UsableAsUnorderedMapKey) {
     EXPECT_EQ(m.size(), 2u);
     EXPECT_EQ(m.at(must_parse("EXAMPLE.com")), 2);
 }
+
+// ─── Hierarchy ──────────────────────────────────────────────────────────────
+
+TEST(Name, IsSubdomainOf) {
+    Name www = must_parse("www.Example.com");
+    EXPECT_TRUE(www.is_subdomain_of(must_parse("example.COM")));
+    EXPECT_TRUE(www.is_subdomain_of(must_parse("com")));
+    EXPECT_TRUE(www.is_subdomain_of(must_parse(".")));
+    EXPECT_TRUE(www.is_subdomain_of(www));  // a name is inside its own zone
+    EXPECT_FALSE(must_parse("example.com").is_subdomain_of(www));
+    // Whole labels only: a string suffix is not a subdomain.
+    EXPECT_FALSE(must_parse("notexample.com").is_subdomain_of(must_parse("example.com")));
+    EXPECT_FALSE(must_parse("example.org").is_subdomain_of(must_parse("example.com")));
+}
+
+TEST(Name, Parent) {
+    Name n = must_parse("wWw.Example.com");
+    EXPECT_EQ(n.parent(), must_parse("example.com"));
+    EXPECT_EQ(n.parent().original_case, (std::vector<std::string>{"Example", "com"}));
+    EXPECT_EQ(n.parent().parent().parent(), must_parse("."));
+    EXPECT_EQ(must_parse(".").parent(), must_parse("."));
+}

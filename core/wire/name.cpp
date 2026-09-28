@@ -3,6 +3,8 @@
 
 #include "dnsentinel/types.h"
 
+#include <algorithm>
+
 namespace dnsentinel {
 
 namespace {
@@ -114,6 +116,23 @@ size_t Name::wire_length() const {
     size_t len = 1;  // trailing root label
     for (const auto& label : labels) len += 1 + label.size();
     return len;
+}
+
+bool Name::is_subdomain_of(const Name& zone) const {
+    if (zone.labels.size() > labels.size()) return false;
+    return std::equal(zone.labels.rbegin(), zone.labels.rend(), labels.rbegin());
+}
+
+Name Name::parent() const {
+    Name p;
+    if (labels.empty()) return p;
+    p.labels.assign(labels.begin() + 1, labels.end());
+    if (original_case.size() == labels.size()) {
+        p.original_case.assign(original_case.begin() + 1, original_case.end());
+    } else {
+        p.original_case = p.labels;
+    }
+    return p;
 }
 
 size_t Name::hash() const noexcept {
