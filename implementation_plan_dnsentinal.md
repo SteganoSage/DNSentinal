@@ -55,7 +55,7 @@ This is the order modules must be built. Each depends on the ones above it:
 2. wire/parser + wire/builder (parse and build DNS packets)
 3. net/event_loop + net/udp_listener (receive and send UDP packets)
 4. resolver/recursive_resolver (walk the delegation tree)
-5. cache/cache (store and retrieve answers)
+5. cache/cache (store and retrieve answers)  ← build the basic cache before 4: the resolver takes a Cache& and needs it for zone cuts and referrals
 6. security/* (harden upstream queries)
 7. policy/* (filter queries and responses)
 8. net/tcp_listener (TCP transport)
@@ -253,6 +253,9 @@ Store labels in both canonical (lowercase) and original-case form as you parse t
 - The CMakeLists.txt is already created. It compiles the core library as a static lib, links OpenSSL and pthreads, and has toggles for DoT, DoH, ML, tests, fuzz, and sanitizers.
 - Set up **clang-format** with a `.clang-format` file for consistent style.
 - Set up **GitHub Actions CI**: build with GCC and Clang, run tests, run with ASan+UBSan.
+- **Toolchain notes (found during implementation):**
+  - Use **Clang ≥ 19**. Clang 18 reports `__cpp_concepts` as `201907`, so GCC 13's libstdc++ hides `std::expected` and the build fails. The fuzz target needs `clang-19` + `libclang-rt-19-dev` (libFuzzer runtime); build commands are in the header of `tests/fuzz/fuzz_parser.cpp`, seed packets in `tests/fuzz/seeds/`.
+  - **ThreadSanitizer on WSL2 / newer kernels** fails with "unexpected memory mapping" because of high-entropy ASLR. Configure with `-DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST` (so the build doesn't run the binary) and run tests under `setarch $(uname -m) -R`.
 
 **Lab namespaces:**
 - Create a shell script (`lab/namespaces/setup_lab.sh`) that creates Linux network namespaces:
@@ -261,8 +264,19 @@ Store labels in both canonical (lowercase) and original-case form as you parse t
   - `ns-infected` — will run DGA simulator and tunnel client
   - `ns-attacker` — will run Scapy poisoning scripts
   - `ns-fakeauth` — our own authoritative server for poisoning tests
+  - `ns-labroot`, `ns-labtld` — the "mini-internet" (below)
 - Connect them with virtual ethernet pairs (`veth`) and bridges
 - Add `tc netem` rules to simulate realistic latency (e.g. 20ms to "upstream")
+
+**Lab mini-internet (fully offline DNS hierarchy):**
+- `ns-labroot` serves the root zone `.` and delegates `lab.` to `ns-labtld`; `ns-labtld` delegates `example.lab.`, `target.lab.` (poisoning target) and `t.example.lab.` (tunnel endpoint) to servers in `ns-fakeauth`.
+- A lab root hints file (`config/lab.root`) lists the lab root server; in lab mode the resolver's `root_hints_path` points at it instead of the IANA hints. No resolver code changes are needed.
+- Run the lab authoritative servers with a lightweight server and zone files in `lab/zones/` (e.g. NSD), plus a small Python server (e.g. `dnslib`) where a test needs a server that misbehaves on purpose (slow, drops, wrong case, bad referrals).
+- **Why:** iterative resolution, poisoning and tunnelling all work with no internet access (demo day doesn't depend on venue Wi-Fi); the resolver can be tested on real root → TLD → authoritative paths even on machines where outbound port 53 is blocked; and the tunnel demo no longer needs a cloud VM or a purchased domain (§6.7).
+
+**Lab tools:** `sudo apt install bind9-dnsutils iodine tcpdump` (dig, tunnel, captures), `pip install scapy dnslib`, and later `dnsperf` for E2. Named namespaces (`ip netns`) need sudo; iodine needs `/dev/net/tun`.
+
+**WSL2:** the WSL2 kernel (6.x) has everything the lab needs — network namespaces, veth, bridges, `tc netem` and TUN were checked. See §9 for how to make a WSL2-hosted resolver reachable from phones.
 
 **DGA dataset collection (M4 starts in parallel):**
 - Download the Tranco top-1M list (benign domains)
@@ -424,6 +438,12 @@ This is the same exponential moving average used for TCP RTT estimation. Pick th
 **Timeouts and deadlines.** Two limits:
 - Per-upstream-query timeout: starts at 800ms, doubles on retry (exponential backoff), capped at ~3s
 - Overall per-client-query deadline: 5 seconds. If we haven't found an answer by then, return SERVFAIL. This prevents a malicious zone from holding our resources forever.
+
+**Asynchronous implementation.** The pseudocode above says "wait", but the resolver runs on the single-threaded event loop, so it must never block: one slow zone would stall every client. Each resolution is a state machine. "Send and wait" becomes: send from the resolver's socket, register a timer, return to the loop, and resume in the socket or timer callback. The API (`recursive_resolver.h`) is `resolve(question, callback)`: the callback is called exactly once, never before `resolve()` returns (so callers are never re-entered), and the overall deadline guarantees it is called. The UDP listener's `Responder` plugs straight into that callback.
+
+**Stub zones (for mixed lab + internet demos).** A config rule such as `stub_zones: { "lab.": ["10.10.0.2"] }` makes queries at or under that name start at the given servers instead of the root. With it, one resolver can browse the real internet *and* serve the `.lab` attack domains from the lab mini-internet (§2.5) at the same time. Small addition: it only changes the starting zone cut. Unbound calls this `stub-zone`.
+
+**Testing.** Don't depend on reaching the real root servers: outbound port 53 is blocked on some networks and dev environments. Unit tests run small fake authoritative servers inside the test process on `127.0.0.x` addresses (a fake root → TLD → authoritative chain), including deliberately misbehaving ones (timeouts, lame delegations, upward referrals, CNAME loops, NS cycles, NXNS-style referrals). Integration tests use the lab mini-internet; E1 uses the real internet.
 
 ### 3.4 Module: Basic Cache (`cache/cache.cpp`)
 
@@ -713,6 +733,8 @@ A Scapy-based attack script (`lab/attacks/kaminsky.py`) that demonstrates the Ka
 
 **Metric:** Number of forged packets sent until successful poisoning (or failure after N million packets).
 
+**Setup:** run it against the lab mini-internet (§2.5): the target is `target.lab`, served by `ns-fakeauth`, with the resolver in lab mode. The attacker races forged referrals for `target.lab` against the real answer, and nothing leaves the lab.
+
 > [!WARNING]
 > All poisoning attacks are run ONLY inside isolated network namespaces against our own resolver and our own fake authoritative server. Never against real resolvers or domains.
 
@@ -761,7 +783,9 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 **Certificate management:**
 - For lab testing: generate a self-signed CA and server certificate with a script.
 - For real deployment: Let's Encrypt with a domain name.
-- Android's "Private DNS" setting can be pointed at any DoT server. This is how we demo DoT with a real phone.
+- Android's "Private DNS" setting is how we demo DoT with a real phone, **but it takes a hostname, not an IP, and only accepts a publicly trusted certificate**. It checks against the system CA store, and user-installed CAs are ignored. A self-signed or mkcert certificate will not work.
+  - **Plan:** buy one cheap domain, point a hostname (e.g. `dns.<domain>`) at the resolver's LAN IP, and get a Let's Encrypt certificate with the **DNS-01 challenge**, which works even though the resolver is not reachable from the internet.
+  - The same domain can also host the optional real-internet tunnel endpoint (§6.7).
 
 ### 6.3 Module: DoH Listener (`net/doh_listener.cpp`)
 
@@ -779,7 +803,7 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 
 **For Phase 5, start with HTTP/1.1 over TLS.** Upgrade to HTTP/2 with nghttp2 if time permits.
 
-**How to test:** Firefox and Chrome can be configured with a custom DoH URL (`https://your-resolver-ip/dns-query`). This is the demo for DoH.
+**How to test:** Firefox and Chrome can be configured with a custom DoH URL (`https://your-resolver-ip/dns-query`). This is the demo for DoH. The browser must trust the certificate: either reuse the Let's Encrypt certificate from §6.2, or, for a laptop-only setup, create a local CA with `mkcert` (which can issue certificates for IP addresses) and install it in the browser.
 
 ### 6.4 Module: DGA Classifier — Fast Path (`core/ml/dga_classifier.cpp`)
 
@@ -867,6 +891,8 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 | Ratio of NXDOMAIN responses | Some tunnel setups generate NXDOMAINs |
 
 **Model:** Random Forest or Gradient Boosting on these tabular features. Also evaluate an Isolation Forest (unsupervised) trained only on benign traffic.
+
+**Generating tunnel traffic:** run the tunnel inside the lab mini-internet (§2.5). `iodined` (and the dnscat2 server) act as the authoritative server for `t.example.lab` in a lab namespace, the client runs in `ns-infected`, and every query goes through DNSentinel in lab mode. No cloud VM or purchased domain is needed, and the traffic never leaves the machine. Vary the data rate (10–500 kbps, plus deliberately slow tunnels) for E8. A cloud VM with a real domain stays optional, for showing the same thing over the real internet.
 
 **Detection latency:** The detector can only fire after one full 60-second window, so the minimum detection delay is ~60 seconds. This is reported as a metric.
 
@@ -1055,6 +1081,12 @@ Each team member writes the sections they own:
 6. Cut the upstream link → serve-stale keeps recent sites working
 7. Show key evaluation graphs
 
+### Demo Logistics
+- **Two modes.** Steps 1–2 need the real internet: the resolver uses the IANA root hints, and phones and laptops browse normally. Steps 3–6 run in the lab mini-internet (§2.5). With stub zones (§3.3), one resolver does both at once: real browsing plus `.lab` attack domains.
+- **Reaching a WSL2-hosted resolver.** By default WSL2 sits behind a NAT inside Windows, so phones on the Wi-Fi cannot reach it. Either enable mirrored networking (`networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\.wslconfig`, Windows 11 22H2+) and allow ports 53/853/443 in the Windows firewall, or run the demo resolver on a native Linux laptop. Test this well before demo day.
+- **Venue network.** Venue or campus Wi-Fi may block outbound DNS or port 853. The lab part runs fully offline. For the browsing part, bring a phone hotspot as the upstream link, and keep a short screen recording of steps 1–2 as a backup.
+- **Certificates.** The phone's Private DNS needs the Let's Encrypt certificate from §6.2. Renew it before the demo; certificates last 90 days.
+
 ### Viva Prep
 Everyone must be able to explain every module, not just their own. Drill the Q&A from §15 of the README.
 
@@ -1093,6 +1125,9 @@ Everyone must be able to explain every module, not just their own. Drill the Q&A
 |---|---|---|---|
 | Parser bugs cause crashes on real traffic | Medium | High | Fuzz from week 2, ASan in CI, conservative parsing (reject on doubt) |
 | Iterative resolution too slow vs Unbound | High | Medium | Expected — we're not trying to match Unbound. Measure and explain the gap honestly. Focus on correctness first. |
+| Recursive resolver not working by the M-A milestone | Medium | High | Add forward mode (`resolver.mode: forward` already exists in the config): send queries with RD=1 to one upstream resolver. It takes about a day and unblocks blocklists, ML integration and the dashboard on real traffic while the recursive resolver is finished. It is a fallback, not a replacement. |
+| Outbound port 53 blocked on a dev machine or network | Medium | Medium | Test the resolver against in-process fake authoritative servers and the lab mini-internet (§2.5, §3.3); only E1 needs the real internet. |
+| Demo network blocks DNS/DoT, or phones can't reach the resolver | Medium | High | Lab mini-internet runs offline; mirrored WSL2 networking or a native Linux laptop; phone hotspot as upstream; recorded backup (§9 Demo Logistics). |
 | DoH HTTP/2 implementation too complex | Medium | Medium | Fall back to HTTP/1.1. Still functional, just less efficient. |
 | ML false positives on legitimate traffic | Medium | High | Popular-domain allowlist, monitor-only mode as default, time-limited blocks, one-click override on dashboard |
 | Broken servers reject minimised queries | Low | Low | RFC 9156 fallback logic: retry with full name for that zone |
