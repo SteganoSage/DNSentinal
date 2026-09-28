@@ -149,7 +149,12 @@ struct RecursiveResolver::Impl {
     Impl(const ResolverConfig& cfg, RootHints root_hints, net::EventLoop& event_loop,
          cache::Cache& answer_cache)
         : config(cfg), hints(std::move(root_hints)), loop(event_loop), cache(answer_cache),
-          upstream(event_loop) {}
+          upstream(event_loop) {
+        for (const auto& stub : config.stub_zones) {
+            auto& servers = stubs[stub.zone];
+            servers.insert(servers.end(), stub.servers.begin(), stub.servers.end());
+        }
+    }
 
     ~Impl() {
         // Callbacks are dropped. The upstream client closes its own sockets.
@@ -164,6 +169,7 @@ struct RecursiveResolver::Impl {
     net::EventLoop&                                    loop;
     cache::Cache&                                      cache;
     UpstreamClient                                     upstream;
+    std::unordered_map<Name, std::vector<in_addr_t>>   stubs;  // zone → its servers
     uint64_t                                           next_task_id = 1;
     std::unordered_map<uint64_t, std::unique_ptr<Task>> tasks;
 
@@ -303,9 +309,17 @@ struct RecursiveResolver::Impl {
         next_server(id);
     }
 
-    /// The deepest ancestor of t.qname with cached NS records, else the root.
+    /// The deepest ancestor of t.qname that is a stub zone or has cached NS
+    /// records, else the root. A stub zone beats cached NS records for the
+    /// same zone, but delegations cached below it (which its servers handed
+    /// out) are still used.
     void start_at_closest_zone(Task& t) {
         for (Name z = t.qname;; z = z.parent()) {
+            if (auto stub = stubs.find(z); stub != stubs.end()) {
+                reset_zone(t, z);
+                for (in_addr_t a : stub->second) add_server(t, a);
+                return;
+            }
             auto ns = cache.lookup({z, kTypeNS, kClassIN});
             if (ns.entry && !ns.entry->is_negative && !ns.entry->records.empty()) {
                 enter_zone(t, z, ns.entry->records);
@@ -322,16 +336,21 @@ struct RecursiveResolver::Impl {
         }
     }
 
-    /// Make `zone`, served by `ns_records`, the current zone cut. Server
-    /// addresses come from `glue` (fresh from a referral) or the cache.
-    void enter_zone(Task& t, Name zone, const std::vector<RR>& ns_records,
-                    const std::vector<RR>& glue = {}) {
+    /// Make `zone` the current zone cut, with no servers known yet.
+    void reset_zone(Task& t, Name zone) {
         t.zone = std::move(zone);
         t.servers.clear();
         t.unresolved.clear();
         t.tried.clear();
         t.glueless_lookups = 0;
         t.timeout          = milliseconds(config.query_timeout_ms);
+    }
+
+    /// Make `zone`, served by `ns_records`, the current zone cut. Server
+    /// addresses come from `glue` (fresh from a referral) or the cache.
+    void enter_zone(Task& t, Name zone, const std::vector<RR>& ns_records,
+                    const std::vector<RR>& glue = {}) {
+        reset_zone(t, std::move(zone));
 
         for (const auto& rr : ns_records) {
             const auto* ns = std::get_if<RDataNS>(&rr.rdata);

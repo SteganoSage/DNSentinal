@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace dnsentinel::net {
 class EventLoop;
@@ -37,6 +38,16 @@ enum class ResolveError {
 
 [[nodiscard]] std::string resolve_error_to_string(ResolveError e);
 
+/// A zone whose names are resolved by asking `servers` directly instead of
+/// starting at the root (Unbound's stub-zone). Lets one resolver browse the
+/// real internet and serve the lab's `lab.` zone at the same time. The
+/// servers must be authoritative for the zone; delegations they hand out
+/// below it are followed as usual.
+struct StubZone {
+    Name                  zone;
+    std::vector<uint32_t> servers;  // IPv4, network byte order (as in RDataA)
+};
+
 struct ResolverConfig {
     std::string root_hints_path = "config/named.root";  // loaded by the caller: see RootHints
     bool     qname_minimisation   = true;   // not implemented yet (plan §6.1)
@@ -50,6 +61,7 @@ struct ResolverConfig {
     uint32_t max_query_timeout_ms = 3000;
     uint32_t overall_deadline_ms  = 5000;
     uint16_t upstream_port        = 53;     // tests and the lab only
+    std::vector<StubZone> stub_zones;
 };
 
 /// Result of a resolution that reached a definite outcome. That includes

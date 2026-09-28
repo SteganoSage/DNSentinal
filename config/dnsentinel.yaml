@@ -28,6 +28,8 @@ resolver:
   max_cname_chain: 8
   query_timeout_ms: 800
   overall_deadline_ms: 5000
+  # stub_zones:              # names under a zone start at its servers, not the root
+  #   lab.: ["10.10.0.2"]    # e.g. the lab mini-internet (plan §2.5, §3.3)
 
 cache:
   max_memory_mb: 256

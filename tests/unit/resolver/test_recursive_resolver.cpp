@@ -466,6 +466,48 @@ TEST_F(ResolverTest, OnlyTheInternetClassIsResolved) {
     EXPECT_EQ(total_queries(), 0);
 }
 
+// ─── Stub zones ─────────────────────────────────────────────────────────────
+
+TEST_F(ResolverTest, StubZoneSkipsTheRoot) {
+    config.stub_zones = {{name("example.test"), {ipv4(ip(3).c_str()).addr}}};
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(r->upstream_queries_used, 1u);
+    EXPECT_EQ(root->queries, 0);
+    EXPECT_EQ(tld->queries, 0);
+    EXPECT_EQ(ex1->queries, 1);
+
+    // Names outside the stub zone still start at the root.
+    ASSERT_TRUE(resolve("www.glueless.test", RRType::A).has_value());
+    EXPECT_GT(root->queries, 0);
+}
+
+TEST_F(ResolverTest, DelegationsBelowAStubZoneAreFollowed) {
+    config.stub_zones = {{name("test"), {ipv4(ip(2).c_str()).addr}}};
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(root->queries, 0);
+    EXPECT_EQ(tld->queries, 1);
+    EXPECT_EQ(ex1->queries + ex2->queries, 1);
+}
+
+TEST_F(ResolverTest, StubZoneBeatsACachedDelegationForTheSameZone) {
+    FakeAuth* other = add_server(9, "example.test");
+    other->add("www.example.test", RRType::A, ipv4("6.6.6.6"));
+    cache.insert({name("example.test"), 2, 1}, {make_rr("example.test", RRType::NS, RDataNS{name("ns.other.lab")})},
+                 TrustRank::Answer, 3600);
+    cache.insert({name("ns.other.lab"), 1, 1}, {make_rr("ns.other.lab", RRType::A, ipv4(ip(9).c_str()))},
+                 TrustRank::Answer, 3600);
+
+    config.stub_zones = {{name("example.test"), {ipv4(ip(3).c_str()).addr}}};
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(other->queries, 0);
+}
+
 // ─── API guarantees ─────────────────────────────────────────────────────────
 
 TEST_F(ResolverTest, CallbackNeverRunsInsideResolve) {

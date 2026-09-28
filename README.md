@@ -800,6 +800,7 @@ dnsentinel/
 │   ├── security/             ← randomisation, 0x20, bailiwick, RRL
 │   ├── policy/               ← ACL, blocklist trie, CNAME check, rebinding
 │   ├── ml/                   ← DGA inference (generated tree code / ONNX)
+│   ├── server/               ← config loading, query pipeline (listeners → resolver)
 │   └── telemetry/            ← event bus, metrics
 ├── analyzer/                 ← Python slow path (tunnelling, NXDOMAIN bursts, fusion)
 ├── ml/                       ← training notebooks, feature code, model export

@@ -16,9 +16,23 @@ option(DNSENTINEL_SANITIZERS    "Enable ASan + UBSan"             OFF)
 # ─── Dependencies ────────────────────────────────────────────────────────────
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
+include(FetchContent)
+
+# yaml-cpp reads config/dnsentinel.yaml. Fetched so no system package is needed.
+set(YAML_CPP_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_TOOLS   OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_INSTALL       OFF CACHE BOOL "" FORCE)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)  # yaml-cpp 0.8.0 asks for 3.4, which CMake 4 refuses
+FetchContent_Declare(
+    yaml-cpp
+    GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+    GIT_TAG        0.8.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(yaml-cpp)
 
 if(DNSENTINEL_ENABLE_TESTS)
-    include(FetchContent)
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
@@ -89,6 +103,10 @@ add_library(dnsentinel_core STATIC
     # core/telemetry/event_bus.cpp
     # core/telemetry/metrics.cpp
     # core/telemetry/query_log.cpp
+
+    # Server: config loading, the query pipeline
+    core/server/config.cpp
+    core/server/query_processor.cpp
 )
 
 target_include_directories(dnsentinel_core PUBLIC
@@ -100,6 +118,7 @@ target_link_libraries(dnsentinel_core PUBLIC
     OpenSSL::Crypto
     Threads::Threads
 )
+target_link_libraries(dnsentinel_core PRIVATE yaml-cpp::yaml-cpp)
 
 # ─── DoT listener ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_DOT)
@@ -120,8 +139,8 @@ if(DNSENTINEL_ENABLE_ML)
 endif()
 
 # ─── Main executable ────────────────────────────────────────────────────────
-# add_executable(dnsentinel core/main.cpp)
-# target_link_libraries(dnsentinel PRIVATE dnsentinel_core)
+add_executable(dnsentinel core/main.cpp)
+target_link_libraries(dnsentinel PRIVATE dnsentinel_core)
 
 # ─── Tests ───────────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_TESTS)
@@ -139,6 +158,8 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/resolver/test_recursive_resolver.cpp
         # tests/unit/cache/test_negative_cache.cpp
         tests/unit/security/test_bailiwick.cpp
+        tests/unit/server/test_config.cpp
+        tests/unit/server/test_query_processor.cpp
         # tests/unit/security/test_zero_x20.cpp
         # tests/unit/policy/test_blocklist_trie.cpp
         # tests/unit/policy/test_rebinding.cpp
@@ -149,7 +170,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         GTest::gtest_main
     )
     target_compile_definitions(dnsentinel_tests PRIVATE
-        DNSENTINEL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"  # tests read config/named.root
+        DNSENTINEL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"  # tests read files in config/
     )
     include(GoogleTest)
     gtest_discover_tests(dnsentinel_tests)
