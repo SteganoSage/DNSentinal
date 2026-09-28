@@ -25,12 +25,15 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->udp.address, "0.0.0.0");
     EXPECT_EQ(c->udp.port, 53);
     EXPECT_EQ(c->udp.max_response_size, 1232);
+    EXPECT_EQ(c->tcp.address, "0.0.0.0");
+    EXPECT_EQ(c->tcp.port, 53);
     EXPECT_EQ(c->resolver.root_hints_path, "config/named.root");
     EXPECT_EQ(c->resolver.query_timeout_ms, 800u);
     EXPECT_EQ(c->resolver.overall_deadline_ms, 5000u);
     EXPECT_EQ(c->cache.max_memory_bytes, size_t{256} << 20);
     EXPECT_EQ(c->cache.num_shards, 16u);
-    for (const char* feature : {"listen.tcp", "listen.dot", "listen.doh", "resolver.qname_minimisation",
+    EXPECT_FALSE(lists(*c, "listen.tcp"));
+    for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation",
                                 "resolver.use_0x20", "cache.serve_stale", "access", "policy", "telemetry"}) {
         EXPECT_TRUE(lists(*c, feature)) << feature;
     }
@@ -71,6 +74,19 @@ TEST(Config, ParsesStubZones) {
     EXPECT_EQ(stubs[1].zone, name("corp.example"));
 }
 
+TEST(Config, TcpListensWhereUdpDoesUnlessToldOtherwise) {
+    auto same = parse_config("listen:\n  udp: \"127.0.0.1:5353\"\n");
+    ASSERT_TRUE(same.has_value()) << same.error();
+    EXPECT_EQ(same->tcp.address, "127.0.0.1");
+    EXPECT_EQ(same->tcp.port, 5353);
+
+    auto apart = parse_config("listen:\n  udp: \"127.0.0.1:5353\"\n  tcp: \"[::1]:5354\"\n");
+    ASSERT_TRUE(apart.has_value()) << apart.error();
+    EXPECT_EQ(apart->tcp.address, "::1");
+    EXPECT_EQ(apart->tcp.port, 5354);
+    EXPECT_EQ(apart->udp.port, 5353);
+}
+
 TEST(Config, ParsesIpv6ListenAddress) {
     auto c = parse_config("listen:\n  udp: \"[::1]:5353\"\n");
     ASSERT_TRUE(c.has_value()) << c.error();
@@ -101,6 +117,7 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"listen:\n  udp: \"::1:53\"\n", "must be \"address:port\""},
         {"listen:\n  udp: \"300.0.0.1:53\"\n", "invalid IP address '300.0.0.1'"},
         {"listen:\n  udp: \"127.0.0.1:0\"\n", "port must be between 1 and 65535"},
+        {"listen:\n  tcp: \"localhost:53\"\n", "listen.tcp: invalid IP address 'localhost'"},
         {"resolver: { edns_buffer: 1232\n", "invalid YAML"},
         {"resolver:\n  stub_zones:\n    lab.: [\"fd00::2\"]\n", "line 3: resolver.stub_zones: IPv6 server fd00::2"},
         {"resolver:\n  stub_zones:\n    lab.: [\"lab-root\"]\n", "invalid server address 'lab-root'"},

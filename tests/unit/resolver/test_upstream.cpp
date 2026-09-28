@@ -1,6 +1,7 @@
 #include "dnsentinel/resolver/upstream.h"
 
 #include "dnsentinel/net/event_loop.h"
+#include "dnsentinel/net/tcp_listener.h"
 #include "dnsentinel/wire/builder.h"
 #include "dnsentinel/wire/parser.h"
 #include "../wire/wire_test_util.h"
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <set>
 #include <span>
@@ -230,4 +232,117 @@ TEST_F(UpstreamTest, EveryQueryGetsAFreshPortAndARandomId) {
     EXPECT_EQ(ports.size(), 32u);  // all in flight at once, each on its own socket
     EXPECT_GE(ids.size(), 30u);    // 16-bit random IDs rarely collide
     EXPECT_FALSE(sequential);
+}
+
+// ─── TCP ────────────────────────────────────────────────────────────────────
+
+namespace {
+
+/// A TCP DNS server on 127.0.0.1, built from our own listener. `answer`
+/// decides each reply; nullopt means never reply.
+std::unique_ptr<net::TcpListener> tcp_server(net::EventLoop& loop,
+                                             std::function<std::optional<Message>(const Message&)> answer) {
+    auto l = net::TcpListener::create(loop, {.address = "127.0.0.1", .port = 0},
+                                      [answer](Message q, const net::ClientInfo&, net::Responder respond) {
+                                          if (auto r = answer(q)) respond(*r);
+                                      });
+    EXPECT_TRUE(l.has_value()) << (l ? "" : l.error().message());
+    return l ? std::move(*l) : nullptr;
+}
+
+/// ~1.6 KB of A records: more than a UDP answer carries.
+std::optional<Message> big_answer(const Message& q) {
+    Message r   = wire::make_response(q);
+    r.header.aa = true;
+    for (uint32_t i = 0; i < 100; ++i) r.answers.push_back(make_rr("www.example.test", RRType::A, RDataA{i}));
+    return r;
+}
+
+}  // namespace
+
+TEST_F(UpstreamTest, TcpQueryGetsTheWholeAnswer) {
+    auto server = tcp_server(*loop, big_answer);
+    ASSERT_TRUE(server);
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    client.send(
+        loopback(server->port()), query_for("www.example.test"), 2s,
+        [&](Result r) {
+            result = std::move(r);
+            loop->stop();
+        },
+        UpstreamTransport::Tcp);
+    run_for(3s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->has_value());
+    EXPECT_EQ((*result)->answers.size(), 100u);
+    EXPECT_FALSE((*result)->header.tc);
+    EXPECT_EQ(client.stats().sent_tcp, 1u);
+    EXPECT_EQ(client.stats().answered, 1u);
+}
+
+TEST_F(UpstreamTest, TcpWrongAnswerIsANetworkError) {
+    auto server = tcp_server(*loop, [](const Message& q) {
+        Message r = wire::make_response(q);
+        r.header.id ^= 1;
+        return std::optional(r);
+    });
+    ASSERT_TRUE(server);
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    client.send(
+        loopback(server->port()), query_for("www.example.test"), 2s,
+        [&](Result r) {
+            result = std::move(r);
+            loop->stop();
+        },
+        UpstreamTransport::Tcp);
+    run_for(3s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error(), UpstreamError::NetworkError);
+    EXPECT_EQ(client.stats().mismatched, 1u);
+}
+
+TEST_F(UpstreamTest, TcpTimesOutWhenNothingAnswers) {
+    auto server = tcp_server(*loop, [](const Message&) { return std::optional<Message>(); });
+    ASSERT_TRUE(server);
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    client.send(
+        loopback(server->port()), query_for("www.example.test"), 50ms,
+        [&](Result r) {
+            result = std::move(r);
+            loop->stop();
+        },
+        UpstreamTransport::Tcp);
+    run_for(2s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error(), UpstreamError::Timeout);
+}
+
+TEST_F(UpstreamTest, TcpToAClosedPortIsANetworkError) {
+    uint16_t closed_port;
+    {
+        auto temp = tcp_server(*loop, big_answer);
+        ASSERT_TRUE(temp);
+        closed_port = temp->port();
+    }  // closed: connecting is refused
+
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    const auto start = Clock::now();
+    client.send(
+        loopback(closed_port), query_for("www.example.test"), 5s,
+        [&](Result r) {
+            result = std::move(r);
+            loop->stop();
+        },
+        UpstreamTransport::Tcp);
+    run_for(6s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error(), UpstreamError::NetworkError);
+    EXPECT_LT(Clock::now() - start, 1s);
 }

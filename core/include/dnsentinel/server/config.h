@@ -5,6 +5,7 @@
 /// resolver, not quietly fall back to defaults.
 
 #include "dnsentinel/cache/cache.h"
+#include "dnsentinel/net/tcp_listener.h"
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
 
@@ -17,11 +18,12 @@ namespace dnsentinel::server {
 
 struct Config {
     net::UdpListenerConfig   udp;
+    net::TcpListenerConfig   tcp;  // listen.tcp, else wherever UDP listens
     resolver::ResolverConfig resolver;
     cache::CacheConfig       cache;
 
     /// Features the config turns on (in the file, or by default) that this
-    /// build doesn't implement yet ("listen.tcp", "policy", ...), so startup
+    /// build doesn't implement yet ("listen.dot", "policy", ...), so startup
     /// can say they are ignored instead of leaving the operator to assume
     /// they work.
     std::vector<std::string> not_implemented;

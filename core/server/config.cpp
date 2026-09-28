@@ -108,34 +108,34 @@ private:
 };
 
 /// "0.0.0.0:53" or "[::]:53".
-void read_listen_address(Section& section, const std::string& key, net::UdpListenerConfig& out) {
+void read_listen_address(Section& section, const std::string& key, std::string& address, uint16_t& port) {
     auto node = section.take(key);
     if (!node) return;
     const std::string name  = section.name(key);
     const std::string text  = scalar_or_empty(*node);
     const std::string usage = name + " must be \"address:port\", e.g. \"0.0.0.0:53\" or \"[::]:53\"";
 
-    std::string host, port;
+    std::string host, port_text;
     int         family = AF_INET;
     if (text.starts_with('[')) {
         const size_t close = text.find(']');
         if (close == std::string::npos || text.compare(close + 1, 1, ":") != 0) fail(*node, usage);
-        host   = text.substr(1, close - 1);
-        port   = text.substr(close + 2);
-        family = AF_INET6;
+        host      = text.substr(1, close - 1);
+        port_text = text.substr(close + 2);
+        family    = AF_INET6;
     } else {
         const size_t colon = text.find(':');
         if (colon == std::string::npos || text.find(':', colon + 1) != std::string::npos) fail(*node, usage);
-        host = text.substr(0, colon);
-        port = text.substr(colon + 1);
+        host      = text.substr(0, colon);
+        port_text = text.substr(colon + 1);
     }
 
     in6_addr buffer{};  // big enough for either family
     if (inet_pton(family, host.c_str(), &buffer) != 1) fail(*node, name + ": invalid IP address '" + host + "'");
-    auto number = to_uint(port);
+    auto number = to_uint(port_text);
     if (!number || *number == 0 || *number > 65535) fail(*node, name + ": port must be between 1 and 65535");
-    out.address = host;
-    out.port    = static_cast<uint16_t>(*number);
+    address = host;
+    port    = static_cast<uint16_t>(*number);
 }
 
 /// stub_zones: { "lab.": ["10.10.0.2", ...], ... }
@@ -179,8 +179,11 @@ Config parse(const YAML::Node& document) {
     Section top(document, "");
 
     Section listen(top.take("listen"), "listen");
-    read_listen_address(listen, "udp", c.udp);
-    for (const char* key : {"tcp", "dot", "doh"}) {
+    read_listen_address(listen, "udp", c.udp.address, c.udp.port);
+    c.tcp.address = c.udp.address;  // unless listen.tcp says otherwise
+    c.tcp.port    = c.udp.port;
+    read_listen_address(listen, "tcp", c.tcp.address, c.tcp.port);
+    for (const char* key : {"dot", "doh"}) {
         if (listen.take(key)) c.not_implemented.push_back(listen.name(key));
     }
     listen.finish();

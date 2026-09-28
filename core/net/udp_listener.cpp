@@ -3,10 +3,10 @@
 
 #include "dnsentinel/net/udp_listener.h"
 
+#include "socket_address.h"
 #include "dnsentinel/wire/builder.h"
 #include "dnsentinel/wire/parser.h"
 
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -48,11 +48,9 @@ LocalAddress read_local_address(msghdr& msg) {
     return std::monostate{};
 }
 
-socklen_t address_length(const sockaddr_storage& addr) {
-    return addr.ss_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
-}
-
 }  // namespace
+
+using detail::address_length;
 
 // ─── Socket (outlives the listener only as a weak reference) ────────────────
 
@@ -119,21 +117,10 @@ void UdpListener::Socket::send(const Message& response, const sockaddr_storage& 
 
 std::expected<std::unique_ptr<UdpListener>, std::error_code>
 UdpListener::create(EventLoop& loop, const UdpListenerConfig& config, QueryHandler handler) {
-    sockaddr_storage addr{};
-    auto* v4 = reinterpret_cast<sockaddr_in*>(&addr);
-    auto* v6 = reinterpret_cast<sockaddr_in6*>(&addr);
-    if (inet_pton(AF_INET, config.address.c_str(), &v4->sin_addr) == 1) {
-        v4->sin_family = AF_INET;
-        v4->sin_port   = htons(config.port);
-    } else {
-        addr = {};
-        if (inet_pton(AF_INET6, config.address.c_str(), &v6->sin6_addr) != 1) {
-            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
-        }
-        v6->sin6_family = AF_INET6;
-        v6->sin6_port   = htons(config.port);
-    }
-    const int family = addr.ss_family;
+    auto parsed = detail::make_address(config.address, config.port);
+    if (!parsed) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    const sockaddr_storage addr   = *parsed;
+    const int              family = addr.ss_family;
 
     auto socket = std::make_shared<Socket>();
     socket->fd  = ::socket(family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -163,9 +150,7 @@ UdpListener::create(EventLoop& loop, const UdpListenerConfig& config, QueryHandl
     if (getsockname(socket->fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) < 0) {
         return std::unexpected(last_error());
     }
-    const uint16_t port = ntohs(family == AF_INET
-                                    ? reinterpret_cast<const sockaddr_in*>(&bound)->sin_port
-                                    : reinterpret_cast<const sockaddr_in6*>(&bound)->sin6_port);
+    const uint16_t port = detail::port_of(bound);
 
     std::unique_ptr<UdpListener> listener(new UdpListener(
         loop, std::move(socket), port, config.max_response_size, std::move(handler)));

@@ -133,6 +133,8 @@ struct RecursiveResolver::Impl {
         std::vector<in_addr_t> servers;     // known addresses of its name servers
         std::vector<Name>      unresolved;  // its name servers with no known address
         std::vector<in_addr_t> tried;
+        in_addr_t              asked    = 0;      // the server asked last
+        bool                   over_tcp = false;  // ... and whether over TCP
         uint8_t                glueless_lookups = 0;
         uint16_t               referrals        = 0;
         milliseconds           timeout{};
@@ -415,14 +417,16 @@ struct RecursiveResolver::Impl {
         next_server(parent_id);
     }
 
-    void send_query(uint64_t id, in_addr_t address) {
+    void send_query(uint64_t id, in_addr_t address, UpstreamTransport transport = UpstreamTransport::Udp) {
         Task& t = *find(id);
         if (t.budget->queries >= config.max_upstream_queries) {
             finish(id, std::unexpected(ResolveError::MaxQueriesExceeded));
             return;
         }
         ++t.budget->queries;
-        t.tried.push_back(address);
+        if (transport == UpstreamTransport::Udp) t.tried.push_back(address);  // a TCP retry is the same try
+        t.asked    = address;
+        t.over_tcp = transport == UpstreamTransport::Tcp;
 
         Message query;
         query.header.rd = false;  // iterative: we do the recursion ourselves
@@ -433,10 +437,9 @@ struct RecursiveResolver::Impl {
         server.sin_family      = AF_INET;
         server.sin_port        = htons(config.upstream_port);
         server.sin_addr.s_addr = address;
-        t.upstream = upstream.send(server, std::move(query), t.timeout,
-                                   [this, id](std::expected<Message, UpstreamError> r) {
-                                       on_response(id, std::move(r));
-                                   });
+        t.upstream = upstream.send(
+            server, std::move(query), t.timeout,
+            [this, id](std::expected<Message, UpstreamError> r) { on_response(id, std::move(r)); }, transport);
     }
 
     void on_response(uint64_t id, std::expected<Message, UpstreamError> response) {
@@ -470,9 +473,18 @@ struct RecursiveResolver::Impl {
         Task& t = *find(id);
         const auto rcode = static_cast<RCode>(response.header.rcode);
 
-        // TC: the full answer needs TCP (plan §4.1). Any error rcode: this
-        // server can't help. Either way, try another server.
-        if (response.header.tc || (rcode != RCode::NoError && rcode != RCode::NXDomain)) {
+        // TC: the answer didn't fit in UDP. Ask the same server again over
+        // TCP (plan §4.1); if even that comes back truncated, give up on it.
+        if (response.header.tc) {
+            if (t.over_tcp) {
+                next_server(id);
+            } else {
+                send_query(id, t.asked, UpstreamTransport::Tcp);
+            }
+            return;
+        }
+        // Any error rcode: this server can't help.
+        if (rcode != RCode::NoError && rcode != RCode::NXDomain) {
             next_server(id);
             return;
         }

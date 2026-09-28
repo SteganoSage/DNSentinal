@@ -72,7 +72,7 @@ add_library(dnsentinel_core STATIC
     # Networking
     core/net/event_loop.cpp
     core/net/udp_listener.cpp
-    # core/net/tcp_listener.cpp
+    core/net/tcp_listener.cpp
 
     # Resolver
     core/resolver/recursive_resolver.cpp
@@ -152,6 +152,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/wire/test_name.cpp
         tests/unit/net/test_event_loop.cpp
         tests/unit/net/test_udp_listener.cpp
+        tests/unit/net/test_tcp_listener.cpp
         tests/unit/cache/test_cache.cpp
         tests/unit/resolver/test_root_hints.cpp
         tests/unit/resolver/test_upstream.cpp
@@ -174,6 +175,16 @@ if(DNSENTINEL_ENABLE_TESTS)
     )
     include(GoogleTest)
     gtest_discover_tests(dnsentinel_tests)
+
+    # The daemon end to end, offline, in a private network namespace.
+    # Reported as skipped where unprivileged user namespaces are disabled.
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME offline_e2e
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/offline_e2e.py
+                         $<TARGET_FILE:dnsentinel>)
+        set_tests_properties(offline_e2e PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
 endif()
 
 # ─── Fuzz targets ────────────────────────────────────────────────────────────

@@ -1,9 +1,11 @@
 #pragma once
 /// A tiny authoritative DNS server for tests: serves one zone on a loopback
-/// address, refers queries for delegated child zones, answers from its
-/// records (following in-zone CNAMEs), and returns NXDOMAIN / NODATA with
-/// the zone's SOA otherwise. `tamper` and `delay` make it misbehave.
+/// address over UDP and TCP, refers queries for delegated child zones,
+/// answers from its records (following in-zone CNAMEs), and returns
+/// NXDOMAIN / NODATA with the zone's SOA otherwise. `tamper`, `delay` and
+/// `truncate_udp` make it misbehave.
 
+#include "dnsentinel/net/tcp_listener.h"
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/wire/builder.h"
 #include "../wire/wire_test_util.h"
@@ -39,11 +41,16 @@ public:
         soa.rdata = RDataSOA{child_name("ns", zone_), child_name("hostmaster", zone_), 1, 3600, 600, 86400, 300};
         soa_      = soa;
 
-        auto listener = net::UdpListener::create(
-            loop, {.address = ip, .port = port, .max_response_size = 4096},
-            [this](Message query, const net::ClientInfo&, net::Responder respond) { on_query(query, respond); });
+        auto handler = [this](Message query, const net::ClientInfo& client, net::Responder respond) {
+            on_query(query, client.transport, respond);
+        };
+        auto listener = net::UdpListener::create(loop, {.address = ip, .port = port, .max_response_size = 4096}, handler);
         EXPECT_TRUE(listener.has_value()) << ip << ":" << port << " " << (listener ? "" : listener.error().message());
-        if (listener) listener_ = std::move(*listener);
+        if (!listener) return;
+        listener_ = std::move(*listener);
+        auto tcp  = net::TcpListener::create(loop, {.address = ip, .port = listener_->port()}, handler);
+        EXPECT_TRUE(tcp.has_value()) << ip << ":" << listener_->port() << " " << (tcp ? "" : tcp.error().message());
+        if (tcp) tcp_ = std::move(*tcp);
     }
 
     [[nodiscard]] uint16_t port() const { return listener_ ? listener_->port() : 0; }
@@ -67,8 +74,10 @@ public:
     /// Misbehave: edit the response, or return false to drop it.
     std::function<bool(const Message& query, Message& response)> tamper;
     std::chrono::milliseconds                                    delay{0};
+    bool truncate_udp = false;  // over UDP, send only TC=1, as for an answer too big for it
 
-    int                   queries = 0;
+    int                   queries     = 0;
+    int                   tcp_queries = 0;  // of `queries`
     std::vector<Question> seen;
 
 private:
@@ -78,10 +87,17 @@ private:
         std::vector<RR> glue;
     };
 
-    void on_query(const Message& query, const net::Responder& respond) {
+    void on_query(const Message& query, net::Transport transport, const net::Responder& respond) {
         ++queries;
+        if (transport == net::Transport::Tcp) ++tcp_queries;
         if (!query.questions.empty()) seen.push_back(query.questions.front());
         Message response = answer(query);
+        if (truncate_udp && transport == net::Transport::Udp) {
+            response.header.tc = true;
+            response.answers.clear();
+            response.authority.clear();
+            response.additional.clear();
+        }
         if (tamper && !tamper(query, response)) return;
         if (delay.count() > 0) {
             loop_.add_timer(delay, [respond, response] { respond(response); });
@@ -154,6 +170,7 @@ private:
     std::vector<RR>                   records_;
     std::vector<Delegation>           delegations_;
     std::unique_ptr<net::UdpListener> listener_;
+    std::unique_ptr<net::TcpListener> tcp_;
 };
 
 }  // namespace dnsentinel::test

@@ -1,10 +1,11 @@
 /// @file main.cpp
 /// The dnsentinel daemon: load the config and root hints, start the
-/// resolver and the UDP listener, and run the event loop until SIGINT or
-/// SIGTERM.
+/// resolver and the UDP and TCP listeners, and run the event loop until
+/// SIGINT or SIGTERM.
 
 #include "dnsentinel/cache/cache.h"
 #include "dnsentinel/net/event_loop.h"
+#include "dnsentinel/net/tcp_listener.h"
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
 #include "dnsentinel/resolver/root_hints.h"
@@ -40,9 +41,18 @@ void usage(std::FILE* out) {
                  "  -h, --help           show this help\n");
 }
 
-std::string endpoint(const net::UdpListenerConfig& udp) {
-    const bool v6 = udp.address.find(':') != std::string::npos;
-    return (v6 ? "[" + udp.address + "]" : udp.address) + ":" + std::to_string(udp.port);
+std::string endpoint(const std::string& address, uint16_t port) {
+    const bool v6 = address.find(':') != std::string::npos;
+    return (v6 ? "[" + address + "]" : address) + ":" + std::to_string(port);
+}
+
+/// Explain why a listener couldn't start.
+void cannot_listen(const char* transport, const std::string& where, uint16_t port, std::error_code error,
+                   const char* argv0) {
+    log(std::string("cannot listen on ") + transport + " " + where + ": " + error.message());
+    if (error == std::errc::permission_denied && port < 1024) {
+        log(std::string("ports below 1024 need a capability: sudo setcap 'cap_net_bind_service=+ep' ") + argv0);
+    }
 }
 
 bool is_loopback(const std::string& address) {
@@ -95,9 +105,10 @@ int main(int argc, char** argv) {
     if (!config->not_implemented.empty()) {
         warn("not implemented yet, ignored: " + join(config->not_implemented));
     }
-    if (!is_loopback(config->udp.address)) {
-        warn("no access control yet (plan §5.5): anyone who can reach " + endpoint(config->udp) +
-             " can use this resolver");
+    const std::string udp_at = endpoint(config->udp.address, config->udp.port);
+    const std::string tcp_at = endpoint(config->tcp.address, config->tcp.port);
+    if (!is_loopback(config->udp.address) || !is_loopback(config->tcp.address)) {
+        warn("no access control yet (plan §5.5): anyone who can reach the listeners can use this resolver");
     }
     for (const auto& stub : config->resolver.stub_zones) {
         std::vector<std::string> servers;
@@ -115,15 +126,17 @@ int main(int argc, char** argv) {
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
     server::QueryProcessor      processor(resolver);
 
-    auto udp = net::UdpListener::create(
-        **loop, config->udp, [&processor](Message query, const net::ClientInfo& client, net::Responder respond) {
-            processor.handle(std::move(query), client, std::move(respond));
-        });
+    auto handler = [&processor](Message query, const net::ClientInfo& client, net::Responder respond) {
+        processor.handle(std::move(query), client, std::move(respond));
+    };
+    auto udp = net::UdpListener::create(**loop, config->udp, handler);
     if (!udp) {
-        log("cannot listen on udp " + endpoint(config->udp) + ": " + udp.error().message());
-        if (udp.error() == std::errc::permission_denied && config->udp.port < 1024) {
-            log(std::string("ports below 1024 need a capability: sudo setcap 'cap_net_bind_service=+ep' ") + argv[0]);
-        }
+        cannot_listen("udp", udp_at, config->udp.port, udp.error(), argv[0]);
+        return 1;
+    }
+    auto tcp = net::TcpListener::create(**loop, config->tcp, handler);
+    if (!tcp) {
+        cannot_listen("tcp", tcp_at, config->tcp.port, tcp.error(), argv[0]);
         return 1;
     }
 
@@ -143,7 +156,7 @@ int main(int argc, char** argv) {
         }
     });
 
-    log("listening on udp " + endpoint(config->udp));
+    log("listening on udp " + udp_at + " and tcp " + tcp_at);
     (*loop)->run();
     log("shutting down");
     action.sa_handler = SIG_DFL;  // a second Ctrl-C now just exits

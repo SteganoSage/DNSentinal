@@ -295,7 +295,7 @@ TEST_F(ResolverTest, OverallDeadlineBoundsResolution) {
     EXPECT_LT(Clock::now() - start, 1s);
 }
 
-TEST_F(ResolverTest, RefusedAndTruncatedResponsesMoveOnToAnotherServer) {
+TEST_F(ResolverTest, RefusedResponsesMoveOnToAnotherServer) {
     ex1->tamper = [](const Message&, Message& r) {
         r.header.rcode = static_cast<uint8_t>(RCode::Refused);
         r.answers.clear();
@@ -304,14 +304,28 @@ TEST_F(ResolverTest, RefusedAndTruncatedResponsesMoveOnToAnotherServer) {
     for (int i = 0; i < 6; ++i) {
         EXPECT_TRUE(resolve("w" + std::to_string(i) + ".example.test", RRType::A).has_value()) << i;
     }
-    ex1->tamper = [](const Message&, Message& r) {
-        r.header.tc = true;  // the real answer would need TCP (plan §4.1)
+}
+
+TEST_F(ResolverTest, TruncatedAnswerIsFetchedOverTcp) {
+    ex1->truncate_udp = ex2->truncate_udp = true;
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(ex1->tcp_queries + ex2->tcp_queries, 1);  // the same server, asked again over TCP
+    EXPECT_EQ(ex1->queries + ex2->queries, 2);
+    EXPECT_EQ(r->upstream_queries_used, 4u);
+}
+
+TEST_F(ResolverTest, TruncatedEvenOverTcpMovesOnToAnotherServer) {
+    ex1->tamper = [](const Message&, Message& r) {  // TC on every transport: broken
+        r.header.tc = true;
         r.answers.clear();
         return true;
     };
-    for (int i = 6; i < 12; ++i) {
+    for (int i = 0; i < 6; ++i) {
         EXPECT_TRUE(resolve("w" + std::to_string(i) + ".example.test", RRType::A).has_value()) << i;
     }
+    EXPECT_EQ(ex2->tcp_queries, 0);
 }
 
 // ─── Attacks and resource limits ────────────────────────────────────────────

@@ -1,6 +1,6 @@
 /// @file resolver/upstream.cpp
-/// One UDP query to one upstream server: fresh socket, random ID,
-/// response validation, timeout.
+/// One query to one upstream server, over UDP or TCP: fresh socket, random
+/// ID, response validation, timeout.
 
 #include "dnsentinel/resolver/upstream.h"
 
@@ -20,6 +20,12 @@ namespace {
 
 constexpr size_t kMaxDatagram = 65535;
 
+/// Is `msg` the response to our query: same ID and question?
+bool answers(const std::expected<Message, wire::ParseError>& msg, uint16_t txid, const Question& question) {
+    return msg && msg->header.qr && msg->header.id == txid && msg->questions.size() == 1 &&
+           msg->questions.front() == question;
+}
+
 }  // namespace
 
 UpstreamClient::UpstreamClient(net::EventLoop& loop) : loop_(loop), buffer_(kMaxDatagram) {}
@@ -29,8 +35,10 @@ UpstreamClient::~UpstreamClient() {
 }
 
 UpstreamClient::QueryId UpstreamClient::send(const sockaddr_in& server, Message query,
-                                             std::chrono::milliseconds timeout, Callback done) {
-    const QueryId id = next_id_++;
+                                             std::chrono::milliseconds timeout, Callback done,
+                                             UpstreamTransport transport) {
+    const bool    tcp = transport == UpstreamTransport::Tcp;
+    const QueryId id  = next_id_++;
     Pending& p = pending_[id];
     p.done     = std::move(done);
     // arc4random is a CSPRNG (glibc >= 2.36 seeds it from getrandom()), so
@@ -48,15 +56,27 @@ UpstreamClient::QueryId UpstreamClient::send(const sockaddr_in& server, Message 
         return id;
     };
 
-    p.fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    p.fd = socket(AF_INET, (tcp ? SOCK_STREAM : SOCK_DGRAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (p.fd < 0) return fail_soon();
     // connect() picks a random ephemeral source port and makes the kernel
-    // drop datagrams from any other address or port.
-    if (connect(p.fd, reinterpret_cast<const sockaddr*>(&server), sizeof server) < 0) return fail_soon();
+    // drop datagrams from any other address or port. For TCP it starts the
+    // handshake; the socket turns writable when that completes.
+    if (connect(p.fd, reinterpret_cast<const sockaddr*>(&server), sizeof server) < 0 &&
+        !(tcp && errno == EINPROGRESS)) {
+        return fail_soon();
+    }
 
-    const std::vector<uint8_t> bytes = wire::build(query, {.max_size = 512});
-    if (::send(p.fd, bytes.data(), bytes.size(), 0) < 0) return fail_soon();
-    if (loop_.add_fd(p.fd, net::kReadable, [this, id](uint32_t) { on_readable(id); })) return fail_soon();
+    if (tcp) {
+        p.out = wire::build_tcp(query);
+        if (loop_.add_fd(p.fd, net::kWritable, [this, id](uint32_t events) { on_tcp_event(id, events); })) {
+            return fail_soon();
+        }
+        ++stats_.sent_tcp;
+    } else {
+        const std::vector<uint8_t> bytes = wire::build(query, {.max_size = 512});
+        if (::send(p.fd, bytes.data(), bytes.size(), 0) < 0) return fail_soon();
+        if (loop_.add_fd(p.fd, net::kReadable, [this, id](uint32_t) { on_readable(id); })) return fail_soon();
+    }
 
     ++stats_.sent;
     p.timer = loop_.add_timer(timeout, [this, id] {
@@ -109,11 +129,57 @@ void UpstreamClient::on_readable(QueryId id) {
         }
 
         auto msg = wire::parse(std::span<const uint8_t>(buffer_.data(), static_cast<size_t>(n)));
-        const bool matches = msg && msg->header.qr && msg->header.id == p.txid &&
-                             msg->questions.size() == 1 && msg->questions.front() == p.question;
-        if (!matches) {
+        if (!answers(msg, p.txid, p.question)) {
             ++stats_.mismatched;
             continue;  // keep waiting for the real answer
+        }
+        ++stats_.answered;
+        finish(id, std::move(*msg));
+        return;
+    }
+}
+
+void UpstreamClient::on_tcp_event(QueryId id, uint32_t events) {
+    auto it = pending_.find(id);
+    if (it == pending_.end()) return;
+    Pending& p = it->second;
+    auto broke_off = [&] {
+        ++stats_.errors;
+        finish(id, std::unexpected(UpstreamError::NetworkError));
+    };
+
+    if (p.written < p.out.size()) {  // connecting, then sending the query
+        if (events & (EPOLLERR | EPOLLHUP)) return broke_off();  // refused, unreachable or reset
+        while (p.written < p.out.size()) {
+            const ssize_t n = ::send(p.fd, p.out.data() + p.written, p.out.size() - p.written, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+                return broke_off();
+            }
+            p.written += static_cast<size_t>(n);
+        }
+        if (loop_.modify_fd(p.fd, net::kReadable)) return broke_off();
+        return;
+    }
+
+    while (true) {  // reading the response
+        const ssize_t n = recv(p.fd, buffer_.data(), buffer_.size(), 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            return broke_off();
+        }
+        if (n == 0) return broke_off();  // closed before the whole response arrived
+        p.in.insert(p.in.end(), buffer_.begin(), buffer_.begin() + n);
+        if (p.in.size() < 2) continue;
+        const size_t length = (size_t{p.in[0]} << 8) | p.in[1];
+        if (p.in.size() - 2 < length) continue;
+
+        auto msg = wire::parse(std::span<const uint8_t>(p.in.data() + 2, length));
+        if (!answers(msg, p.txid, p.question)) {  // nothing else will come on this connection
+            ++stats_.mismatched;
+            return broke_off();
         }
         ++stats_.answered;
         finish(id, std::move(*msg));
