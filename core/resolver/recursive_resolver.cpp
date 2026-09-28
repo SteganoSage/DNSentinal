@@ -4,7 +4,7 @@
 /// A Task is one resolution: a client's question, or a sub-query for a name
 /// server's address. It moves through
 ///   step()             answer from the cache, or find the closest zone cut
-///   next_server()      pick an untried server; if none, resolve a glueless NS
+///   next_server()      pick the fastest untried server (SRTT); if none, resolve a glueless NS
 ///   send_query()       ask it and return to the loop
 ///   handle_response()  answer / CNAME / NXDOMAIN / referral / NODATA
 /// and never blocks: every wait is a return to the event loop.
@@ -16,6 +16,7 @@
 #include "dnsentinel/resolver/recursive_resolver.h"
 
 #include "dnsentinel/net/event_loop.h"
+#include "dnsentinel/resolver/server_selection.h"
 #include "dnsentinel/resolver/upstream.h"
 #include "dnsentinel/security/bailiwick.h"
 
@@ -24,7 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
-#include <cstdlib>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -32,6 +33,7 @@ namespace dnsentinel::resolver {
 
 namespace {
 
+using std::chrono::microseconds;
 using std::chrono::milliseconds;
 using Clock = std::chrono::steady_clock;
 
@@ -137,7 +139,8 @@ struct RecursiveResolver::Impl {
         bool                   over_tcp = false;  // ... and whether over TCP
         uint8_t                glueless_lookups = 0;
         uint16_t               referrals        = 0;
-        milliseconds           timeout{};
+        uint32_t               timeouts         = 0;  // in this zone: each doubles the next wait
+        Clock::time_point      sent_at;
 
         std::shared_ptr<Budget> budget;
         Clock::time_point       started;
@@ -151,7 +154,7 @@ struct RecursiveResolver::Impl {
     Impl(const ResolverConfig& cfg, RootHints root_hints, net::EventLoop& event_loop,
          cache::Cache& answer_cache)
         : config(cfg), hints(std::move(root_hints)), loop(event_loop), cache(answer_cache),
-          upstream(event_loop) {
+          upstream(event_loop), selection(cfg.explore_one_in) {
         for (const auto& stub : config.stub_zones) {
             auto& servers = stubs[stub.zone];
             servers.insert(servers.end(), stub.servers.begin(), stub.servers.end());
@@ -171,6 +174,7 @@ struct RecursiveResolver::Impl {
     net::EventLoop&                                    loop;
     cache::Cache&                                      cache;
     UpstreamClient                                     upstream;
+    ServerSelection                                    selection;
     std::unordered_map<Name, std::vector<in_addr_t>>   stubs;  // zone → its servers
     uint64_t                                           next_task_id = 1;
     std::unordered_map<uint64_t, std::unique_ptr<Task>> tasks;
@@ -345,7 +349,7 @@ struct RecursiveResolver::Impl {
         t.unresolved.clear();
         t.tried.clear();
         t.glueless_lookups = 0;
-        t.timeout          = milliseconds(config.query_timeout_ms);
+        t.timeouts         = 0;
     }
 
     /// Make `zone`, served by `ns_records`, the current zone cut. Server
@@ -384,8 +388,7 @@ struct RecursiveResolver::Impl {
             if (std::find(t->tried.begin(), t->tried.end(), s) == t->tried.end()) untried.push_back(s);
         }
         if (!untried.empty()) {
-            // Random choice for now; plan §4.3 replaces this with SRTT.
-            send_query(id, untried[arc4random_uniform(static_cast<uint32_t>(untried.size()))]);
+            send_query(id, selection.pick(untried));
             return;
         }
 
@@ -433,27 +436,44 @@ struct RecursiveResolver::Impl {
         query.questions.push_back(Question{t.qname, t.question.qtype, kClassIN});
         query.edns = EdnsInfo{.udp_payload_size = config.edns_buffer};
 
+        // As long as this server usually takes, doubled for each timeout in this zone.
+        const milliseconds most    = milliseconds(config.max_query_timeout_ms);
+        milliseconds       timeout = selection.timeout(address, milliseconds(config.query_timeout_ms));
+        for (uint32_t i = 0; i < t.timeouts && timeout < most; ++i) timeout *= 2;
+        timeout = std::min(timeout, most);
+
         sockaddr_in server{};
         server.sin_family      = AF_INET;
         server.sin_port        = htons(config.upstream_port);
         server.sin_addr.s_addr = address;
+        t.sent_at  = Clock::now();
         t.upstream = upstream.send(
-            server, std::move(query), t.timeout,
+            server, std::move(query), timeout,
             [this, id](std::expected<Message, UpstreamError> r) { on_response(id, std::move(r)); }, transport);
     }
 
     void on_response(uint64_t id, std::expected<Message, UpstreamError> response) {
         Task* t = find(id);
         if (!t) return;
-        t->upstream = 0;
+        t->upstream    = 0;
+        const auto rtt = std::chrono::duration_cast<microseconds>(Clock::now() - t->sent_at);
         if (!response) {
-            if (response.error() == UpstreamError::Timeout) {
-                t->timeout = std::min(t->timeout * 2, milliseconds(config.max_query_timeout_ms));
-            }
+            selection.record_failure(t->asked);
+            if (response.error() == UpstreamError::Timeout) ++t->timeouts;
             next_server(id);
             return;
         }
-        handle_response(id, *response);
+        handle_response(id, *response, rtt);
+    }
+
+    /// Tell server selection how the server just asked did. Only UDP round
+    /// trips are samples: over TCP the handshake doubles them.
+    void rate(const Task& t, bool usable, microseconds rtt) {
+        if (usable) {
+            selection.record_answer(t.asked, t.over_tcp ? std::nullopt : std::optional(rtt));
+        } else {
+            selection.record_unusable(t.asked);
+        }
     }
 
     /// Cache the addresses a response gave for these name servers (already
@@ -469,13 +489,14 @@ struct RecursiveResolver::Impl {
         }
     }
 
-    void handle_response(uint64_t id, Message& response) {
+    void handle_response(uint64_t id, Message& response, microseconds rtt) {
         Task& t = *find(id);
         const auto rcode = static_cast<RCode>(response.header.rcode);
 
         // TC: the answer didn't fit in UDP. Ask the same server again over
         // TCP (plan §4.1); if even that comes back truncated, give up on it.
         if (response.header.tc) {
+            rate(t, !t.over_tcp, rtt);
             if (t.over_tcp) {
                 next_server(id);
             } else {
@@ -485,6 +506,7 @@ struct RecursiveResolver::Impl {
         }
         // Any error rcode: this server can't help.
         if (rcode != RCode::NoError && rcode != RCode::NXDomain) {
+            rate(t, false, rtt);
             next_server(id);
             return;
         }
@@ -493,6 +515,21 @@ struct RecursiveResolver::Impl {
         security::filter_to_bailiwick(response, t.zone);
         const uint16_t  qtype       = t.question.qtype;
         const TrustRank answer_rank = response.header.aa ? TrustRank::Answer : TrustRank::Authority;
+
+        // What the response says, worked out before acting on it: acting can
+        // finish the task, and the server must be rated first.
+        const bool answered = !collect(response.answers, t.qname, qtype).empty() ||
+                              (qtype != kTypeCNAME && !collect(response.answers, t.qname, kTypeCNAME).empty());
+        const RR*       soa   = find_soa(response.authority, t.qname);
+        std::vector<RR> proof = soa ? std::vector<RR>{*soa} : std::vector<RR>{};
+        // Referral: a non-authoritative response delegating a zone. Only
+        // delegations downward, toward the name, are followed; upward or
+        // sideways ones are a classic poisoning trick.
+        const std::vector<RR> ns = response.header.aa ? std::vector<RR>{} : referral_ns(response.authority);
+        const bool downward = !ns.empty() && ns.front().name.label_count() > t.zone.label_count() &&
+                              t.qname.is_subdomain_of(ns.front().name);
+        // Useless: a bad referral, or nothing at all (a lame server).
+        rate(t, answered || rcode == RCode::NXDomain || (ns.empty() ? response.header.aa || soa : downward), rtt);
 
         // Answer section: follow CNAMEs as far as this response goes.
         bool followed = false;
@@ -522,9 +559,6 @@ struct RecursiveResolver::Impl {
             return;
         }
 
-        const RR*       soa   = find_soa(response.authority, t.qname);
-        std::vector<RR> proof = soa ? std::vector<RR>{*soa} : std::vector<RR>{};
-
         if (rcode == RCode::NXDomain) {
             if (soa) {
                 cache.insert({t.qname, kNxdomainType, kClassIN}, proof, TrustRank::Authority,
@@ -534,28 +568,21 @@ struct RecursiveResolver::Impl {
             return;
         }
 
-        // Referral: a non-authoritative response delegating a zone closer to
-        // the name. Only downward delegations are followed; upward or
-        // sideways ones are a classic poisoning trick.
-        if (!response.header.aa) {
-            std::vector<RR> ns = referral_ns(response.authority);
-            if (!ns.empty()) {
-                const Name child    = ns.front().name;
-                const bool downward = child.label_count() > t.zone.label_count() && t.qname.is_subdomain_of(child);
-                if (!downward) {
-                    next_server(id);
-                    return;
-                }
-                if (++t.referrals > config.max_referral_depth) {
-                    finish(id, std::unexpected(ResolveError::MaxDepthExceeded));
-                    return;
-                }
-                cache.insert({child, kTypeNS, kClassIN}, ns, TrustRank::Authority, min_ttl(ns));
-                cache_glue(response.additional, ns);
-                enter_zone(t, child, ns, response.additional);
+        if (!ns.empty()) {
+            if (!downward) {
                 next_server(id);
                 return;
             }
+            if (++t.referrals > config.max_referral_depth) {
+                finish(id, std::unexpected(ResolveError::MaxDepthExceeded));
+                return;
+            }
+            const Name child = ns.front().name;
+            cache.insert({child, kTypeNS, kClassIN}, ns, TrustRank::Authority, min_ttl(ns));
+            cache_glue(response.additional, ns);
+            enter_zone(t, child, ns, response.additional);
+            next_server(id);
+            return;
         }
 
         // NODATA: the name exists but has no records of this type.

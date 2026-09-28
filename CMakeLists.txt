@@ -78,7 +78,7 @@ add_library(dnsentinel_core STATIC
     core/resolver/recursive_resolver.cpp
     core/resolver/root_hints.cpp
     core/resolver/upstream.cpp
-    # core/resolver/server_selection.cpp
+    core/resolver/server_selection.cpp
     # core/resolver/qname_minimisation.cpp
 
     # Cache
@@ -157,6 +157,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/resolver/test_root_hints.cpp
         tests/unit/resolver/test_upstream.cpp
         tests/unit/resolver/test_recursive_resolver.cpp
+        tests/unit/resolver/test_server_selection.cpp
         # tests/unit/cache/test_negative_cache.cpp
         tests/unit/security/test_bailiwick.cpp
         tests/unit/server/test_config.cpp

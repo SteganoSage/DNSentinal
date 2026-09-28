@@ -57,9 +57,11 @@ struct ResolverConfig {
     uint16_t max_referral_depth   = 16;
     uint8_t  max_cname_chain      = 8;
     uint8_t  max_glueless_ns      = 5;      // NXNSAttack cap: NS names resolved per zone
-    uint32_t query_timeout_ms     = 800;    // first try; doubles after each timeout
+    uint32_t query_timeout_ms     = 800;    // for a server not yet measured (less for fast ones, see
+                                            // ServerSelection); doubles after each timeout
     uint32_t max_query_timeout_ms = 3000;
     uint32_t overall_deadline_ms  = 5000;
+    uint32_t explore_one_in       = 20;     // ask a random server once in this many picks; 0: never
     uint16_t upstream_port        = 53;     // tests and the lab only
     std::vector<StubZone> stub_zones;
 };

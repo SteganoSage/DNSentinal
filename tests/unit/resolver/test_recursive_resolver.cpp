@@ -261,15 +261,42 @@ TEST_F(ResolverTest, EmptyNonTerminalIsNodataNotNxdomain) {
 
 // ─── Failures and time limits ───────────────────────────────────────────────
 
-TEST_F(ResolverTest, FailsOverFromAnUnresponsiveServer) {
+TEST_F(ResolverTest, DeadServerIsAvoidedAfterOneTimeout) {
     config.query_timeout_ms = 50;
+    config.explore_one_in   = 0;
     ex1->tamper = drop_everything;
     for (int i = 0; i < 20; ++i) {
         auto r = resolve("w" + std::to_string(i) + ".example.test", RRType::A);
         ASSERT_TRUE(r.has_value()) << i << ": " << resolve_error_to_string(r.error());
         EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.2"}));
     }
-    EXPECT_GT(ex1->queries, 0);  // random choice sent some queries to the dead one first
+    // If it was picked first it timed out once; after that the live server
+    // is measured and the dead one is only ever behind it (plan §4.3).
+    EXPECT_LE(ex1->queries, 1);
+}
+
+TEST_F(ResolverTest, KnownFastServerIsGivenUpOnQuickly) {
+    config.query_timeout_ms     = 2000;  // for servers never measured
+    config.max_query_timeout_ms = 3000;
+    config.explore_one_in       = 0;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());  // measures one of example.test's servers
+
+    // That server now loses one query. Its timeout comes from its measured
+    // round trips (~100 ms floor), not the 2 s default, before the other
+    // server is asked.
+    bool dropped = false;
+    ex1->tamper = ex2->tamper = [&](const Message& q, Message&) {
+        if (dropped || q.questions.at(0).qname != name("w1.example.test")) return true;
+        dropped = true;
+        return false;
+    };
+    const auto start = Clock::now();
+    auto r = resolve("w1.example.test", RRType::A);
+    const auto took = Clock::now() - start;
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_TRUE(dropped);
+    EXPECT_GE(took, 100ms);
+    EXPECT_LT(took, 1s);
 }
 
 TEST_F(ResolverTest, FailsWhenEveryServerIsDown) {
@@ -296,6 +323,7 @@ TEST_F(ResolverTest, OverallDeadlineBoundsResolution) {
 }
 
 TEST_F(ResolverTest, RefusedResponsesMoveOnToAnotherServer) {
+    config.explore_one_in = 0;
     ex1->tamper = [](const Message&, Message& r) {
         r.header.rcode = static_cast<uint8_t>(RCode::Refused);
         r.answers.clear();
@@ -304,6 +332,7 @@ TEST_F(ResolverTest, RefusedResponsesMoveOnToAnotherServer) {
     for (int i = 0; i < 6; ++i) {
         EXPECT_TRUE(resolve("w" + std::to_string(i) + ".example.test", RRType::A).has_value()) << i;
     }
+    EXPECT_LE(ex1->queries, 1);  // then the server that answers is preferred
 }
 
 TEST_F(ResolverTest, TruncatedAnswerIsFetchedOverTcp) {

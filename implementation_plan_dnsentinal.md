@@ -533,6 +533,13 @@ When we receive an upstream UDP response with the TC bit set, re-send the same q
 
 - **New servers** (no SRTT data yet) get an initial estimate of 400ms — optimistic enough that they'll be tried, but not so low that they always win over proven-fast servers.
 
+**Implementation notes (`resolver/server_selection.cpp`):**
+- A server's first sample is taken as-is (`srtt = sample`, `rttvar = sample/2`, as in RFC 6298); smoothing from the 400ms guess would take a dozen answers to converge.
+- The wait for a measured server is `srtt + 4·rttvar` (TCP's RTO), clamped to [100ms, `query_timeout_ms`]; unmeasured servers get `query_timeout_ms`. Each timeout in the same zone doubles the next wait, up to `max_query_timeout_ms`. A lost packet to a 20ms server costs ~100ms, not 800ms.
+- Only UDP round trips are samples (a TCP handshake doubles them). Answers we can't use (REFUSED, SERVFAIL, lame or upward referrals) count toward the 5 failures but add no penalty. Penalties stop adding up at 5s, so a revived server can recover.
+- Servers untouched for 15 minutes are forgotten (treated as new, and pruned), which also bounds memory.
+- Failures are tracked per server, not per (server, zone) as §3.3 suggests; a server lame for one zone is also deprioritised for others it serves.
+
 ### 4.4 Module: In-Flight Deduplication
 
 **What it is:** If 20 clients simultaneously ask for `www.example.com A` and it's not cached, we send **one** upstream query and fan the answer out to all 20 clients.
