@@ -54,11 +54,16 @@ ZONES = {
         "records": {
             ("www.example.lab", A): ["192.0.2.1"],
             ("big.example.lab", A): [f"192.0.2.{i}" for i in range(1, 101)],  # ~1.6 KB: needs TCP
+            ("slow.example.lab", A): ["192.0.2.7"],  # answered late: see SLOW_NAMES
             ("ns.lab", A): [LAB_IP],
         },
         "cnames": {"alias.example.lab": "www.example.lab"},
     },
 }
+
+# Answered over UDP only after this delay, so identical queries pile up meanwhile.
+# Kept under the resolver's 100 ms minimum timeout for a server it has measured as fast.
+SLOW_NAMES, SLOW_DELAY = {"slow.example.lab"}, 0.05
 
 # ─── Wire format ─────────────────────────────────────────────────────────────
 
@@ -140,10 +145,15 @@ def recv_exact(sock, count):
     return data
 
 
-def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False):
-    """Send one query to the daemon (RD set, no EDNS) and return its Response."""
+def make_query(qname, qtype=A, qclass=CLASS_IN):
+    """A query with a random ID, RD set and no EDNS: (id, bytes)."""
     qid = struct.unpack(">H", os.urandom(2))[0]
-    query = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + encode_name(qname) + struct.pack(">HH", qtype, qclass)
+    return qid, struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + encode_name(qname) + struct.pack(">HH", qtype, qclass)
+
+
+def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False):
+    """Send one query to the daemon and return its Response."""
+    qid, query = make_query(qname, qtype, qclass)
     if tcp:
         with socket.create_connection(DAEMON, timeout=5) as sock:
             sock.sendall(struct.pack(">H", len(query)) + query)
@@ -156,6 +166,25 @@ def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False):
             response = Response(sock.recv(65535))
     response.id_matches = response.id == qid
     return response
+
+
+def ask_many(qname, count):
+    """Send `count` identical queries at once, each from its own socket, and
+    return their Responses."""
+    sent = []
+    for _ in range(count):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(5)
+        qid, query = make_query(qname)
+        sock.sendto(query, DAEMON)
+        sent.append((sock, qid))
+    responses = []
+    for sock, qid in sent:
+        with sock:
+            response = Response(sock.recv(65535))
+        response.id_matches = response.id == qid
+        responses.append(response)
+    return responses
 
 
 # ─── The fake authoritative servers ──────────────────────────────────────────
@@ -217,7 +246,11 @@ class FakeServers:
                 try:
                     if transport == "udp":
                         data, peer = key.fileobj.recvfrom(4096)
-                        key.fileobj.sendto(self._reply(server, data, tcp=False), peer)
+                        reply = self._reply(server, data, tcp=False)
+                        if self.seen[-1][1] in SLOW_NAMES:
+                            threading.Timer(SLOW_DELAY, key.fileobj.sendto, (reply, peer)).start()
+                        else:
+                            key.fileobj.sendto(reply, peer)
                     else:  # one query per connection is all the resolver sends
                         conn, _ = key.fileobj.accept()
                         with conn:
@@ -359,6 +392,13 @@ def resolving_from_the_root(binary, servers, tmp):
               "repeat query answered from the cache")
         check(r.questions == ["WwW.ExAmPlE.LaB."], "question echoed in the client's case")
         check(len(servers.queries_to(ROOT_IP)) == 2, "root asked only twice: priming, then the lab. referral")
+
+        before = len(servers.seen)
+        rs = ask_many("slow.example.lab", 10)
+        check(all(r.id_matches and r.answers == [("slow.example.lab.", A, "192.0.2.7")] for r in rs),
+              "10 identical queries in flight at once all get the answer")
+        check(servers.seen[before:] == [(LAB_IP, "slow.example.lab", A)],
+              "...from one upstream query (in-flight deduplication)")
 
         check(ask("www.dead").rcode == SERVFAIL, "unreachable name server gives SERVFAIL")
 

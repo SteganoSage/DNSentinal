@@ -300,15 +300,53 @@ TEST_F(ResolverTest, KnownFastServerIsGivenUpOnQuickly) {
 }
 
 TEST_F(ResolverTest, FailsWhenEveryServerIsDown) {
-    config.query_timeout_ms = 50;
+    config.query_timeout_ms     = 50;
+    config.max_query_timeout_ms = 200;
     ex1->tamper = ex2->tamper = drop_everything;
     const auto start = Clock::now();
     auto r = resolve("www.example.test", RRType::A);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), ResolveError::AllServersFailed);
-    EXPECT_EQ(ex1->queries, 1);
-    EXPECT_EQ(ex2->queries, 1);
-    EXPECT_GE(Clock::now() - start, 150ms);  // 50 ms, then backed off to 100 ms
+    EXPECT_EQ(ex1->queries, 3);  // the first round plus two retry rounds
+    EXPECT_EQ(ex2->queries, 3);
+    EXPECT_GE(Clock::now() - start, 950ms);  // 50, 100, then 200 ms (capped) four times
+}
+
+TEST_F(ResolverTest, ServersThatTimedOutAreRetriedWithALongerWait) {
+    // Both of example.test's servers lose their first query. Instead of
+    // giving up, the resolver asks again, waiting longer (plan §3.3).
+    config.query_timeout_ms = 50;
+    int seen1 = 0, seen2 = 0;
+    ex1->tamper = [&](const Message&, Message&) { return ++seen1 > 1; };
+    ex2->tamper = [&](const Message&, Message&) { return ++seen2 > 1; };
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(ex1->queries + ex2->queries, 3);  // each lost one, then one answered
+}
+
+TEST_F(ResolverTest, UnreachableServersAreNotRetried) {
+    // closed.test is delegated to two addresses where nothing listens, so
+    // each query comes straight back as ICMP port unreachable. Asking again
+    // is pointless: each is asked once. The budget covers root, test. and
+    // those two queries, so any retry would exceed it.
+    tld->delegate("closed.test", {{"ns1.closed.test", ip(10)}, {"ns2.closed.test", ip(11)}});
+    config.max_upstream_queries = 4;
+    auto r = resolve("www.closed.test", RRType::A);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), ResolveError::AllServersFailed);
+}
+
+TEST_F(ResolverTest, ServersThatRefuseAreNotRetried) {
+    ex1->tamper = ex2->tamper = [](const Message&, Message& r) {
+        r.header.rcode = static_cast<uint8_t>(RCode::Refused);
+        r.answers.clear();
+        return true;
+    };
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), ResolveError::AllServersFailed);
+    EXPECT_EQ(ex1->queries + ex2->queries, 2);  // an answer, even a refusal, isn't retried
 }
 
 TEST_F(ResolverTest, OverallDeadlineBoundsResolution) {
@@ -551,6 +589,90 @@ TEST_F(ResolverTest, StubZoneBeatsACachedDelegationForTheSameZone) {
     EXPECT_EQ(other->queries, 0);
 }
 
+// ─── In-flight deduplication (plan §4.4) ───────────────────────────────────
+
+TEST_F(ResolverTest, IdenticalQueriesInFlightShareOneResolution) {
+    // 20 clients ask for the same uncached name at once, half of them in
+    // another case: one resolution, one query per server, 20 answers.
+    const char* spellings[] = {"www.example.test", "WWW.Example.TEST"};
+    std::vector<Outcome> outcomes;
+    for (int i = 0; i < 20; ++i) {
+        resolver().resolve({name(spellings[i % 2]), 1, 1}, [&](Outcome o) {
+            outcomes.push_back(std::move(o));
+            if (outcomes.size() == 20) loop->stop();
+        });
+    }
+    run_for(5s);
+    ASSERT_EQ(outcomes.size(), 20u);
+    EXPECT_EQ(total_queries(), 3);  // root, test., example.test: once each
+
+    int coalesced = 0;
+    for (size_t i = 0; i < outcomes.size(); ++i) {  // first asker first, then in order
+        ASSERT_TRUE(outcomes[i].has_value()) << i;
+        EXPECT_EQ(a_records(outcomes[i]), (std::vector<std::string>{"192.0.2.1"}));
+        EXPECT_EQ(outcomes[i]->response.questions.at(0).qname.original_case,
+                  name(spellings[i % 2]).original_case);  // each gets its own question back
+        EXPECT_EQ(outcomes[i]->upstream_queries_used, outcomes[i]->coalesced ? 0u : 3u);
+        coalesced += outcomes[i]->coalesced;
+    }
+    EXPECT_FALSE(outcomes[0]->coalesced);
+    EXPECT_EQ(coalesced, 19);
+}
+
+TEST_F(ResolverTest, DifferentTypesAreNotCoalesced) {
+    std::vector<Outcome> outcomes;
+    for (RRType type : {RRType::A, RRType::AAAA}) {
+        resolver().resolve({name("www.example.test"), static_cast<uint16_t>(type), 1}, [&](Outcome o) {
+            outcomes.push_back(std::move(o));
+            if (outcomes.size() == 2) loop->stop();
+        });
+    }
+    run_for(5s);
+    ASSERT_EQ(outcomes.size(), 2u);
+    for (const auto& o : outcomes) {
+        ASSERT_TRUE(o.has_value());
+        EXPECT_FALSE(o->coalesced);
+    }
+    EXPECT_EQ(ex1->queries + ex2->queries, 2);
+}
+
+TEST_F(ResolverTest, JoinersShareAFailureAndLaterQueriesStartAfresh) {
+    config.query_timeout_ms     = 50;
+    config.max_query_timeout_ms = 200;
+    ex1->tamper = ex2->tamper = drop_everything;
+    std::vector<Outcome> outcomes;
+    for (int i = 0; i < 5; ++i) {
+        resolver().resolve({name("www.example.test"), 1, 1}, [&](Outcome o) {
+            outcomes.push_back(std::move(o));
+            if (outcomes.size() == 5) loop->stop();
+        });
+    }
+    run_for(5s);
+    ASSERT_EQ(outcomes.size(), 5u);
+    for (const auto& o : outcomes) {
+        ASSERT_FALSE(o.has_value());
+        EXPECT_EQ(o.error(), ResolveError::AllServersFailed);
+    }
+    EXPECT_EQ(ex1->queries + ex2->queries, 6);  // one resolution: each server, three rounds
+
+    // Failures aren't cached: a query after it ended starts a new resolution.
+    EXPECT_FALSE(resolve("www.example.test", RRType::A).has_value());
+    EXPECT_EQ(ex1->queries + ex2->queries, 12);
+}
+
+TEST_F(ResolverTest, JoinersAreCalledBackEvenIfAnEarlierCallbackDestroysTheResolver) {
+    int called = 0;
+    for (int i = 0; i < 3; ++i) {
+        resolver().resolve({name("www.example.test"), 1, 1}, [&](Outcome o) {
+            EXPECT_TRUE(o.has_value());
+            if (++called == 1) destroy_resolver();
+            if (called == 3) loop->stop();
+        });
+    }
+    run_for(5s);
+    EXPECT_EQ(called, 3);
+}
+
 // ─── API guarantees ─────────────────────────────────────────────────────────
 
 TEST_F(ResolverTest, CallbackNeverRunsInsideResolve) {
@@ -569,12 +691,14 @@ TEST_F(ResolverTest, CallbackNeverRunsInsideResolve) {
 
 TEST_F(ResolverTest, DestroyingTheResolverDropsPendingCallbacks) {
     ex1->delay = ex2->delay = 200ms;
-    bool called = false;
-    resolver().resolve({name("www.example.test"), 1, 1}, [&](Outcome) { called = true; });
+    int called = 0;
+    for (int i = 0; i < 3; ++i) {  // one resolution and two clients joined to it
+        resolver().resolve({name("www.example.test"), 1, 1}, [&](Outcome) { ++called; });
+    }
     run_for(50ms);  // root and test. answered; waiting on example.test
     destroy_resolver();
     run_for(400ms);
-    EXPECT_FALSE(called);
+    EXPECT_EQ(called, 0);
 }
 
 TEST_F(ResolverTest, PrimingCachesTheRootNameServers) {

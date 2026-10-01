@@ -4,7 +4,8 @@
 /// A Task is one resolution: a client's question, or a sub-query for a name
 /// server's address. It moves through
 ///   step()             answer from the cache, or find the closest zone cut
-///   next_server()      pick the fastest untried server (SRTT); if none, resolve a glueless NS
+///   next_server()      pick the fastest untried server (SRTT); if none, resolve a glueless
+///                      NS; if none, retry the servers that timed out, waiting longer
 ///   send_query()       ask it and return to the loop
 ///   handle_response()  answer / CNAME / NXDOMAIN / referral / NODATA
 /// and never blocks: every wait is a return to the event loop.
@@ -50,6 +51,10 @@ constexpr uint16_t kNxdomainType = 0;
 /// How deep sub-queries may nest (an NS name whose zone needs another NS
 /// name resolved, ...). Cycles are caught separately; this bounds depth.
 constexpr size_t kMaxSubqueryDepth = 4;
+
+/// Extra rounds for a zone's servers that timed out, each with a doubled wait
+/// (plan §3.3). The query budget and the overall deadline still apply.
+constexpr uint8_t kMaxRetryRounds = 2;
 
 std::vector<RR> collect(const std::vector<RR>& section, const Name& name, uint16_t type) {
     std::vector<RR> out;
@@ -99,6 +104,17 @@ std::vector<in_addr_t> ipv4_addresses(const std::vector<RR>& rrs) {
     return out;
 }
 
+/// Questions are equal when name (case-insensitively), type and class are.
+struct QuestionHash {
+    size_t operator()(const Question& q) const noexcept {
+        return q.qname.hash() ^ (((size_t{q.qtype} << 16) | q.qclass) * 0x9e3779b97f4a7c15ULL);
+    }
+};
+
+uint32_t elapsed_us(Clock::time_point since, Clock::time_point now) {
+    return static_cast<uint32_t>(std::chrono::duration_cast<microseconds>(now - since).count());
+}
+
 }  // namespace
 
 std::string resolve_error_to_string(ResolveError e) {
@@ -124,6 +140,13 @@ struct RecursiveResolver::Impl {
         uint32_t queries = 0;
     };
 
+    /// A client that asked a question already being resolved (plan §4.4).
+    struct Waiter {
+        Question          question;  // as this client asked it, case included
+        Clock::time_point asked;
+        ResolveCallback   done;
+    };
+
     struct Task {
         Question              question;    // as asked
         Name                  qname;       // current target, after CNAMEs
@@ -135,6 +158,8 @@ struct RecursiveResolver::Impl {
         std::vector<in_addr_t> servers;     // known addresses of its name servers
         std::vector<Name>      unresolved;  // its name servers with no known address
         std::vector<in_addr_t> tried;
+        std::vector<in_addr_t> timed_out;         // tried this round and timed out: may be retried
+        uint8_t                retry_rounds = 0;
         in_addr_t              asked    = 0;      // the server asked last
         bool                   over_tcp = false;  // ... and whether over TCP
         uint8_t                glueless_lookups = 0;
@@ -149,6 +174,8 @@ struct RecursiveResolver::Impl {
         net::EventLoop::TimerId start_timer = 0;
         net::EventLoop::TimerId deadline    = 0;  // client queries only
         ResolveCallback         done;
+        bool                    client = false;  // a client's query, not a sub-query
+        std::vector<Waiter>     joiners;         // identical client queries that came later
     };
 
     Impl(const ResolverConfig& cfg, RootHints root_hints, net::EventLoop& event_loop,
@@ -178,6 +205,7 @@ struct RecursiveResolver::Impl {
     std::unordered_map<Name, std::vector<in_addr_t>>   stubs;  // zone → its servers
     uint64_t                                           next_task_id = 1;
     std::unordered_map<uint64_t, std::unique_ptr<Task>> tasks;
+    std::unordered_map<Question, uint64_t, QuestionHash> in_flight;  // client question → its task
 
     // ─── Task lifecycle ─────────────────────────────────────────────────────
 
@@ -209,7 +237,15 @@ struct RecursiveResolver::Impl {
     }
 
     void resolve_client(const Question& q, ResolveCallback done) {
+        if (auto it = in_flight.find(q); it != in_flight.end()) {
+            if (Task* t = find(it->second)) {
+                t->joiners.push_back(Waiter{q, Clock::now(), std::move(done)});
+                return;
+            }
+        }
         const uint64_t id = spawn(q, std::make_shared<Budget>(), {}, std::move(done));
+        in_flight[q]      = id;
+        tasks.at(id)->client   = true;
         tasks.at(id)->deadline = loop.add_timer(milliseconds(config.overall_deadline_ms), [this, id] {
             if (Task* t = find(id)) {
                 t->deadline = 0;
@@ -218,7 +254,10 @@ struct RecursiveResolver::Impl {
         });
     }
 
-    void release(Task& t) {
+    void release(uint64_t id, Task& t) {
+        if (t.client) {
+            if (auto it = in_flight.find(t.question); it != in_flight.end() && it->second == id) in_flight.erase(it);
+        }
         if (t.upstream) upstream.cancel(t.upstream);
         if (t.child) cancel(t.child);
         if (t.start_timer) loop.cancel_timer(t.start_timer);
@@ -231,7 +270,7 @@ struct RecursiveResolver::Impl {
         if (it == tasks.end()) return;
         std::unique_ptr<Task> t = std::move(it->second);
         tasks.erase(it);
-        release(*t);
+        release(id, *t);
     }
 
     void finish(uint64_t id, Outcome result) {
@@ -239,15 +278,33 @@ struct RecursiveResolver::Impl {
         if (it == tasks.end()) return;
         std::unique_ptr<Task> t = std::move(it->second);
         tasks.erase(it);
-        release(*t);
+        release(id, *t);
+
+        const auto now = Clock::now();
         if (result) {
             result->upstream_queries_used = t->budget->queries;
-            result->latency_us            = static_cast<uint32_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t->started).count());
+            result->latency_us            = elapsed_us(t->started, now);
+        }
+        // Clients that joined while this was in flight get the same outcome,
+        // with their own question (case included) and latency.
+        std::vector<std::pair<ResolveCallback, Outcome>> joiners;
+        joiners.reserve(t->joiners.size());
+        for (auto& w : t->joiners) {
+            Outcome copy = result;
+            if (copy) {
+                copy->response.questions    = {w.question};
+                copy->upstream_queries_used = 0;
+                copy->latency_us            = elapsed_us(w.asked, now);
+                copy->coalesced             = true;
+            }
+            joiners.emplace_back(std::move(w.done), std::move(copy));
         }
         ResolveCallback done = std::move(t->done);
         t.reset();
+        // Callbacks last: they may start new work or destroy the resolver.
+        // The joiners are still called back then; their resolution is over.
         done(std::move(result));
+        for (auto& [callback, joined] : joiners) callback(std::move(joined));
     }
 
     static Outcome outcome(const Task& t, RCode rcode, const std::vector<RR>& answers,
@@ -348,6 +405,8 @@ struct RecursiveResolver::Impl {
         t.servers.clear();
         t.unresolved.clear();
         t.tried.clear();
+        t.timed_out.clear();
+        t.retry_rounds     = 0;
         t.glueless_lookups = 0;
         t.timeouts         = 0;
     }
@@ -407,6 +466,17 @@ struct RecursiveResolver::Impl {
                              [this, id](Outcome o) { on_child_done(id, std::move(o)); });
             return;
         }
+
+        // Every server has had its turn. Those that merely timed out (rather
+        // than refusing or answering uselessly) get another round, each wait
+        // doubled: a busy or briefly slow server shouldn't mean SERVFAIL.
+        if (!t->timed_out.empty() && t->retry_rounds < kMaxRetryRounds) {
+            ++t->retry_rounds;
+            for (in_addr_t s : t->timed_out) std::erase(t->tried, s);
+            t->timed_out.clear();
+            next_server(id);
+            return;
+        }
         finish(id, std::unexpected(ResolveError::AllServersFailed));
     }
 
@@ -459,7 +529,10 @@ struct RecursiveResolver::Impl {
         const auto rtt = std::chrono::duration_cast<microseconds>(Clock::now() - t->sent_at);
         if (!response) {
             selection.record_failure(t->asked);
-            if (response.error() == UpstreamError::Timeout) ++t->timeouts;
+            if (response.error() == UpstreamError::Timeout) {
+                ++t->timeouts;
+                t->timed_out.push_back(t->asked);
+            }
             next_server(id);
             return;
         }

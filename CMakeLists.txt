@@ -83,7 +83,7 @@ add_library(dnsentinel_core STATIC
 
     # Cache
     core/cache/cache.cpp
-    # core/cache/negative_cache.cpp
+    # negative caching (plan §4.2) lives in core/resolver/recursive_resolver.cpp
     # core/cache/serve_stale.cpp
 
     # Security
@@ -158,7 +158,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/resolver/test_upstream.cpp
         tests/unit/resolver/test_recursive_resolver.cpp
         tests/unit/resolver/test_server_selection.cpp
-        # tests/unit/cache/test_negative_cache.cpp
+        # negative caching is tested in tests/unit/resolver/test_recursive_resolver.cpp
         tests/unit/security/test_bailiwick.cpp
         tests/unit/server/test_config.cpp
         tests/unit/server/test_query_processor.cpp

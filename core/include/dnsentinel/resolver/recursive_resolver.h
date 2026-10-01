@@ -73,8 +73,9 @@ struct ResolverConfig {
 /// A ResolveError means no outcome could be reached (answer SERVFAIL).
 struct ResolveResult {
     Message  response;
-    uint32_t upstream_queries_used = 0;
-    uint32_t latency_us            = 0;
+    uint32_t upstream_queries_used = 0;      // caused by this query: 0 when coalesced
+    uint32_t latency_us            = 0;      // from this query's resolve() call
+    bool     coalesced             = false;  // joined an identical resolution in flight (plan §4.4)
 };
 
 using ResolveCallback = std::function<void(std::expected<ResolveResult, ResolveError>)>;
@@ -103,6 +104,14 @@ public:
     /// resolve() returns, even when the answer is already known. Callers
     /// therefore never see their callback re-entered from inside resolve().
     /// config.overall_deadline_ms bounds how long that can take.
+    ///
+    /// A question identical to one already being resolved (same name,
+    /// compared case-insensitively, type and class) joins that resolution
+    /// instead of starting another (in-flight deduplication, plan §4.4).
+    /// Every caller gets the outcome, with its own question in the response.
+    /// Besides saving upstream traffic, this keeps at most one upstream query
+    /// outstanding per question, which blunts birthday-style spoofing: with
+    /// n identical queries in flight, a forged answer has n chances to match.
     void resolve(const Question& question, ResolveCallback done);
 
     /// Prime the cache with the root NS set (done once at startup). Same
