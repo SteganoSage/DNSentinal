@@ -20,6 +20,7 @@
 #include "dnsentinel/resolver/server_selection.h"
 #include "dnsentinel/resolver/upstream.h"
 #include "dnsentinel/security/bailiwick.h"
+#include "dnsentinel/security/zero_x20.h"
 
 #include <netinet/in.h>
 
@@ -28,6 +29,7 @@
 #include <climits>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace dnsentinel::resolver {
@@ -162,6 +164,7 @@ struct RecursiveResolver::Impl {
         uint8_t                retry_rounds = 0;
         in_addr_t              asked    = 0;      // the server asked last
         bool                   over_tcp = false;  // ... and whether over TCP
+        bool                   sent_0x20 = false; // ... and whether with random letter case
         uint8_t                glueless_lookups = 0;
         uint16_t               referrals        = 0;
         uint32_t               timeouts         = 0;  // in this zone: each doubles the next wait
@@ -206,6 +209,7 @@ struct RecursiveResolver::Impl {
     uint64_t                                           next_task_id = 1;
     std::unordered_map<uint64_t, std::unique_ptr<Task>> tasks;
     std::unordered_map<Question, uint64_t, QuestionHash> in_flight;  // client question → its task
+    std::unordered_set<in_addr_t>                        no_0x20;    // servers that don't echo letter case
 
     // ─── Task lifecycle ─────────────────────────────────────────────────────
 
@@ -500,10 +504,14 @@ struct RecursiveResolver::Impl {
         if (transport == UpstreamTransport::Udp) t.tried.push_back(address);  // a TCP retry is the same try
         t.asked    = address;
         t.over_tcp = transport == UpstreamTransport::Tcp;
+        // 0x20 (plan §5.2): over UDP, ask in random letter case and accept only
+        // replies that echo it. TCP can't be spoofed off-path, so it needn't.
+        t.sent_0x20 = config.use_0x20 && !t.over_tcp && !no_0x20.contains(address);
 
         Message query;
         query.header.rd = false;  // iterative: we do the recursion ourselves
-        query.questions.push_back(Question{t.qname, t.question.qtype, kClassIN});
+        query.questions.push_back(
+            Question{t.sent_0x20 ? security::randomize_case(t.qname) : t.qname, t.question.qtype, kClassIN});
         query.edns = EdnsInfo{.udp_payload_size = config.edns_buffer};
 
         // As long as this server usually takes, doubled for each timeout in this zone.
@@ -519,7 +527,8 @@ struct RecursiveResolver::Impl {
         t.sent_at  = Clock::now();
         t.upstream = upstream.send(
             server, std::move(query), timeout,
-            [this, id](std::expected<Message, UpstreamError> r) { on_response(id, std::move(r)); }, transport);
+            [this, id](std::expected<Message, UpstreamError> r) { on_response(id, std::move(r)); }, transport,
+            /*match_case=*/t.sent_0x20);
     }
 
     void on_response(uint64_t id, std::expected<Message, UpstreamError> response) {
@@ -527,6 +536,15 @@ struct RecursiveResolver::Impl {
         if (!t) return;
         t->upstream    = 0;
         const auto rtt = std::chrono::duration_cast<microseconds>(Clock::now() - t->sent_at);
+        if (!response && response.error() == UpstreamError::CaseMismatch) {
+            // It answered, but not in the case we asked: it normalises case.
+            // Ask again without 0x20, from now on. Not the server's fault, so
+            // neither a failed try nor an SRTT penalty.
+            no_0x20.insert(t->asked);
+            std::erase(t->tried, t->asked);
+            send_query(id, t->asked);
+            return;
+        }
         if (!response) {
             selection.record_failure(t->asked);
             if (response.error() == UpstreamError::Timeout) {
@@ -537,6 +555,17 @@ struct RecursiveResolver::Impl {
             return;
         }
         handle_response(id, *response, rtt);
+    }
+
+    /// Records named after a 0x20 question usually come back in its random
+    /// case (servers compress them against the question). Put back the case
+    /// the name was asked in, so clients never see the random pattern.
+    static void restore_case(Message& response, const Name& asked) {
+        for (std::vector<RR>* section : {&response.answers, &response.authority, &response.additional}) {
+            for (RR& rr : *section) {
+                if (rr.name == asked) rr.name.original_case = asked.original_case;
+            }
+        }
     }
 
     /// Tell server selection how the server just asked did. Only UDP round
@@ -565,6 +594,7 @@ struct RecursiveResolver::Impl {
     void handle_response(uint64_t id, Message& response, microseconds rtt) {
         Task& t = *find(id);
         const auto rcode = static_cast<RCode>(response.header.rcode);
+        if (t.sent_0x20) restore_case(response, t.qname);
 
         // TC: the answer didn't fit in UDP. Ask the same server again over
         // TCP (plan §4.1); if even that comes back truncated, give up on it.

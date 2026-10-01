@@ -346,3 +346,64 @@ TEST_F(UpstreamTest, TcpToAClosedPortIsANetworkError) {
     EXPECT_EQ(result->error(), UpstreamError::NetworkError);
     EXPECT_LT(Clock::now() - start, 1s);
 }
+
+// ─── 0x20: the reply must echo our letter case (plan §5.2) ──────────────────
+
+namespace {
+
+/// Our question, echoed back in lower case: what a case-normalising server
+/// (or a forger who didn't know our case pattern) sends.
+std::vector<uint8_t> lower_case_echo(const Message& q) {
+    Message r = wire::make_response(q);
+    r.questions[0].qname.original_case = r.questions[0].qname.labels;
+    return wire::build(r);
+}
+
+}  // namespace
+
+TEST_F(UpstreamTest, WrongCaseReplyIsIgnoredWhenCaseMustMatch) {
+    RawServer server(*loop);
+    server.reply = [](const Message& q) {
+        return std::vector<std::vector<uint8_t>>{lower_case_echo(q), answer_to(q)};  // the exact echo comes second
+    };
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    client.send(loopback(server.port), query_for("wWw.ExAmPlE.tEsT"), 2s, [&](Result r) {
+        result = std::move(r);
+        loop->stop();
+    }, UpstreamTransport::Udp, /*match_case=*/true);
+    run_for(3s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->has_value());
+    EXPECT_EQ((*result)->questions.at(0).qname.original_case, name("wWw.ExAmPlE.tEsT").original_case);
+    EXPECT_EQ(client.stats().case_mismatches, 1u);
+}
+
+TEST_F(UpstreamTest, OnlyWrongCaseRepliesEndInCaseMismatch) {
+    RawServer server(*loop);
+    server.reply = [](const Message& q) { return std::vector<std::vector<uint8_t>>{lower_case_echo(q)}; };
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    client.send(loopback(server.port), query_for("wWw.ExAmPlE.tEsT"), 50ms, [&](Result r) {
+        result = std::move(r);
+        loop->stop();
+    }, UpstreamTransport::Udp, /*match_case=*/true);
+    run_for(2s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error(), UpstreamError::CaseMismatch);  // not plain Timeout: the server did answer
+}
+
+TEST_F(UpstreamTest, CaseIsNotCheckedUnlessAsked) {
+    RawServer server(*loop);
+    server.reply = [](const Message& q) { return std::vector<std::vector<uint8_t>>{lower_case_echo(q)}; };
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    client.send(loopback(server.port), query_for("wWw.ExAmPlE.tEsT"), 2s, [&](Result r) {
+        result = std::move(r);
+        loop->stop();
+    });
+    run_for(3s);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->has_value());
+}

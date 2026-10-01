@@ -4,6 +4,7 @@
 
 #include "dnsentinel/resolver/upstream.h"
 
+#include "dnsentinel/security/zero_x20.h"
 #include "dnsentinel/wire/builder.h"
 #include "dnsentinel/wire/parser.h"
 
@@ -20,10 +21,18 @@ namespace {
 
 constexpr size_t kMaxDatagram = 65535;
 
-/// Is `msg` the response to our query: same ID and question?
-bool answers(const std::expected<Message, wire::ParseError>& msg, uint16_t txid, const Question& question) {
-    return msg && msg->header.qr && msg->header.id == txid && msg->questions.size() == 1 &&
-           msg->questions.front() == question;
+enum class Match { No, WrongCase, Yes };
+
+/// Is `msg` the response to our query: same ID and question, and (for
+/// 0x20) the question in exactly the case we sent?
+Match match(const std::expected<Message, wire::ParseError>& msg, uint16_t txid, const Question& question,
+            bool match_case) {
+    if (!msg || !msg->header.qr || msg->header.id != txid || msg->questions.size() != 1 ||
+        !(msg->questions.front() == question)) {
+        return Match::No;
+    }
+    if (match_case && !security::same_case(msg->questions.front().qname, question.qname)) return Match::WrongCase;
+    return Match::Yes;
 }
 
 }  // namespace
@@ -36,11 +45,12 @@ UpstreamClient::~UpstreamClient() {
 
 UpstreamClient::QueryId UpstreamClient::send(const sockaddr_in& server, Message query,
                                              std::chrono::milliseconds timeout, Callback done,
-                                             UpstreamTransport transport) {
+                                             UpstreamTransport transport, bool match_case) {
     const bool    tcp = transport == UpstreamTransport::Tcp;
     const QueryId id  = next_id_++;
     Pending& p = pending_[id];
-    p.done     = std::move(done);
+    p.done       = std::move(done);
+    p.match_case = match_case;
     // arc4random is a CSPRNG (glibc >= 2.36 seeds it from getrandom()), so
     // the ID can't be predicted from earlier ones.
     p.txid = static_cast<uint16_t>(arc4random());
@@ -81,7 +91,9 @@ UpstreamClient::QueryId UpstreamClient::send(const sockaddr_in& server, Message 
     ++stats_.sent;
     p.timer = loop_.add_timer(timeout, [this, id] {
         ++stats_.timeouts;
-        finish(id, std::unexpected(UpstreamError::Timeout));
+        auto it = pending_.find(id);
+        const bool wrong_case = it != pending_.end() && it->second.wrong_case_seen;
+        finish(id, std::unexpected(wrong_case ? UpstreamError::CaseMismatch : UpstreamError::Timeout));
     });
     return id;
 }
@@ -129,7 +141,16 @@ void UpstreamClient::on_readable(QueryId id) {
         }
 
         auto msg = wire::parse(std::span<const uint8_t>(buffer_.data(), static_cast<size_t>(n)));
-        if (!answers(msg, p.txid, p.question)) {
+        const Match m = match(msg, p.txid, p.question, p.match_case);
+        if (m == Match::WrongCase) {
+            // Forged (the forger didn't know our case pattern), or a server
+            // that normalises case. Keep waiting: if the server does echo
+            // case, its real answer is still on the way.
+            ++stats_.case_mismatches;
+            p.wrong_case_seen = true;
+            continue;
+        }
+        if (m == Match::No) {
             ++stats_.mismatched;
             continue;  // keep waiting for the real answer
         }
@@ -177,7 +198,13 @@ void UpstreamClient::on_tcp_event(QueryId id, uint32_t events) {
         if (p.in.size() - 2 < length) continue;
 
         auto msg = wire::parse(std::span<const uint8_t>(p.in.data() + 2, length));
-        if (!answers(msg, p.txid, p.question)) {  // nothing else will come on this connection
+        const Match m = match(msg, p.txid, p.question, p.match_case);
+        if (m == Match::WrongCase) {  // nothing else will come on this connection
+            ++stats_.case_mismatches;
+            finish(id, std::unexpected(UpstreamError::CaseMismatch));
+            return;
+        }
+        if (m == Match::No) {
             ++stats_.mismatched;
             return broke_off();
         }

@@ -51,7 +51,7 @@ struct StubZone {
 struct ResolverConfig {
     std::string root_hints_path = "config/named.root";  // loaded by the caller: see RootHints
     bool     qname_minimisation   = true;   // not implemented yet (plan §6.1)
-    bool     use_0x20             = true;   // not implemented yet (plan §5.2)
+    bool     use_0x20             = true;   // random letter case in upstream queries (plan §5.2)
     uint16_t edns_buffer          = 1232;
     uint32_t max_upstream_queries = 30;     // per client query, sub-queries included
     uint16_t max_referral_depth   = 16;

@@ -214,7 +214,6 @@ Config parse(const YAML::Node& document) {
     }
     c.udp.max_response_size = r.edns_buffer;  // one EDNS buffer size, upstream and to clients
     if (r.qname_minimisation) c.not_implemented.push_back("resolver.qname_minimisation");
-    if (r.use_0x20) c.not_implemented.push_back("resolver.use_0x20");
 
     Section             cache(top.take("cache"), "cache");
     cache::CacheConfig& k  = c.cache;

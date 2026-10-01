@@ -589,6 +589,72 @@ TEST_F(ResolverTest, StubZoneBeatsACachedDelegationForTheSameZone) {
     EXPECT_EQ(other->queries, 0);
 }
 
+// ─── 0x20 encoding (plan §5.2) ─────────────────────────────────────────────
+
+namespace {
+
+bool has_upper_case(const Question& q) {
+    for (const auto& label : q.qname.original_case) {
+        for (char c : label) {
+            if (c >= 'A' && c <= 'Z') return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_F(ResolverTest, UpstreamQueriesUseRandomLetterCase) {
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());
+    int queries = 0, mixed = 0;
+    for (FakeAuth* s : {root, tld, ex1, ex2}) {
+        for (const auto& q : s->seen) {
+            ++queries;
+            mixed += has_upper_case(q);
+        }
+    }
+    EXPECT_EQ(queries, 3);
+    EXPECT_GT(mixed, 0);  // 13 letters each: all three in lower case has odds 2^-39
+}
+
+TEST_F(ResolverTest, Without0x20QueriesKeepTheCaseAsked) {
+    config.use_0x20 = false;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());
+    for (FakeAuth* s : {root, tld, ex1, ex2}) {
+        for (const auto& q : s->seen) EXPECT_FALSE(has_upper_case(q));
+    }
+}
+
+TEST_F(ResolverTest, AnswersComeBackInTheCaseTheClientAsked) {
+    // Servers echo our random case into the answer's owner names (they
+    // compress them against the question); the client must not see it.
+    auto r = resolve("WWW.Example.TEST", RRType::A);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->response.answers.at(0).name.original_case, (std::vector<std::string>{"WWW", "Example", "TEST"}));
+}
+
+TEST_F(ResolverTest, CaseNormalisingServerIsAskedAgainWithout0x20) {
+    // Some servers echo the question in lower case whatever was asked. The
+    // first time, the resolver waits for an exact echo, then asks again
+    // plainly; after that it doesn't use 0x20 with that server at all.
+    config.query_timeout_ms = 50;
+    auto normalise = [](const Message&, Message& r) {
+        r.questions[0].qname.original_case = r.questions[0].qname.labels;
+        return true;
+    };
+    ex1->tamper = ex2->tamper = normalise;
+    for (int i = 0; i < 6; ++i) {
+        auto r = resolve("w" + std::to_string(i) + ".example.test", RRType::A);
+        ASSERT_TRUE(r.has_value()) << i << ": " << resolve_error_to_string(r.error());
+        EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.2"}));
+    }
+    for (FakeAuth* ex : {ex1, ex2}) {
+        int random_case = 0;
+        for (const auto& q : ex->seen) random_case += has_upper_case(q);
+        EXPECT_LE(random_case, 1);  // once at most, then plain queries only
+    }
+}
+
 // ─── In-flight deduplication (plan §4.4) ───────────────────────────────────
 
 TEST_F(ResolverTest, IdenticalQueriesInFlightShareOneResolution) {

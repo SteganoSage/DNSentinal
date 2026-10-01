@@ -34,9 +34,11 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->cache.num_shards, 16u);
     EXPECT_FALSE(lists(*c, "listen.tcp"));
     for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation",
-                                "resolver.use_0x20", "cache.serve_stale", "access", "policy", "telemetry"}) {
+                                "cache.serve_stale", "access", "policy", "telemetry"}) {
         EXPECT_TRUE(lists(*c, feature)) << feature;
     }
+    EXPECT_TRUE(c->resolver.use_0x20);
+    EXPECT_FALSE(lists(*c, "resolver.use_0x20"));  // implemented (plan §5.2)
 }
 
 TEST(Config, EmptyConfigKeepsDefaults) {
@@ -58,6 +60,7 @@ TEST(Config, OnlyFeaturesThatAreOnAreReportedMissing) {
         "  prefetch: { enabled: false }\n");
     ASSERT_TRUE(c.has_value()) << c.error();
     EXPECT_TRUE(c->not_implemented.empty());
+    EXPECT_FALSE(c->resolver.use_0x20);
 }
 
 TEST(Config, ParsesStubZones) {

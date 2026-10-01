@@ -20,6 +20,8 @@ namespace dnsentinel::resolver {
 enum class UpstreamError {
     Timeout,       // no matching response in time
     NetworkError,  // could not send, the server's port is closed, or a TCP exchange broke off
+    CaseMismatch,  // timed out, but a reply matched in all but letter case (0x20): the server
+                   // probably normalises case (or that reply was forged)
 };
 
 enum class UpstreamTransport {
@@ -39,6 +41,7 @@ public:
         uint64_t timeouts   = 0;
         uint64_t errors     = 0;
         uint64_t mismatched = 0;  // wrong ID / question, or unparseable (possible spoofing)
+        uint64_t case_mismatches = 0;  // right ID and question, wrong letter case (0x20)
     };
 
     /// `loop` must outlive the client.
@@ -59,10 +62,17 @@ public:
     /// Over TCP (one query per connection) a mismatch is a NetworkError.
     /// `timeout` covers the whole exchange, TCP handshake included.
     ///
+    /// With `match_case` (0x20, plan §5.2) the reply must also echo the
+    /// question's letter case exactly. A reply that differs only in case is
+    /// counted and ignored like any other mismatch; if nothing better comes
+    /// before the timeout, the query ends with CaseMismatch instead of
+    /// Timeout, so the caller can tell a case-normalising server from a dead one.
+    ///
     /// `done` is called exactly once, and never before send() returns,
     /// unless the query is cancelled first.
     QueryId send(const sockaddr_in& server, Message query, std::chrono::milliseconds timeout,
-                 Callback done, UpstreamTransport transport = UpstreamTransport::Udp);
+                 Callback done, UpstreamTransport transport = UpstreamTransport::Udp,
+                 bool match_case = false);
 
     /// Abandon a query without calling its callback. Unknown ids are ignored.
     void cancel(QueryId id);
@@ -76,6 +86,8 @@ private:
         Question                question;
         net::EventLoop::TimerId timer = 0;
         Callback                done;
+        bool                    match_case      = false;  // 0x20
+        bool                    wrong_case_seen = false;
         // TCP only
         std::vector<uint8_t> out;  // the framed query
         size_t               written = 0;
