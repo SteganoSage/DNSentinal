@@ -7,16 +7,17 @@
 ## Table of Contents
 
 1. [Project Overview & Architecture Recap](#1-project-overview--architecture-recap)
-2. [Phase 1 — Foundation (Weeks 1–2)](#2-phase-1--foundation-weeks-12)
-3. [Phase 2 — Working Resolver (Weeks 3–4)](#3-phase-2--working-resolver-weeks-34)
-4. [Phase 3 — Robust Core (Weeks 5–6)](#4-phase-3--robust-core-weeks-56)
-5. [Phase 4 — Security & Policy (Weeks 7–8)](#5-phase-4--security--policy-weeks-78)
+2. [Phase 1 — Foundation (Weeks 1–3)](#2-phase-1--foundation-weeks-13)
+3. [Phase 2 — Working Resolver (Weeks 3–5)](#3-phase-2--working-resolver-weeks-35)
+4. [Phase 3 — Robust Core (Weeks 5–7)](#4-phase-3--robust-core-weeks-57)
+5. [Phase 4 — Security & Policy (Weeks 7–9)](#5-phase-4--security--policy-weeks-79)
 6. [Phase 5 — Privacy & ML Integration (Weeks 9–10)](#6-phase-5--privacy--ml-integration-weeks-910)
 7. [Phase 6 — Observability (Week 11)](#7-phase-6--observability-week-11)
-8. [Phase 7 — Evaluation (Weeks 12–13)](#8-phase-7--evaluation-weeks-1213)
+8. [Phase 7 — Evaluation (Weeks 10–13)](#8-phase-7--evaluation-weeks-1013)
 9. [Phase 8 — Final (Week 14)](#9-phase-8--final-week-14)
-10. [Cross-Cutting Concerns](#10-cross-cutting-concerns)
-11. [Risk Register & Contingencies](#11-risk-register--contingencies)
+10. [Optional Extensions (O1–O4, gated)](#10-optional-extensions-o1o4-gated)
+11. [Cross-Cutting Concerns](#11-cross-cutting-concerns)
+12. [Risk Register & Contingencies](#12-risk-register--contingencies)
 
 ---
 
@@ -31,7 +32,7 @@ Every query flows through two parallel paths:
 **Fast path (synchronous, blocks the response):**
 ```
 Client query → ACL check → Rate limit → Dynamic rules → Blocklist lookup
-→ DGA classifier (cached per domain) → Cache lookup → [miss] → Resolver
+→ DGA classifier [+ optional O2 look-alike check] (verdicts cached per domain) → Cache lookup → [miss] → Resolver
 → Post-resolution checks (CNAME chain, rebinding) → Response
 ```
 The fast path must add **< 1ms** of latency. Everything here is C++ and runs in the event-loop thread.
@@ -45,6 +46,10 @@ Every query+response event → in-memory ring buffer → Unix socket
                             block rule back to the fast-path policy engine
 ```
 The slow path receives a **copy** of events and processes them out-of-band. Detection delay is seconds, not milliseconds, and that's acceptable because tunnelling can only be identified over time.
+
+**Offline path (optional O1, §10):** a nightly batch job outside the resolver (tracker discovery) that analyses crawl data and proposes new tracker domains. It never touches live queries; its only output is a candidate list that a person approves into the local custom blocklist.
+
+**Where ML verdicts go:** a high-risk fast-path verdict (enforce mode) and every slow-path detection become **time-limited dynamic rules** in their own table, which the fast path checks before the blocklist. ML never edits the blocklist trie (§6.9).
 
 ### Module Dependency Order
 
@@ -64,11 +69,12 @@ This is the order modules must be built. Each depends on the ones above it:
 11. telemetry/event_bus (feed the slow path)
 12. analyzer/* (Python slow-path detectors)
 13. telemetry/metrics + query_log + dashboard
+14. optional, gated, in this order (§10): O1 tracker discovery → O2 look-alike detector → O3 learned prefetching → O4 DNSSEC
 ```
 
 ---
 
-## 2. Phase 1 — Foundation (Weeks 1–2)
+## 2. Phase 1 — Foundation (Weeks 1–3)
 
 ### 2.1 Module: Core Types (`types.h`)
 
@@ -278,6 +284,14 @@ Store labels in both canonical (lowercase) and original-case form as you parse t
 
 **WSL2:** the WSL2 kernel (6.x) has everything the lab needs — network namespaces, veth, bridges, `tc netem` and TUN were checked. See §9 for how to make a WSL2-hosted resolver reachable from phones.
 
+**Building the lab (README §10, EVALUATION.md §3):** the topology is built with a **Mininet** script, so one command recreates it. Mininet hosts are network namespaces, so everything above applies; `setup_lab.sh` with plain `ip netns` is the fallback. The lab hierarchy's servers run NSD or BIND, in containers or as Mininet hosts. The WSL2 kernel ships the Open vSwitch module Mininet's default switch needs (`sudo apt install mininet openvswitch-switch`).
+
+**Start these early (cheap, and they can't be done retroactively):**
+- **Weekly list snapshots:** download the ad/tracker blocklists and DuckDuckGo Tracker Radar every week into dated folders (e.g. `ml/data/snapshots/2026-10-05/`). If optional O1 is built, its main experiment (E15's time split) needs this history.
+- **Real traffic trace W1:** collect from the team's own devices (with consent, client IPs anonymised) as soon as the resolver runs (EVALUATION.md §3.5).
+
+**Repository layout additions (README §9):** `crawler/` (Playwright crawler for E12, and O1's training data), `sim/ns3/` (ns-3 scenarios, `DnsQueryApp`), `theory/` (analytical models A1–A3), and under `ml/`: `tracker/`, `lookalike/`, `prefetch/` for O1–O3.
+
 **DGA dataset collection (M4 starts in parallel):**
 - Download the Tranco top-1M list (benign domains)
 - Run open-source DGA family reimplementations to generate malicious domain names
@@ -285,7 +299,7 @@ Store labels in both canonical (lowercase) and original-case form as you parse t
 
 ---
 
-## 3. Phase 2 — Working Resolver (Weeks 3–4)
+## 3. Phase 2 — Working Resolver (Weeks 3–5)
 
 ### 3.1 Module: Event Loop (`net/event_loop.cpp`)
 
@@ -470,7 +484,7 @@ This is the same exponential moving average used for TCP RTT estimation. Pick th
 
 ---
 
-## 4. Phase 3 — Robust Core (Weeks 5–6)
+## 4. Phase 3 — Robust Core (Weeks 5–7)
 
 ### 4.1 Module: TCP Listener (`net/tcp_listener.cpp`)
 
@@ -565,7 +579,7 @@ When we receive an upstream UDP response with the TC bit set, re-send the same q
 
 ---
 
-## 5. Phase 4 — Security & Policy (Weeks 7–8)
+## 5. Phase 4 — Security & Policy (Weeks 7–9)
 
 ### 5.1 Module: Random Source Port (`security/randomisation.cpp`)
 
@@ -656,15 +670,24 @@ Root
 
 **Operations:**
 - **Insert:** Split the domain into labels, reverse them, walk/create trie nodes, mark the terminal node with the action (block/allow).
-- **Lookup:** Split the query domain into labels, reverse them, walk the trie. At each level, check if the current node is marked. The deepest match wins. An allow marking overrides a block marking at the same or deeper level.
+- **Lookup:** Split the query domain into labels, reverse them, walk the trie. At each level, check if the current node is marked. **Any allow rule that covers the name wins, at any depth** (README §7.6.2: allowlist beats blocklist), so allowing `example.com` also overrides a block on `ads.example.com`. Otherwise the deepest block rule is reported.
+- **Built once, never edited:** a builder collects the rules, sorts them by reversed labels and freezes them into flat arrays (each distinct label stored once, children sorted for binary search). ~114k feed domains take ~3.8 MiB and ~0.3 s to build (Release).
 - **Complexity:** O(number of labels in the query) — typically 3–4. Independent of the number of rules in the list (could be 500k+).
 
 **Loading lists:**
-- Support hosts-format (`0.0.0.0 ads.example.com`) and plain domain-list format (one domain per line).
-- Lines starting with `#` are comments.
+- Support hosts-format (`0.0.0.0 ads.example.com`, several names per line), plain domain-list format (one domain per line), `*.example.com`, and adblock-style `||example.com^`. Anything more complex (`$` modifiers, `@@` exceptions, URL patterns) is skipped and counted.
+- `#` starts a comment (also mid-line); `!` and `[...]` lines are adblock comments/headers. Hosts-file boilerplate (`localhost`, `ip6-*`, `broadcasthost`) is ignored; the root name is never accepted.
+- **Public feeds:** `config/lists/download_feeds.sh` fetches StevenBlack hosts (ads), EasyPrivacy domains (trackers) and URLhaus (malware) into `config/lists/feeds/` (gitignored), with a `SOURCES.txt` of dates and hashes. A list that can't be read stops startup.
 - Load multiple files and merge into one trie.
+- Also load the **local custom blocklist** (`config/lists/custom_block.txt`) and the allowlist. Besides the public feeds, the custom file is the **only way into permanent blocking**: a person confirms an alert on the dashboard (§7.5), or (optional O1) approves a tracker-discovery candidate (§10). It takes effect at the next reload.
+- **A lookup says why:** the matching rule and the list file it came from, for the query log and the dashboard (e.g. blocked by `doubleclick.net` in `trackers.txt`).
+- **ML never edits the trie.** ML verdicts are time-limited dynamic rules in a separate table (§6.9).
 
 **Hot reload:** Build a new trie from the (possibly updated) files, then atomically swap the pointer. Old trie is destroyed when no queries are using it (use `std::shared_ptr` or a read-copy-update pattern). This allows blocklist updates without restarting the resolver.
+- **Triggers:** `SIGHUP` (via an eventfd the loop watches), or a changed list file (mtime, size or inode, checked every `policy.reload_check_seconds`, default 60).
+- The files are read on a worker thread; the event loop picks up the finished trie and swaps it in, so lookups never take a lock. A failed reload (e.g. a list was deleted) is logged and **the old lists stay in use**; it is retried only when the files change again.
+
+**What a blocked name gets** (`policy/blocklists.h`, in `QueryProcessor` after access control, before resolution): `block_response: null_ip` answers A with `0.0.0.0`, AAAA with `::` and other types with NODATA; `nxdomain` answers NXDOMAIN. Both carry `block_ttl` (default 60 s). Nothing is sent upstream.
 
 ### 5.7 Module: CNAME Cloaking Check (`policy/cname_check.cpp`)
 
@@ -844,7 +867,8 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 - Check against a **popular-domain allowlist** (top 100k Tranco). If on the list → skip scoring entirely (no false-positive risk, no latency).
 - If not on the list → compute features, run the model, get a score (0.0 = benign, 1.0 = DGA).
 - **Cache the verdict** per registrable domain. The domain `x7kq2mzpfa.com` is scored once; all subsequent queries for any subdomain of it reuse the cached score.
-- If score > threshold (e.g. 0.9) and mode is "enforce" → block. If mode is "monitor" → log alert, allow.
+- If score > threshold (e.g. 0.9) and mode is "enforce" → block, and record it as a time-limited dynamic rule (§6.9) so it shows on the dashboard with its score and expires on its own. If mode is "monitor" → log alert, allow.
+- **Build the stage as a list of domain scorers** sharing one verdict cache and feeding the same fusion (§6.9). The DGA classifier is the first; the optional look-alike detector (O2, §10) plugs in as a second scorer without redesign.
 
 ### 6.5 Module: Event Bus (`telemetry/event_bus.cpp`)
 
@@ -939,10 +963,18 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 | Medium | 0.3 – 0.6 | Dashboard alert with full explanation |
 | High | 0.6 – 1.0 | Block domain for that client (time-limited), push dynamic rule to policy engine |
 
-**Dynamic rules:** A high-risk verdict creates a rule like "block `*.suspicious-domain.net` for client `192.168.1.23` for 1 hour." This rule is pushed to the resolver's policy engine (via a control socket or shared state), where the fast path enforces it on all subsequent queries. The rule has:
+**Dynamic rules:** A high-risk verdict creates a rule like "block `*.suspicious-domain.net` for client `192.168.1.23` for 1 hour." This rule is pushed to the resolver's policy engine over the control socket (§11), where the fast path enforces it on all subsequent queries. The rule has:
 - An expiry time (auto-unblock after duration)
 - A reason string (for the dashboard)
 - The contributing scores and features (for explainability)
+
+**Where dynamic rules live (`policy/dynamic_rules.{h,cpp}`):** a small hash table keyed by registrable domain, optionally with a client address, checked **before** the blocklist trie on every query and pruned as rules expire. The analyzer adds and removes rules over the control socket; a high-risk fast-path DGA verdict in enforce mode adds one directly (§6.4). **ML never edits the blocklist trie**, because:
+- ML can be wrong: a temporary rule undoes itself, a permanent list entry does not.
+- An attacker could deliberately trigger false verdicts to get legitimate domains blocked permanently.
+- Tunnel and burst verdicts are per client, while the trie is network-wide.
+- The trie is rebuilt from files and swapped in atomically (§5.6); live edits from another process would complicate that.
+
+**The only ways into the permanent blocklist:** the public list feeds, and the local custom blocklist file. A domain reaches the custom file when a person confirms an alert on the dashboard (§7.5) or, with O1, when a tracker-discovery candidate is approved (§10). Alerts marked as false alarms go to the allowlist and are saved as **labelled examples for retraining** (`ml/data/feedback/`).
 
 ---
 
@@ -971,6 +1003,7 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 - If `remaining_pct < 10` (configurable threshold) AND the entry has been hit multiple times (it's popular), set `needs_prefetch = true` in the lookup result.
 - The caller triggers a background resolution for this name. The result updates the cache entry with a new TTL.
 - From the user's perspective, popular names never expire — they always get a fast cache answer, and the cache is silently kept fresh.
+- **Optional O3 (§10)** builds on this background-refresh path: a learned model predicts each device's next names and requests them in advance, within a budget of extra upstream queries. Count prefetches (and later, wasted ones) from the start so the budget has something to measure.
 
 ### 7.3 Module: Query Log (`telemetry/query_log.cpp`)
 
@@ -1038,29 +1071,34 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 2. **Custom alert UI** (simple web page):
    - List of ML alerts with timestamp, client, domain, risk score, and contributing features
    - Feature explanation: "unique subdomains: 412/min, mean entropy: 4.8 bits/char, tunnel_score: 0.92"
-   - One-click buttons: "Add to allowlist" / "Permanently block" / "Dismiss"
-   - These actions update the resolver's policy via the control socket
+   - One-click buttons:
+     - **Permanently block** → appends the domain to the local custom blocklist file (applied at the next list reload; the dynamic rule covers it until then)
+     - **False alarm / Add to allowlist** → appends to the allowlist, removes the dynamic rule, and saves the alert's features as a labelled example for retraining (`ml/data/feedback/`)
+     - **Dismiss** → closes the alert; its dynamic rule expires on its own
+   - All of these go through the control socket (§11); the resolver takes policy changes from nowhere else.
+
+3. *(Optional O1)* **Tracker candidate review:** the nightly candidate list, each domain with its score and evidence (prevalence, nearest known trackers). Approving one appends it to the custom blocklist file.
 
 ---
 
-## 8. Phase 7 — Evaluation (Weeks 12–13)
+## 8. Phase 7 — Evaluation (Weeks 10–13)
 
-### All 12 Experiments
+**EVALUATION.md is the source of truth** for the evaluation: claims C1–C13 (and optional C14–C16), every experiment's hypothesis, setup, baseline and success criterion, the statistics rules, the figure plan and the report structure. This section only lists what has to exist to run it.
 
-| # | Question | Detailed Method | Key Metrics |
-|---|---|---|---|
-| E1 | Is resolution correct? | Resolve top 10k Tranco with DNSentinel and Unbound; compare answer IP sets | % matching, SERVFAIL rate |
-| E2 | How fast is it? | `dnsperf` with cold cache (first run) and warm cache (second run); compare latency distributions with Unbound | p50/p95/p99 latency (ms), max sustained QPS before >1% loss |
-| E3 | Cache effectiveness? | Replay a multi-hour query trace captured from our own devices; measure hit ratio over time | Cache hit ratio (%), upstream queries saved (%) |
-| E4 | Serve-stale impact? | During a replayed trace, cut the upstream link for 5 minutes; measure how many queries are answered | % queries answered during outage, with vs without serve-stale |
-| E5 | Poisoning resistance? | Kaminsky attack at 4 defence levels; count forged packets to success | Packets to success (or "failed after N million"), per defence level |
-| E6 | Privacy cost? | Latency with/without QNAME minimisation; latency over DoT/DoH vs plain UDP | Added latency per query (ms), extra upstream queries (%) |
-| E7 | DGA detection? | Random split AND leave-family-out cross-validation | Per-family P/R/F1, ROC AUC, PR AUC, false positives per day of real browsing |
-| E8 | Tunnel detection? | Run iodine/dnscat2 at 5 different throughput rates (10 kbps to 500 kbps); run 24h of benign traffic | Recall per rate, FP per day, detection delay (seconds from tunnel start to alert) |
-| E9 | ML latency cost? | Benchmark queries with and without fast-path DGA scoring enabled | Microseconds added per query (histogram); effect of verdict caching |
-| E10 | Abuse resistance? | Send spoofed-source queries from attacker namespace while legitimate clients query; measure amplification | Amplification factor with RRL off vs on; legitimate client success rate |
-| E11 | Parser robustness? | Run libFuzzer and/or AFL++ for 48+ hours; report crashes and code coverage | Crashes found/fixed, line/branch coverage (%) |
-| E12 | Blocking in practice? | Browse top 50 websites with blocking enabled; compare network requests against unblocked baseline | % tracker requests blocked, CNAME-cloaked trackers caught, pages visually broken |
+**Four levels of evidence (README §10.2):** analytical models (A1 poisoning cost, A2 cache hit ratio, A3 latency under load; MATLAB/Octave or Python in `theory/`), simulation (ns-3 in emulation mode, S1–S3; falls back to Mininet + `tc netem` if real-time emulation is unstable), emulated labs (Mininet), and real-network measurement.
+
+| Group | Items | Needs |
+|---|---|---|
+| Analytical models | A1, A2, A3 | Nothing from the code; done by week 8 |
+| Simulation | S1–S3 | DoT/DoH, QNAME minimisation, serve-stale, rate limiting; ns-3 setup |
+| Core experiments | E1–E14 | The whole core; the lab hierarchy (§2.5); the benchmark harness; the Playwright crawler (E12); Singularity of Origin (E13) |
+| Optional experiments | E15–E17 | Only for whichever of O1–O3 were built (§10) |
+
+**Targets are frozen in week 6:** hypotheses and success criteria are reviewed and committed before the final runs (EVALUATION.md §9).
+
+**Hooks the code must provide:**
+- **Weak mode for E5:** a lab-only compile-time option that shrinks the transaction-ID space, fixes the source port, and can switch off 0x20, bailiwick checks and spoof detection (the defence ladder L0–L5). Release builds can never be weakened by configuration.
+- **Counters for every defence and policy stage** (forged replies, case mismatches, bailiwick drops, ACL refusals, blocks per list, RRL drops), exposed as metrics (§7.4), so experiments read numbers rather than parse logs.
 
 **Every experiment is:**
 - Scripted (reproducible from `bench/scripts/`)
@@ -1074,10 +1112,11 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 
 ### Report Structure
 Each team member writes the sections they own:
-- M1: Wire format, resolver algorithm, QNAME minimisation, E1/E11 results
-- M2: Event loop, cache, serve-stale, prefetch, E2/E3/E4/E9 results
-- M3: Security defences, policy engine, DoT/DoH, attack lab, E5/E6/E10/E12 results
-- M4: ML models, analyzer, dashboard, E7/E8 results
+- M1: Wire format, resolver algorithm, QNAME minimisation; test frameworks; E1/E11 results
+- M2: Event loop, cache, serve-stale, prefetch; benchmark harness, models A2/A3, ns-3 S1–S3; E2/E3/E4/E14 results
+- M3: Security defences, policy engine, DoT/DoH, attack lab; lab DNS hierarchy, Mininet lab, model A1; E5/E6/E10/E12/E13 results
+- M4: ML models, analyzer, dashboard; real traffic trace W1; E7/E8/E9 results
+- Optional extensions, if built (README §14): O1 — M3 (crawler, data) with M4 (model); O2 — M1 (punycode/IDN) with M4 reviewing the model; O3 — M2
 
 ### Demo Script (10 minutes)
 1. Show a phone (DoT) and laptop (DoH) browsing with DNSentinel — pages load, ads disappear
@@ -1086,7 +1125,8 @@ Each team member writes the sections they own:
 4. Start an iodine tunnel → alert appears on dashboard with feature explanation → auto-blocked
 5. Run DGA simulator → NXDOMAIN burst + DGA scores → client flagged
 6. Cut the upstream link → serve-stale keeps recent sites working
-7. Show key evaluation graphs
+   - *If O1 was built:* show the nightly candidate list with a newly discovered tracker, its evidence, and approving it into the blocklist
+7. Close with the headline graphs: poisoning cost measured vs model (F6), cache hit ratio vs theory (F3), privacy cost across simulated link types (F7) (figure IDs: EVALUATION.md §11)
 
 ### Demo Logistics
 - **Two modes.** Steps 1–2 need the real internet: the resolver uses the IANA root hints, and phones and laptops browse normally. Steps 3–6 run in the lab mini-internet (§2.5). With stub zones (§3.3), one resolver does both at once: real browsing plus `.lab` attack domains.
@@ -1099,7 +1139,43 @@ Everyone must be able to explain every module, not just their own. Drill the Q&A
 
 ---
 
-## 10. Cross-Cutting Concerns
+## 10. Optional Extensions (O1–O4, gated)
+
+Designed now (README §4, §7.8.7) so they can be added without redesign, but **built only if time allows**. The project's claims don't depend on them; anything not built goes into the report's Future Work chapter, with its design.
+
+**Gate (README §14):** start only if M-C (Phase 4) is complete by the end of week 9 and later milestones are on track. Take the queue **in order, one item at a time**: O1, then O2, then O3, then O4.
+
+| Item | What it adds | Where it runs | Core hooks it needs (worth building anyway) | Experiment | Owners |
+|---|---|---|---|---|---|
+| **O1** Tracker discovery | Finds tracker domains before public lists do | Offline, nightly (`ml/tracker/`, `crawler/`) | Custom blocklist file and hot reload (§5.6); event-bus records with client and timestamp (§6.5); candidate review page (§7.5) | E15 | M3 (crawl, data) + M4 (model) |
+| **O2** Look-alike detector | Flags brand imitations: typos, homographs | Fast path, next to the DGA classifier | The domain-scorer interface and shared verdict cache (§6.4); fusion inputs (§6.9) | E16 | M1 (punycode/IDN) + M4 |
+| **O3** Learned prefetching | Predicts each device's next names | Slow path (analyzer) | A `prefetch` control-socket command, and a budget counter on the background-refresh path (§7.2, §11) | E17 | M2 |
+| **O4** DNSSEC validation | Validates signatures from the root trust anchor | Resolver | The DO bit, and RRSIG/DNSKEY/DS records already kept as raw records (Modules 1–2) | — (stretch) | M1 |
+
+### O1 — Tracker discovery (priority 1)
+- **Data:** Playwright loads the top 1,000–5,000 Tranco sites through DNSentinel, reusing the E12 crawler. The crawler tags each page load, so the lookups it causes form one burst. Labels: DuckDuckGo Tracker Radar and public tracker lists, using the weekly snapshots (§2.5) for the time split.
+- **Features:** prevalence across unrelated sites; a word2vec co-occurrence embedding (each burst a "sentence", each domain a "word": the Dns2Vec idea); lexical n-grams; infrastructure shared with known trackers (IPs, CNAME targets, name servers).
+- **Model:** gradient boosting (or a small MLP) giving a tracker probability per domain.
+- **Nightly output:** a candidate list with scores and evidence → reviewed on the dashboard → approved domains appended to the custom blocklist file → loaded at the next reload. Optionally, auto-approve above a very high threshold.
+- **Never touches live queries.**
+
+### O2 — Look-alike detector (priority 2)
+- **Pipeline:** decode punycode (RFC 3492) → map confusable characters to a "skeleton" with the Unicode confusables data (UTS #39) → compare with a protected list (top Tranco brands plus user-defined names) → features (edit distance to the nearest protected name, brand as a token, brand in a subdomain, suspicious words like `login`/`verify`, TLD, length) → gradient boosting, compared with a character CNN reusing the DGA pipeline.
+- **Runs as a second fast-path scorer** (§6.4): scores the registrable domain, caches the verdict, feeds the same fusion and actions. Protected names themselves and allowlisted popular domains are skipped.
+- **Data:** dnstwist permutations of protected names; real look-alike phishing domains (OpenPhish, PhishTank); negatives that include legitimate brand-like names.
+- **Implementation note:** punycode decoding and the skeleton mapping run in C++ on the fast path. Generate the confusables table from the Unicode data file; don't write it by hand.
+
+### O3 — Learned prefetching (priority 3)
+- **Models, simplest first:** the core TTL-based prefetch (§7.2) as the baseline → a per-device first-order Markov model → a small LSTM/GRU over recent domain IDs.
+- **Runs in the analyzer:** for each event, predict the next names; when a prediction is above a probability threshold and the name isn't fresh in the cache, send `prefetch <name> <type>` over the control socket.
+- **Budget:** the resolver caps prefetches at a fraction of real query volume (e.g. 10%) and counts wasted ones (never used before expiry). QNAME minimisation still applies; the small privacy cost of names fetched but never visited is stated in the report.
+
+### O4 — DNSSEC validation (stretch)
+- Validate the chain of trust from the root trust anchor (DS → DNSKEY → RRSIG) for answers, set AD on validated answers and honour CD. The largest item, so it comes last.
+
+---
+
+## 11. Cross-Cutting Concerns
 
 ### Error Handling Strategy
 - **Network errors** (timeouts, connection refused): retry with next server, bounded by deadline. Return SERVFAIL only after all options exhausted.
@@ -1114,6 +1190,13 @@ Everyone must be able to explain every module, not just their own. Drill the Q&A
 - Use `std::span` instead of raw pointer + length.
 - Use `std::expected` for error returns instead of exceptions (no unwinding cost, explicit error handling).
 
+### Control Socket
+The only way anything outside the resolver changes its behaviour: one local Unix socket (e.g. `run/dnsentinel.ctl`), writable only by the service's user. The analyzer and the dashboard use it. Commands:
+- `add_rule` / `remove_rule`: dynamic rules (§6.9): domain, optional client, action, expiry, reason, scores
+- `reload_lists`: rebuild the blocklist trie from the list files (§5.6)
+- `stats`: counters for the dashboard and experiments
+- `prefetch` (optional O3, §10): resolve a name in the background, within the prefetch budget
+
 ### Configuration Loading
 - Parse `config/dnsentinel.yaml` at startup using a YAML library (e.g. `yaml-cpp`).
 - Validate all values at startup (e.g. `edns_buffer` must be ≥ 512 and ≤ 4096).
@@ -1126,7 +1209,7 @@ Everyone must be able to explain every module, not just their own. Drill the Q&A
 
 ---
 
-## 11. Risk Register & Contingencies
+## 12. Risk Register & Contingencies
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
@@ -1138,7 +1221,10 @@ Everyone must be able to explain every module, not just their own. Drill the Q&A
 | DoH HTTP/2 implementation too complex | Medium | Medium | Fall back to HTTP/1.1. Still functional, just less efficient. |
 | ML false positives on legitimate traffic | Medium | High | Popular-domain allowlist, monitor-only mode as default, time-limited blocks, one-click override on dashboard |
 | Broken servers reject minimised queries | Low | Low | RFC 9156 fallback logic: retry with full name for that zone |
-| DNSSEC stretch goal too large | High | Low | It's explicitly a stretch goal. Core project is complete without it. |
+| DNSSEC stretch goal too large | High | Low | It's explicitly a stretch goal (O4, last in the optional queue). Core project is complete without it. |
+| Optional extensions eat into core time | High | High | Gate (§10): start only if M-C is done by the end of week 9; one at a time, in order; no claim depends on them; unbuilt items become Future Work. |
+| Attackers trigger false ML verdicts to get legitimate domains blocked | Medium | Medium | Verdicts become expiring dynamic rules; permanent blocking only through human approval (§6.9). |
+| ns-3 real-time emulation is unstable or can't keep up | Medium | Low | Run the same scenarios on Mininet with `tc netem` (README §10.2) and say so in the report. |
 | Team member unavailable for their phase | Medium | High | Everyone reviews every PR and can explain every module. Overlap in expertise. |
 
 ---

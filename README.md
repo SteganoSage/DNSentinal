@@ -56,10 +56,10 @@ Every connection a device makes starts with a DNS lookup. That makes DNS the bes
 | **Protocol core** | A recursive resolver written from scratch: its own packet parser, iterative resolution from the root servers, caching, UDP/TCP/EDNS0 |
 | **Security** | Blocklists, CNAME-cloaking detection, cache-poisoning hardening (TXID + port randomisation, 0x20 encoding, bailiwick checks), DNS rebinding protection, response rate limiting |
 | **Privacy** | DNS-over-TLS and DNS-over-HTTPS for clients, QNAME minimisation towards upstream servers |
-| **ML** | A DGA (malware domain) classifier, a DNS tunnelling detector, and an NXDOMAIN-burst signal, fused into one risk score |
+| **ML** | A DGA (malware domain) classifier, a DNS tunnelling detector, and an NXDOMAIN-burst signal, fused into one risk score. *Optional, if time allows:* ML tracker discovery, a look-alike (phishing) domain detector, and learned prefetching |
 | **Observability** | Per-client query logs, metrics, and a dashboard that explains every block and alert |
 
-The project is evaluated experimentally: resolver latency against a production resolver, cache effectiveness, resistance to a real poisoning attack in an isolated lab, the cost of privacy features, and ML precision, recall, false-positive rate and added latency.
+The project is evaluated experimentally, and every claim is checked against evidence at up to four levels: **analytical models** (MATLAB/Python), **network simulation** (ns-3 in emulation mode), **emulated labs** (Mininet/namespaces) and **real-network measurement**. Experiments cover correctness and latency against a production resolver, cache effectiveness against caching theory, resistance to a real poisoning attack against a probability model, the cost of privacy features across simulated link types, and ML precision, recall, false-positive rate and added latency. The full plan, including the report structure, is in **[EVALUATION.md](EVALUATION.md)**.
 
 **Why this project:** every feature maps to core Computer Networks theory (application-layer protocols, UDP vs TCP, caching, hierarchical naming, TLS, security), and because we implement the protocol ourselves rather than calling a library, we understand every byte that goes over the wire.
 
@@ -248,12 +248,26 @@ Every design choice in the rest of this document traces back to one of these six
 | G9 | Per-client logging, metrics and an explainable dashboard | R6 |
 | G10 | Rigorous experimental evaluation of every feature | All |
 
+### Optional goals (only after the core is done, in this order)
+
+| Priority | ID | Optional goal | Requirement | Design |
+|---|---|---|---|---|
+| **1 (first)** | O1 | **ML tracker discovery:** find ad and tracker domains that aren't on any blocklist yet | R3 | §7.8.7 |
+| 2 | O2 | **Look-alike domain detector:** flag domains imitating well-known brands (typos, homographs) | R4 | §7.8.7 |
+| 3 | O3 | **Learned prefetching:** predict which names each device will query next and resolve them in advance | R6 | §7.8.7 |
+| 4 | O4 | **DNSSEC validation** (stretch goal) | R1 | §7.9 |
+
+**Rules for optional work:**
+- Optional work starts only when the core milestones are on track (see §14), and the queue is taken **in order, one item at a time**. O1 is the first thing to add if there is time.
+- Each optional item is designed now so that it can be picked up without redesign, but **the project's claims do not depend on any of them.**
+- Anything not completed goes into the report's *Future Work* chapter, with its design from §7.8.7.
+
 ### Non-Goals
 
 - **Being an authoritative server** for public zones. We may serve a few local names (e.g. `nas.home`), nothing more.
 - **Competing with Unbound or BIND on raw performance.** We aim for "fast enough for a network of ~50–100 devices" and measure honestly against them.
 - **Stopping a determined attacker who controls a client device.** Such an attacker can use hard-coded IPs or other protocols. We raise the cost and create visibility.
-- **Full DNSSEC** is a stretch goal, not a promise (§7.9).
+- **DNSSEC and the optional ML extensions** (O1–O4 above) are optional goals, not promises.
 - **Deep packet inspection of non-DNS traffic.**
 
 ---
@@ -334,6 +348,8 @@ A key design idea is to split decisions into two paths.
 **The slow path (asynchronous)** receives a copy of every query and response event through an in-memory queue and never blocks resolution. It holds the detectors that need **history**: tunnelling detection and NXDOMAIN bursts. When the slow path decides something is malicious, it pushes a new rule (e.g. "block `*.attacker.com` for client 192.168.1.23") back into the policy engine, which the fast path then enforces.
 
 **Why:** tunnelling cannot be judged from one query, and we refuse to make every DNS answer wait on a model that looks at a sliding window. This is the same split used in real network security systems (inline enforcement, out-of-band analysis).
+
+**An offline path (optional O1).** If ML tracker discovery is built, it runs as a third, **offline** path: a nightly batch job outside the resolver that analyses crawl data and proposes new tracker domains for the blocklist. It never touches live queries, so it cannot slow down or destabilise resolution (§7.8.7).
 
 ### 6.3 How each part of the problem maps to the solution
 
@@ -572,7 +588,15 @@ Token buckets are the same algorithm studied in traffic shaping.
 
 #### 7.6.6 Dynamic rules from the ML slow path
 
-The slow path can insert time-limited rules like "block `*.suspicious-domain.net` for client X for 1 hour". These have an expiry, a reason and a model score, all shown on the dashboard.
+The slow path (and a high-risk fast-path verdict in enforce mode) can insert time-limited rules like "block `*.suspicious-domain.net` for client X for 1 hour". These have an expiry, a reason and a model score, all shown on the dashboard.
+
+**Dynamic rules are kept separate from the blocklist trie.** They live in a small hash table keyed by domain (and optionally client), checked *before* the blocklist on every query, and removed when they expire. ML never edits the trie directly, because:
+- ML can be wrong; a temporary rule undoes itself, a permanent list entry does not.
+- An attacker could deliberately trigger false verdicts to get legitimate domains blocked permanently.
+- Tunnel and burst verdicts are per client, while the trie is network-wide.
+- The trie is rebuilt from list files and swapped in atomically (§7.6.2); live edits from another process would complicate that.
+
+**The only ways into the permanent blocklist** are the public list feeds, and the **local custom blocklist file**. A domain reaches the custom file when a person confirms an alert on the dashboard, or (optional O1) when the tracker-discovery candidate list is approved. The custom file is loaded into the trie at the next reload. Alerts marked as false alarms go to the allowlist and are saved as labelled examples for retraining.
 
 ### 7.7 Privacy: QNAME Minimisation and Encrypted DNS
 
@@ -693,6 +717,76 @@ Operating mode is configurable: **monitor-only** (alert, never block) vs **enfor
 - **Adversarial check:** dictionary-based DGAs (concatenated English words) are known to evade character-statistics models. We test on them and report the result honestly.
 - **Latency:** microseconds added per query (fast path), and detection delay (seconds from tunnel start to alert) for the slow path.
 
+#### 7.8.7 Optional ML extensions (O1–O3)
+
+These are designed now but **built only if time allows**, in priority order (§4). Their experiments are E15–E17 in EVALUATION.md.
+
+##### O1 — ML tracker discovery (optional, priority 1)
+
+**Problem.** Ad and tracker blocklists are maintained by people, so new tracker domains get through until someone reports them. O1 finds likely trackers **before** they reach the lists.
+
+**Key idea.** Trackers behave differently from ordinary sites in DNS traffic:
+- **Prevalence:** a tracker is looked up during visits to many unrelated websites, while a site's own domains appear only when that site is visited. Only a network-wide resolver sees this.
+- **Company they keep:** trackers tend to be looked up in the same burst as other trackers.
+- **Shared infrastructure:** they often share IP addresses, CNAME targets or name servers with known trackers.
+
+**Data.** A headless browser (Playwright) loads the top 1,000–5,000 Tranco sites through DNSentinel. This reuses the crawler built for experiment E12. Each page load produces a burst of DNS lookups tagged with the site that caused it.
+
+**Labels.** DuckDuckGo Tracker Radar (an open dataset of third-party domains with purpose categories and prevalence) plus public tracker blocklists. Negatives are domains seen only as first-party or content domains.
+
+**Features.**
+
+| Group | Feature | Intuition |
+|---|---|---|
+| Prevalence | Number of distinct, unrelated sites whose page loads include the domain | Third-party behaviour, visible at the DNS level |
+| Co-occurrence embedding | Vector from a word2vec (skip-gram) model in which each page-load burst is a "sentence" and each domain a "word" (the Dns2Vec idea) | Trackers sit close to other trackers in embedding space |
+| Lexical | Character n-grams and tokens (`pixel`, `metrics`, `tag`, `ads`, …) | Naming conventions |
+| Infrastructure | Shares IPs, CNAME targets or NS with known trackers | Same operators, same hosting |
+
+word2vec is a **shallow** neural network; we describe it as such.
+
+**Model.** Gradient boosting (or a small MLP) on the combined features, giving a tracker probability per domain.
+
+**How it plugs in.** O1 runs as the **offline path** (§6.2), nightly:
+1. Score every third-party domain seen in the crawl and in the network's own traffic that isn't already on a list.
+2. Write a **candidate list** with scores and the evidence behind each (prevalence, nearest known trackers).
+3. Candidates are reviewed on the dashboard. Optionally, candidates above a very high threshold are auto-approved.
+4. Approved domains go into the **local custom blocklist file**, which is loaded into the trie at the next reload (§7.6.6).
+
+**Limits (stated in the report).** DNS sees domain names only, so domains that serve both content and tracking cannot be blocked without breaking sites. First-party subdomain trackers are already handled by the CNAME-chain check (§7.6.3). Browser-based research systems such as AdGraph and WebGraph see full URLs and page structure; O1's research question is **how much of that is possible from DNS alone**, network-wide, for devices that can't run a browser extension.
+
+##### O2 — Look-alike (phishing) domain detector (optional, priority 2)
+
+**Problem.** Phishing domains imitate well-known brands: typos (`paypa1.com`), added words (`paypal-login-secure.com`), the brand placed in a subdomain (`paypal.com.verify-account.net`), and **Unicode homographs**, where a character from another alphabet looks identical to a Latin one (on the wire these names travel in punycode form, `xn--…`).
+
+**Where it runs.** On the fast path, next to the DGA classifier. It scores the registrable domain, caches the verdict per domain, and feeds the same fusion and actions (§7.8.5). Exact protected names and allowlisted popular domains are skipped.
+
+**Pipeline.**
+1. Decode punycode (RFC 3492) to Unicode.
+2. Map confusable characters to a "skeleton" using the Unicode confusables data (UTS #39), so homographs become plain look-alikes.
+3. Compare against a **protected list**: top Tranco brands plus user-defined names (e.g. the college portal, local banks).
+4. Features: edit distance from the skeleton to the nearest protected name, protected name contained as a token, brand appearing in a subdomain, suspicious words (`login`, `secure`, `verify`, `account`), TLD, length.
+5. Model: gradient boosting on these features, compared with a character CNN reusing the DGA pipeline (§7.8.2). A Siamese network comparing a candidate with its nearest brand is a further option.
+
+**Data.** Positives: permutations of protected names generated with dnstwist (typos, homoglyphs, bit flips, added words), plus real phishing domains from public feeds (OpenPhish, PhishTank). Negatives: Tranco domains, deliberately including legitimate names that resemble brands (e.g. `apple.com` vs `applebees.com`).
+
+##### O3 — Learned prefetching (optional, priority 3)
+
+**Problem.** Even with a good cache, some lookups are misses, and the user waits for a full resolution. The core resolver already prefetches popular entries near expiry (§7.4). O3 tries to **predict** what each device will look up next and resolve it before it is asked for. This is ML used to improve network *performance*, not security.
+
+**Models (in order of complexity).**
+1. Baseline: the existing TTL-based prefetch (§7.4).
+2. A first-order **Markov model** per device: "after A, B usually follows".
+3. A small **LSTM or GRU** over each device's recent sequence of domain IDs (vocabulary = the most common domains seen on the network).
+
+**How it plugs in.** On the slow path: for each event, predict the next names; if a prediction's probability is above a threshold and the name is not fresh in the cache, resolve it in the background.
+
+**Safeguards.**
+- A **prefetch budget** caps extra upstream queries (e.g. at most 10% of real query volume), so prefetching cannot load upstream servers or waste bandwidth. Wasted prefetches (never used before expiry) are counted.
+- Prefetched names are sent upstream even if the user never visits them, which is a small extra privacy leak; QNAME minimisation still applies, and the report states it.
+
+**Honest expectation.** The cache model (EVALUATION.md A2) suggests most remaining misses come from rarely queried names, which are the hardest to predict, so gains may be modest. Measuring exactly how much a learned model adds over simple prefetching is itself a useful result.
+
 ### 7.9 DNSSEC Validation (Stretch Goal)
 
 DNSSEC adds signatures so a resolver can verify answers cryptographically:
@@ -785,13 +879,22 @@ A second client asking the same name 10 seconds later gets the cached block resu
 | Metrics + dashboard | Prometheus + Grafana, plus a small custom web page for alerts | Standard, low effort for charts |
 | Lab | Linux network namespaces, Docker, 2–3 cloud VMs | Isolated, reproducible |
 | Traffic tools | `dig`, `kdig`, `dnsperf`/`resperf`, Scapy, iodine, dnscat2, Wireshark | Testing, attacks, measurement |
+| Lab DNS hierarchy | NSD or BIND in containers (our own root, TLD and authoritative zones) | Repeatable experiments with crafted edge cases |
+| Lab topology | Mininet (+ `tc netem`) | One-command, reproducible attack lab |
+| Network simulation | ns-3 in emulation mode (`TapBridge`, real-time scheduler) | Realistic links (Wi-Fi contention, mobile, satellite) around our real binary |
+| Analytical models | MATLAB (or Python/NumPy, GNU Octave) | Predict results from theory and check them against measurements |
+| Results & plots | Python (pandas, matplotlib), `make figures` | Every report figure regenerated from raw data |
+| Crawler | Playwright (Python), headless Chromium | Blocking experiments (E12); training data for optional O1 |
+| Optional ML extensions | gensim (word2vec), scikit-learn, PyTorch; dnstwist; Unicode confusables data | O1 tracker discovery, O2 look-alike detection, O3 learned prefetching |
 
 ### Repository layout (planned)
 
 ```
 dnsentinel/
 ├── README.md                 ← this document
-├── docs/                     ← design notes, experiment logs, report drafts
+├── EVALUATION.md             ← claims, experiments, tests, report structure
+├── LEARNING_PATH.md          ← theory to learn before coding
+├── docs/                     ← design notes, experiment log, report drafts
 ├── core/                     ← C++ resolver
 │   ├── wire/                 ← parser, builder, name handling
 │   ├── net/                  ← event loop, UDP/TCP/DoT/DoH listeners
@@ -805,10 +908,16 @@ dnsentinel/
 ├── analyzer/                 ← Python slow path (tunnelling, NXDOMAIN bursts, fusion)
 ├── ml/                       ← training notebooks, feature code, model export
 │   ├── dga/
-│   └── tunnel/
+│   ├── tunnel/
+│   ├── tracker/              ← optional O1: embeddings, classifier, candidate list
+│   ├── lookalike/            ← optional O2
+│   └── prefetch/             ← optional O3
+├── crawler/                  ← Playwright crawler (E12, and O1 training data)
 ├── dashboard/                ← Grafana dashboards + alert web UI
-├── lab/                      ← namespace/Docker topologies, attack scripts
-├── bench/                    ← dnsperf configs, experiment runners, plotting
+├── lab/                      ← Mininet topology, lab DNS hierarchy zones, attack scripts
+├── sim/ns3/                  ← ns-3 emulation scenarios, DnsQueryApp
+├── theory/                   ← analytical models A1–A3 (MATLAB/Octave or Python)
+├── bench/                    ← experiment configs and runner, raw results, `make figures`
 ├── tests/                    ← unit, integration, fuzz targets
 └── config/dnsentinel.yaml
 ```
@@ -831,9 +940,22 @@ dnsentinel/
    Cloud VM: authoritative server for a domain we own (tunnel endpoint)
 ```
 
-Network conditions (latency, loss) between namespaces are set with `tc netem` to emulate realistic upstream paths.
+Network conditions (latency, loss) between namespaces are set with `tc netem` to emulate realistic upstream paths. The topology is built with **Mininet**, so anyone can recreate it with one command.
 
-### 10.2 Ethics and safety rules
+Most experiments use a **lab DNS hierarchy**: our own root, TLD and authoritative servers (NSD or BIND in containers), with zones crafted for every edge case (CNAME chains, truncation, empty non-terminals, lame servers, out-of-bailiwick answers). This makes experiments repeatable, which the real internet is not. Experiments that need ground truth (correctness, real-world latency, blocking) run against the real internet. Details: EVALUATION.md §3.
+
+### 10.2 Four levels of evidence
+
+| Level | Tool | Used for |
+|---|---|---|
+| Analytical | MATLAB / Python / Octave | Predicting poisoning cost (A1), cache hit ratio (A2), latency under load (A3) |
+| Simulation | ns-3 in emulation mode | Our real binary over simulated Wi-Fi, mobile, lossy and satellite links; outages; many clients (S1–S3) |
+| Emulation | Mininet, namespaces, Docker | The attack lab and most system experiments |
+| Real | Cloud VMs, real internet, our own devices | Correctness, real latency, real traffic, blocking |
+
+ns-3 is used to simulate the **network around** our real programs rather than to model DNS itself: it has no DNS model, and writing one would test the model instead of our resolver. If ns-3's real-time emulation proves unstable at our scale, the same scenarios fall back to Mininet with `tc netem`.
+
+### 10.3 Ethics and safety rules
 
 - **Poisoning attacks are only run inside network namespaces** against our own resolver and our own fake authoritative server. Never against real resolvers or domains.
 - **Tunnelling uses a domain we own** and our own VMs.
@@ -845,24 +967,35 @@ Network conditions (latency, loss) between namespaces are set with `tc netem` to
 
 ## 11. Evaluation Plan
 
-Every experiment is scripted (`bench/`), repeated (≥5 runs), and reported with medians and confidence intervals.
+The complete plan is in **[EVALUATION.md](EVALUATION.md)**: the claims we must prove, every experiment's hypothesis, setup, baseline and success criterion, the analytical models and ns-3 scenarios, the software test plan, a traceability matrix, statistics rules, threats to validity, the figure plan and the report structure. Summary:
 
-| # | Question | Method | Metrics | Baseline |
-|---|---|---|---|---|
-| E1 | Is resolution correct? | Resolve the top 10k Tranco domains; compare answer sets with Unbound | % matching (allowing for CDN/geo variance), SERVFAIL rate | Unbound |
-| E2 | How fast is it? | `dnsperf` with cold and warm cache | p50/p95/p99 latency, max queries/s before loss | Unbound, forwarding to 1.1.1.1 |
-| E3 | How effective is the cache? | Replay a realistic query trace (from our own devices) | Hit ratio over time, upstream queries saved, effect of prefetch | Cache disabled |
-| E4 | Does serve-stale help? | Cut the upstream link mid-trace | % queries answered during outage | Serve-stale off |
-| E5 | How resistant is it to poisoning? | Kaminsky-style attack at increasing defence levels | Forged packets until success; success within fixed budget | Weak mode |
-| E6 | What does privacy cost? | Latency with/without QNAME minimisation; DoT/DoH vs UDP | Added latency (cold/warm), extra upstream queries | Features off |
-| E7 | How good is DGA detection? | Random split + leave-family-out | Per-family precision/recall/F1, ROC/PR AUC, false positives per day | Blocklist-only |
-| E8 | How good is tunnel detection? | iodine/dnscat2 at several rates + benign days | Recall per rate, FP per day, detection delay | Simple threshold rule (query count) |
-| E9 | What does ML cost? | Latency with/without fast-path ML | µs added per query, cache effect | ML off |
-| E10 | Does it resist abuse? | Spoofed-source flood + legitimate clients | Amplification factor, legit success rate with RRL on/off | RRL off |
-| E11 | How robust is the parser? | 24h+ fuzzing campaign | Crashes found/fixed, code coverage | — |
-| E12 | Does blocking work in practice? | Browse top sites with blocking on | % tracker requests blocked, CNAME-cloaked trackers caught, pages broken | Name-only blocking |
+| # | Question | Level(s) | Baseline |
+|---|---|---|---|
+| A1 | How much does each defence raise the cost of cache poisoning? | Analytical (probability model) | — |
+| A2 | What cache hit ratio does theory predict for our traffic? | Analytical (TTL-cache + Zipf model) | — |
+| A3 | How should latency grow with load? | Analytical (M/M/1, M/D/1 queues) | — |
+| S1 | What do DoT/DoH and QNAME-min cost on Wi-Fi, mobile, lossy and satellite links? | Simulation (ns-3) | UDP, features off; `tc netem` cross-check |
+| S2 | How well do serve-stale and prefetch handle outages of different lengths? | Simulation (ns-3) | Serve-stale off |
+| S3 | Is the resolver fast and fair with many clients and one flooding client? | Simulation (ns-3) | Rate limiting off |
+| E1 | Is resolution correct? | Real | Unbound |
+| E2 | How fast is it? | Real + emulation + A3 | Unbound, forwarder |
+| E3 | How effective is the cache? | Real trace + A2 | Cache disabled |
+| E4 | Does serve-stale help? | Emulation + S2 | Serve-stale off |
+| E5 | How resistant is it to poisoning? | Emulation + A1 | Weak mode, defence ladder |
+| E6 | What does privacy gain and cost? | Real + emulation + S1 | UDP, QNAME-min off |
+| E7 | How good is DGA detection on unseen families? | ML + real traffic | Blocklist-only, entropy rule |
+| E8 | How good and how fast is tunnel detection? | Emulation + real | Threshold rule, Isolation Forest |
+| E9 | What does ML cost per query? | Emulation | ML off |
+| E10 | Does it resist amplification and referral abuse? | Emulation + analytical | RRL off, cap off |
+| E11 | How robust is the parser? | Fuzzing | — |
+| E12 | Does blocking work, and what breaks? | Real | No blocking, name-only blocking |
+| E13 | Does rebinding protection work? | Emulation | Protection off |
+| E14 | What does each fast-path stage cost? | Emulation | — |
+| *E15* | *(Optional O1)* Does ML tracker discovery find trackers before the public lists do? | Real crawl + offline ML | Prevalence rule, lexical-only model |
+| *E16* | *(Optional O2)* Does the look-alike detector catch brand imitations without false alarms? | ML + real traffic | Edit-distance rule, dnstwist exact match |
+| *E17* | *(Optional O3)* Does learned prefetching beat TTL-based prefetching at the same upstream budget? | Trace replay | No prefetch, TTL-based prefetch |
 
-**Why the comparison baselines matter:** a number means little in isolation. "Our p99 latency is within X ms of Unbound" or "ML catches Y% of DGA domains that the blocklist missed" are claims that can be defended.
+**Why the baselines and models matter:** a number means little in isolation. "Our p99 latency is within X ms of Unbound", "ML catches Y% of DGA domains the blocklist missed" and "measured poisoning cost matches the model within its confidence interval" are claims that can be defended.
 
 ---
 
@@ -939,6 +1072,20 @@ It removes unnecessary leakage of full query names to root and TLD operators at 
 
 That encrypts traffic but moves all trust (and all query data) to a single external company, and bypasses local protections such as blocking and malware detection. DNSentinel offers DoH/DoT *to itself*, so encryption and local control coexist.
 
+### D17. Why validate at four levels instead of just measuring the system?
+
+Each method has a blind spot: models simplify, simulations approximate links, labs are small, and the real internet can't be controlled. When a model's prediction matches a measurement, both become more credible, and models let us extrapolate to cases we can't test directly. Full-entropy poisoning is the clearest example: it would take months to attack, so we validate the model at reduced entropy and extrapolate (EVALUATION.md A1, E5).
+
+### D18. Why ns-3 in emulation mode rather than a pure ns-3 DNS simulation?
+
+ns-3 has no DNS model. Writing one would duplicate our resolver, and the results would describe the model rather than our code. In emulation mode ns-3 simulates only the links (including Wi-Fi contention that `tc netem` can't reproduce), while the real DNSentinel binary, real clients and real authoritative servers send real packets through them.
+
+### D19. Why are the extra ML features optional, and why tracker discovery first?
+
+The project's claims rest on the resolver, its security and privacy features, and the two core detectors. Each optional extension is roughly 3–4 weeks of work, so committing to them up front would put the core at risk. They are designed now so they can be added cleanly if time allows.
+
+**O1 goes first** because it strengthens the most user-visible feature (ad and tracker blocking) against its main weakness (blocklist lag), asks a genuine research question (how far DNS-only tracker detection can go), reuses the crawler already built for E12, and runs offline, so it cannot hurt query latency or stability. **O2** is next because it is cheap: it reuses the DGA pipeline. **O3** comes after because its benefit is the least certain. **DNSSEC (O4)** is last because it is the largest piece of work.
+
 ### Alternatives considered
 
 | Alternative | Why not chosen |
@@ -949,6 +1096,8 @@ That encrypts traffic but moves all trust (and all query data) to a single exter
 | Detect tunnels with fixed thresholds only | Easy to evade by slowing down; kept as a baseline in E8 |
 | Large transformer models for DGA | Latency, data size and explainability (D7) |
 | Blocking all TXT queries | Breaks legitimate services (email verification, SPF lookups); behaviour-based detection is better |
+| Pure ns-3 simulation of DNS | Would test a model of our resolver, not the resolver (D18) |
+| UnetStack | Simulates underwater acoustic networks; irrelevant to DNS |
 
 ---
 
@@ -964,6 +1113,7 @@ We state these openly; they are part of the defence, not weaknesses to hide.
 6. **Single-node design.** No high availability or clustering; a failure of the host stops DNS for the network. Clients can be given a secondary resolver.
 7. **Logs are sensitive.** A DNS log reveals browsing history. We provide retention limits, anonymisation and per-client opt-out.
 8. **Performance.** We do not expect to match Unbound's throughput; we measure the gap and explain its causes.
+9. **Models and simulations simplify reality.** The analytical models assume Poisson arrivals and independent attack windows; ns-3 link models approximate real links; our lab hierarchy is simpler than the internet. We cross-check each against measurements and state the assumptions (EVALUATION.md §10).
 
 ---
 
@@ -973,10 +1123,12 @@ We state these openly; they are part of the defence, not weaknesses to hide.
 
 | Member | Owns | Also contributes to |
 |---|---|---|
-| **M1 — Protocol lead** | Wire parser/builder, iterative resolver, TCP/EDNS0, QNAME minimisation | Fuzzing, E1 |
-| **M2 — Performance lead** | Event loop, cache (TTL, negative, serve-stale, prefetch), in-flight dedup | E2, E3, E4, E9 |
-| **M3 — Security lead** | Anti-spoofing, policy engine, rebinding, RRL, DoT/DoH, attack lab | E5, E6, E10, E12 |
-| **M4 — ML & observability lead** | Datasets, DGA + tunnel models, fusion, analyser, dashboard | E7, E8 |
+| **M1 — Protocol lead** | Wire parser/builder, iterative resolver, TCP/EDNS0, QNAME minimisation | Fuzzing, test frameworks, ns-3 help; E1, E11 |
+| **M2 — Performance lead** | Event loop, cache (TTL, negative, serve-stale, prefetch), in-flight dedup | Benchmark harness, models A2/A3, **ns-3 S1–S3**; E2, E3, E4, E14 |
+| **M3 — Security lead** | Anti-spoofing, policy engine, rebinding, RRL, DoT/DoH, attack lab | Lab DNS hierarchy, Mininet lab, model A1; E5, E6, E10, E12, E13 |
+| **M4 — ML & observability lead** | Datasets, DGA + tunnel models, fusion, analyser, dashboard | Real traffic trace W1; E7, E8, E9 |
+
+**Optional extensions (if built):** O1 tracker discovery — M3 (crawler and data) with M4 (model); O2 look-alike detector — M1 (punycode/IDN handling is protocol work) with M4 reviewing the model; O3 learned prefetching — M2 (owns the cache).
 
 Everyone: code review each other's modules, write their section of the report, and be able to explain the whole system.
 
@@ -986,15 +1138,17 @@ Everyone: code review each other's modules, write their section of the report, a
 
 | Weeks | Milestone | Deliverable / demo |
 |---|---|---|
-| 1–2 | Theory + skeleton | Everyone reads RFC 1034/1035 sections; repo, CI, lab namespaces; parser handles real captured packets |
-| 3–4 | **M-A: Working resolver** | Iterative resolution from root over UDP; basic cache; `dig @localhost example.com` works |
-| 5–6 | **M-B: Robust core** | TCP fallback, EDNS0, negative caching, SRTT server selection, in-flight dedup; E1 passing; fuzzing started |
-| 5–7 | Parallel: ML data | DGA dataset built; tunnel lab on cloud VM; first baseline models |
-| 7–8 | **M-C: Security & policy** | Blocklists + CNAME check, rebinding, ACL, RRL, TXID/port/0x20/bailiwick hardening; poisoning lab working |
+| 1–3 | **Theory + skeleton** | LEARNING_PATH (incl. simulation & modelling); repo, CI, test frameworks; parser handles real captured packets; lab DNS hierarchy and Mininet lab started |
+| 3–5 | **M-A: Working resolver** | Iterative resolution from root over UDP; basic cache; `dig @localhost example.com` works; benchmark harness; real trace W1 collection starts |
+| 5–7 | **M-B: Robust core** | TCP fallback, EDNS0, negative caching, SRTT server selection, in-flight dedup; E1 passing; fuzzing started; **models A1–A3 under way (done by week 8)**; ML datasets built |
+| 6 | **Targets frozen** | Experiment hypotheses and success criteria reviewed and committed (EVALUATION.md §9) |
+| 7–9 | **M-C: Security & policy** | Blocklists + CNAME check, rebinding, ACL, RRL, TXID/port/0x20/bailiwick hardening; poisoning lab working; ns-3 emulation setup and S1 prototype |
 | 9–10 | **M-D: Privacy & ML integration** | DoT/DoH listeners, QNAME minimisation; DGA model in fast path; analyser with tunnel + NXDOMAIN detectors; dynamic rules |
 | 11 | **M-E: Observability** | Metrics, logs, dashboard with explainable alerts; serve-stale and prefetch |
-| 12–13 | **Evaluation** | All experiments E1–E12 run, plots produced; bug fixing; DNSSEC stretch if ahead |
-| 14 | **Final** | Report, demo script, viva preparation |
+| 9–13 | **Optional queue (gated)** | Only if M-C is complete by the end of week 9 and later milestones are on track. **O1 first:** crawler (shared with E12) in week 9, embeddings and classifier in weeks 10–11, candidate review flow and E15 in weeks 12–13. Then O2, then O3, then O4 (DNSSEC), each only if the previous one is done and time remains |
+| 10–13 | **Evaluation** | All core experiments (E1–E14, S1–S3) run against frozen targets; optional experiments (E15–E17) for whatever optional items were built; figures generated; bug fixing |
+| 10–14 | **Report** | Chapters written alongside (design and literature early, results as experiments finish) |
+| 14 | **Final** | Final figures, report, demo script, viva preparation |
 
 ### Demo script (final presentation, ~10 minutes)
 
@@ -1004,7 +1158,8 @@ Everyone: code review each other's modules, write their section of the report, a
 4. Start an iodine tunnel from the "infected" namespace; show the alert, its feature explanation, and the automatic block.
 5. Run the DGA simulator; show NXDOMAIN burst + DGA scores → client flagged.
 6. Cut the upstream link; show serve-stale keeping recent sites working.
-7. Close with the key graphs from the evaluation.
+   - *If O1 was built:* show the nightly candidate list with a newly discovered tracker, its evidence, and approving it into the blocklist.
+7. Close with the headline graphs: poisoning cost measured vs model (F6), cache hit ratio vs theory (F3), and privacy cost across simulated link types (F7). Figure IDs refer to EVALUATION.md §11.
 
 ---
 
@@ -1042,6 +1197,18 @@ We classify only the registrable domain (`cloudfront.net`) and never score allow
 
 **Q: How do you prevent your own resolver from being used in a DDoS?**
 Only LAN clients are answered, and response rate limiting drops or truncates repeated responses to the same network, forcing legitimate clients to TCP where spoofing is impossible.
+
+**Q: Your poisoning attack at full entropy would take months. How can you claim the defence works?**
+We built a probability model of the attack, then measured attacks at deliberately reduced entropy (6–12 bits) where they succeed quickly. The measurements matched the model's predictions, so we use the validated model to extrapolate to full entropy, and we also ran the full-entropy attack for a fixed budget with zero successes.
+
+**Q: Why use ns-3 if you have a real implementation?**
+ns-3 gives us link conditions we can't create on a laptop, such as Wi-Fi with many contending stations or satellite delay, while our real binary handles real packets. We also cross-checked the simple link profiles against `tc netem` to see where the richer model matters.
+
+**Q: How do you know your results aren't just tuned to look good?**
+Hypotheses and success criteria were frozen in a dated commit before the final runs, test sets were never used for tuning, every figure is regenerated from raw data, and missed targets are reported with explanations.
+
+**Q: Does the ML update the blocklist when it flags something?**
+Not directly. ML verdicts create time-limited rules in a separate table that the fast path checks first; they expire on their own. A domain only enters the permanent blocklist when a person confirms the alert on the dashboard, or, if O1 is built, when its candidate list is approved. This protects the blocklist from model mistakes and from attackers trying to trigger false blocks.
 
 **Q: What would you do with more time?**
 Complete DNSSEC (including NSEC3), encrypted upstream where authoritative servers support it, active-active redundancy, and online learning for the ML models with human feedback from the dashboard.
@@ -1176,11 +1343,17 @@ telemetry:
 - J. Woodbridge et al., "Predicting Domain Generation Algorithms with Long Short-Term Memory Networks", arXiv 2016.
 - V. Le Pochat et al., "Tranco: A Research-Oriented Top Sites Ranking Hardened Against Manipulation", NDSS 2019.
 - G. Engelen, V. Rimmer, W. Joosen, "Troubleshooting an Intrusion Detection Dataset: the CICIDS2017 Case Study", IEEE SPW 2021.
+- X. Man et al., "DNS Cache Poisoning Attack Reloaded: Revolutions with Side Channels" (SAD DNS), ACM CCS 2020.
+- J. Jung, E. Sit, H. Balakrishnan, R. Morris, "DNS Performance and the Effectiveness of Caching", ACM IMW 2001 / IEEE/ACM Transactions on Networking 2002.
+- J. Jung, A. W. Berger, H. Balakrishnan, "Modeling TTL-based Internet Caches", IEEE INFOCOM 2003.
+- L. Breslau et al., "Web Caching and Zipf-like Distributions: Evidence and Implications", IEEE INFOCOM 1999.
+- D. Arp et al., "Dos and Don'ts of Machine Learning in Computer Security", USENIX Security 2022.
+- *Optional extensions:* Arora et al., "Dns2Vec: Exploring Internet Domain Names through Deep Learning", USENIX ScAINet 2019 · U. Iqbal et al., "AdGraph: A Graph-Based Approach to Ad and Tracker Blocking", IEEE S&P 2020 · S. Siby et al., "WebGraph: Capturing Advertising and Tracking Information Flows for Robust Blocking", USENIX Security 2022 · DuckDuckGo Tracker Radar (open dataset) · Unicode Technical Standard #39, "Unicode Security Mechanisms" · RFC 3492, "Punycode" · Piredda et al., "Deepsquatting: Learning-Based Typosquatting Detection at Deeper Domain Levels", 2017.
 - DNS Flag Day 2020 — recommendations on EDNS buffer size (dnsflagday.net).
 
 ### Tools
 
-Unbound, BIND, Pi-hole (reference implementations for comparison) · dig/kdig · dnsperf/resperf (DNS-OARC) · Scapy · iodine · dnscat2 · Wireshark · libFuzzer/AFL++ · scikit-learn · PyTorch · ONNX Runtime · Prometheus · Grafana.
+Unbound, BIND, NSD, Pi-hole (reference implementations and lab hierarchy) · dig/kdig · dnsperf/resperf (DNS-OARC) · Scapy · iodine · dnscat2 · Singularity of Origin · Playwright · dnstwist · Wireshark · libFuzzer/AFL++ · scikit-learn · PyTorch · ONNX Runtime · Prometheus · Grafana · ns-3 · Mininet · MATLAB / GNU Octave.
 
 ---
 
