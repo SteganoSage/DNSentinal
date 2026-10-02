@@ -33,8 +33,8 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->cache.max_memory_bytes, size_t{256} << 20);
     EXPECT_EQ(c->cache.num_shards, 16u);
     EXPECT_FALSE(lists(*c, "listen.tcp"));
-    for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation",
-                                "cache.serve_stale", "policy", "telemetry"}) {
+    for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation", "cache.serve_stale",
+                                "policy.check_cname_chain", "policy.rebinding_protection", "telemetry"}) {
         EXPECT_TRUE(lists(*c, feature)) << feature;
     }
     EXPECT_TRUE(c->resolver.use_0x20);
@@ -44,6 +44,45 @@ TEST(Config, LoadsTheRepoConfig) {
     for (const auto& subnet : c->access.allow) allowed.push_back(subnet.to_string());
     EXPECT_EQ(allowed, (std::vector<std::string>{"127.0.0.0/8", "::1/128", "192.168.0.0/16", "10.0.0.0/8"}));
     EXPECT_EQ(c->access.deny, policy::DenyAction::Refuse);
+    EXPECT_FALSE(lists(*c, "policy"));  // the lists are implemented (plan §5.6)
+    EXPECT_EQ(c->lists.blocklists,
+              (std::vector<std::string>{"config/lists/feeds/ads.txt", "config/lists/feeds/trackers.txt",
+                                        "config/lists/feeds/malware.txt", "config/lists/custom_block.txt"}));
+    EXPECT_EQ(c->lists.allowlists, (std::vector<std::string>{"config/lists/allow.txt"}));
+    EXPECT_EQ(c->lists.response, policy::BlockResponse::NullIp);
+    EXPECT_EQ(c->lists.block_ttl, 60u);
+}
+
+TEST(Config, ListsDefaultToNone) {
+    auto c = parse_config("");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_TRUE(c->lists.blocklists.empty());
+    EXPECT_TRUE(c->lists.allowlists.empty());
+    EXPECT_EQ(c->lists.response, policy::BlockResponse::NullIp);
+    EXPECT_EQ(c->lists.block_ttl, 60u);
+    EXPECT_EQ(c->lists.reload_check_seconds, 60u);
+}
+
+TEST(Config, ParsesPolicyLists) {
+    auto c = parse_config(
+        "policy:\n"
+        "  blocklists: [a.txt, b.txt]\n"
+        "  allowlist: allow.txt\n"  // one path or a list
+        "  block_response: nxdomain\n"
+        "  block_ttl: 5\n"
+        "  reload_check_seconds: 0\n"
+        "  check_cname_chain: false\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_EQ(c->lists.blocklists, (std::vector<std::string>{"a.txt", "b.txt"}));
+    EXPECT_EQ(c->lists.allowlists, (std::vector<std::string>{"allow.txt"}));
+    EXPECT_EQ(c->lists.response, policy::BlockResponse::NxDomain);
+    EXPECT_EQ(c->lists.block_ttl, 5u);
+    EXPECT_EQ(c->lists.reload_check_seconds, 0u);
+    for (const auto& feature : c->not_implemented) EXPECT_FALSE(feature.starts_with("policy")) << feature;
+
+    c = parse_config("policy:\n  allowlist: [x.txt, y.txt]\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_EQ(c->lists.allowlists, (std::vector<std::string>{"x.txt", "y.txt"}));
 }
 
 TEST(Config, AccessDefaultsToLocalhostOnly) {
@@ -161,6 +200,12 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"access:\n  allow: []\n", "access.allow is empty: no client could use the resolver"},
         {"access:\n  deny_action: reject\n", "access.deny_action must be 'refuse' or 'drop'"},
         {"access:\n  alow: [\"10.0.0.0/8\"]\n", "unknown setting 'access.alow'"},
+        {"policy:\n  blocklists: [a.txt, b.txt, a.txt]\n", "line 2: policy.blocklists: a.txt is listed twice"},
+        {"policy:\n  blocklists: [[a.txt]]\n", "policy.blocklists must be a file path or a list of them"},
+        {"policy:\n  allowlist: \"\"\n", "policy.allowlist must be a file path or a list of them"},
+        {"policy:\n  block_response: sinkhole\n", "policy.block_response must be 'null_ip' or 'nxdomain'"},
+        {"policy:\n  block_ttl: 100000\n", "policy.block_ttl must be between 0 and 86400"},
+        {"policy:\n  blocklist: [a.txt]\n", "unknown setting 'policy.blocklist'"},
     };
     for (const auto& c : cases) {
         auto config = parse_config(c.yaml);

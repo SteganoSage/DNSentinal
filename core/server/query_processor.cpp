@@ -1,5 +1,5 @@
 /// @file server/query_processor.cpp
-/// Query checks, then resolution.
+/// Query checks and the block lists, then resolution.
 
 #include "dnsentinel/server/query_processor.h"
 
@@ -37,10 +37,34 @@ std::optional<RCode> reject_reason(const Message& query) {
     return std::nullopt;
 }
 
+/// The answer for a name on a blocklist (README §7.6.2): an address that
+/// goes nowhere, or NXDOMAIN, either way with a short TTL.
+Message blocked_response(const Message& query, const policy::ListsConfig& lists) {
+    if (lists.response == policy::BlockResponse::NxDomain) return wire::make_response(query, RCode::NXDomain);
+
+    Message         response = wire::make_response(query);
+    const Question& q        = query.questions.front();
+    RR              rr;
+    rr.name  = q.qname;
+    rr.ttl   = lists.block_ttl;
+    rr.trust = TrustRank::Answer;
+    if (q.qtype == static_cast<uint16_t>(RRType::A)) {
+        rr.type  = RRType::A;
+        rr.rdata = RDataA{};  // 0.0.0.0
+        response.answers.push_back(std::move(rr));
+    } else if (q.qtype == static_cast<uint16_t>(RRType::AAAA)) {
+        rr.type  = RRType::AAAA;
+        rr.rdata = RDataAAAA{};  // ::
+        response.answers.push_back(std::move(rr));
+    }  // any other type: no records (NODATA)
+    return response;
+}
+
 }  // namespace
 
-QueryProcessor::QueryProcessor(resolver::RecursiveResolver& resolver, policy::AccessControl access)
-    : resolver_(resolver), access_(std::move(access)) {}
+QueryProcessor::QueryProcessor(resolver::RecursiveResolver& resolver, policy::AccessControl access,
+                               const policy::Blocklists& lists)
+    : resolver_(resolver), access_(std::move(access)), lists_(lists) {}
 
 void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::Responder respond) {
     // Access control first (plan §5.5): outsiders cost us nothing further,
@@ -53,6 +77,13 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
     }
     if (auto rcode = reject_reason(query)) {
         respond(wire::make_response(query, *rcode));
+        return;
+    }
+    // Block and allow lists (plan §5.6): a blocked name is answered here,
+    // without a single upstream query; an allowed one is never blocked.
+    if (auto match = lists_.lookup(query.questions.front().qname);
+        match.matched && match.action == policy::ListAction::Block) {
+        respond(blocked_response(query, lists_.config()));
         return;
     }
 

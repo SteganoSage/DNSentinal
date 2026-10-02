@@ -48,17 +48,19 @@ cache:
     threshold_pct: 10    # trigger when <10% TTL remaining
 
 policy:
-  blocklists:
-    - config/lists/ads.txt
-    - config/lists/trackers.txt
-    - config/lists/malware.txt
-  allowlist: config/lists/allow.txt
+  blocklists:              # plan §5.6; get the feeds with config/lists/download_feeds.sh
+    - config/lists/feeds/ads.txt
+    - config/lists/feeds/trackers.txt
+    - config/lists/feeds/malware.txt
+    - config/lists/custom_block.txt   # names confirmed on the dashboard, or added by hand
+  allowlist: config/lists/allow.txt   # beats every blocklist
+  block_response: null_ip  # null_ip (0.0.0.0 / ::) | nxdomain
+  block_ttl: 60
+  reload_check_seconds: 60 # reload the lists when a file changes; 0 = only on SIGHUP
   check_cname_chain: true
   rebinding_protection:
     enabled: true
     exempt_tlds: ["home", "lan", "local"]
-  block_response: null_ip  # null_ip | nxdomain
-  block_ttl: 60
 
 rate_limit:
   per_client:

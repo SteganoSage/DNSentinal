@@ -1,0 +1,7 @@
+# Local custom blocklist (plan §5.6): names blocked on top of the public feeds.
+# A name gets here when someone confirms an alert on the dashboard (plan §7.5),
+# or by hand. The resolver reloads this file when it changes.
+#
+# One domain per line; it covers every name below it too:
+#   tracker.example.com
+# Hosts format and adblock-style "||example.com^" lines work as well.

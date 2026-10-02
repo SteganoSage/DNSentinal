@@ -42,6 +42,9 @@ ml/data/*.pcap
 ml/data/*.gz
 !ml/data/README.md
 
+# ─── Downloaded block lists (config/lists/download_feeds.sh) ─────────────────
+config/lists/feeds/
+
 # ─── Logs & runtime ─────────────────────────────────────────────────────────
 *.log
 *.jsonl

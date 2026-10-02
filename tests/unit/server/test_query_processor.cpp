@@ -6,6 +6,7 @@
 #include "dnsentinel/resolver/recursive_resolver.h"
 #include "dnsentinel/wire/builder.h"
 #include "dnsentinel/wire/parser.h"
+#include "../policy/list_file.h"
 #include "../resolver/fake_auth.h"
 
 #include <gtest/gtest.h>
@@ -48,7 +49,16 @@ protected:
         hints.ns.push_back(make_rr(".", RRType::NS, RDataNS{name("a.root.lab")}));
         hints.addresses.push_back(make_rr("a.root.lab", RRType::A, ipv4(ip.c_str())));
         resolver  = std::make_unique<RecursiveResolver>(config, hints, *loop, cache);
-        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}));  // localhost only
+        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}), *lists);  // localhost only
+    }
+
+    /// Use these block and allow lists from now on.
+    void use_lists(ListsConfig config) {
+        processor.reset();  // it refers to the old lists
+        lists = std::make_unique<Blocklists>(std::move(config));
+        auto loaded = lists->load();
+        ASSERT_TRUE(loaded.has_value()) << loaded.error();
+        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}), *lists);
     }
 
     static Message query(std::string_view qname, uint16_t qtype = 1, uint16_t qclass = 1) {
@@ -90,6 +100,7 @@ protected:
     std::unique_ptr<FakeAuth>          auth;
     cache::Cache                       cache{cache::CacheConfig{}};
     std::unique_ptr<RecursiveResolver> resolver;
+    std::unique_ptr<Blocklists>        lists = std::make_unique<Blocklists>(ListsConfig{});
     std::unique_ptr<QueryProcessor>    processor;
 };
 
@@ -214,7 +225,7 @@ TEST_F(QueryProcessorTest, ClientsOutsideTheAllowedSubnetsAreRefused) {
 
 TEST_F(QueryProcessorTest, ClientsOutsideCanBeIgnoredInstead) {
     processor = std::make_unique<QueryProcessor>(
-        *resolver, AccessControl(AccessConfig{AccessConfig::localhost(), DenyAction::Drop}));
+        *resolver, AccessControl(AccessConfig{AccessConfig::localhost(), DenyAction::Drop}), *lists);
     int calls = 0;
     processor->handle(query("www.example.test"), client_at("192.0.2.99"), [&](const Message&) { ++calls; });
     run_for(100ms);
@@ -230,4 +241,84 @@ TEST_F(QueryProcessorTest, AccessIsCheckedBeforeAnythingElse) {
     auto r = ask(q, "192.0.2.99");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::Refused));
+}
+
+// ─── Block and allow lists (plan §5.6) ──────────────────────────────────────
+
+TEST_F(QueryProcessorTest, BlockedNamesGetAnAddressThatGoesNowhere) {
+    const ListFile block("example.test\n");  // the whole zone
+    use_lists({.blocklists = {block.path()}});
+
+    const Message q = query("Ads.Example.TEST");
+    auto r = ask(q);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.id, 0x4242);
+    EXPECT_TRUE(r->header.qr);
+    EXPECT_TRUE(r->header.ra);
+    EXPECT_EQ(r->header.rcode, 0);
+    ASSERT_EQ(r->questions.size(), 1u);
+    EXPECT_EQ(r->questions[0].qname.original_case, q.questions[0].qname.original_case);
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].name, name("ads.example.test"));
+    EXPECT_EQ(r->answers[0].type, RRType::A);
+    EXPECT_EQ(r->answers[0].ttl, 60u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")});
+
+    r = ask(query("www.example.test", static_cast<uint16_t>(RRType::AAAA)));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].type, RRType::AAAA);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv6("::")});
+
+    r = ask(query("www.example.test", static_cast<uint16_t>(RRType::TXT)));  // nothing to point nowhere
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, 0);
+    EXPECT_TRUE(r->answers.empty());
+
+    EXPECT_EQ(auth->queries, 0);  // blocked names never go upstream
+}
+
+TEST_F(QueryProcessorTest, BlockedNamesCanGetNxdomainInstead) {
+    const ListFile block("0.0.0.0 www.example.test\n");
+    use_lists({.blocklists = {block.path()}, .response = BlockResponse::NxDomain, .block_ttl = 5});
+    auto r = ask(query("www.example.test"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::NXDomain));
+    EXPECT_TRUE(r->answers.empty());
+    EXPECT_EQ(auth->queries, 0);
+}
+
+TEST_F(QueryProcessorTest, BlockTtlIsConfigurable) {
+    const ListFile block("www.example.test\n");
+    use_lists({.blocklists = {block.path()}, .block_ttl = 5});
+    auto r = ask(query("www.example.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].ttl, 5u);
+}
+
+TEST_F(QueryProcessorTest, AllowlistedNamesAreResolved) {
+    const ListFile block("example.test\n");
+    const ListFile allow("www.example.test\n");
+    use_lists({.blocklists = {block.path()}, .allowlists = {allow.path()}});
+
+    auto r = ask(query("www.example.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.0.2.1")});  // the real answer
+    EXPECT_GT(auth->queries, 0);
+
+    r = ask(query("mail.example.test"));  // the rest of the zone is still blocked
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")});
+}
+
+TEST_F(QueryProcessorTest, OutsidersAreRefusedEvenForBlockedNames) {
+    const ListFile block("example.test\n");
+    use_lists({.blocklists = {block.path()}});
+    auto r = ask(query("www.example.test"), "192.0.2.99");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::Refused));  // not 0.0.0.0
+    EXPECT_TRUE(r->answers.empty());
 }

@@ -1,12 +1,13 @@
 /// @file main.cpp
-/// The dnsentinel daemon: load the config and root hints, start the
-/// resolver and the UDP and TCP listeners, and run the event loop until
-/// SIGINT or SIGTERM.
+/// The dnsentinel daemon: load the config, root hints and block lists,
+/// start the resolver and the UDP and TCP listeners, and run the event loop
+/// until SIGINT or SIGTERM. SIGHUP reloads the block lists.
 
 #include "dnsentinel/cache/cache.h"
 #include "dnsentinel/net/event_loop.h"
 #include "dnsentinel/net/tcp_listener.h"
 #include "dnsentinel/net/udp_listener.h"
+#include "dnsentinel/policy/blocklists.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
 #include "dnsentinel/resolver/root_hints.h"
 #include "dnsentinel/server/config.h"
@@ -15,8 +16,13 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -27,9 +33,15 @@ using namespace dnsentinel;
 
 namespace {
 
-net::EventLoop* g_loop = nullptr;
+net::EventLoop* g_loop      = nullptr;
+int             g_reload_fd = -1;  // eventfd the loop watches; SIGHUP writes to it
 
 void on_signal(int) { g_loop->stop(); }  // stop() is async-signal-safe
+
+void on_reload_signal(int) {
+    const uint64_t one = 1;
+    [[maybe_unused]] const ssize_t n = write(g_reload_fd, &one, sizeof one);  // async-signal-safe
+}
 
 void log(const std::string& message) { std::fprintf(stderr, "dnsentinel: %s\n", message.c_str()); }
 void warn(const std::string& message) { log("warning: " + message); }
@@ -65,6 +77,17 @@ std::string join(const std::vector<std::string>& items) {
     std::string out;
     for (const auto& item : items) out += (out.empty() ? "" : ", ") + item;
     return out;
+}
+
+void log_lists(const policy::LoadReport& report) {
+    for (const auto& file : report.files) {
+        std::string line = (file.action == policy::ListAction::Block ? "  block " : "  allow ") + file.path + ": " +
+                           std::to_string(file.stats.rules) + " domains";
+        if (file.stats.skipped > 0) line += " (" + std::to_string(file.stats.skipped) + " unusable lines skipped)";
+        log(line);
+    }
+    log("lists: " + std::to_string(report.domains) + " distinct domains, " +
+        std::to_string(report.memory_bytes / 1024) + " KiB, read in " + std::to_string(report.took.count()) + " ms");
 }
 
 }  // namespace
@@ -111,6 +134,16 @@ int main(int argc, char** argv) {
         for (uint32_t a : stub.servers) servers.push_back(ipv4_text(a));
         log("stub zone " + stub.zone.to_string() + " -> " + join(servers));
     }
+    policy::Blocklists lists(config->lists);
+    if (config->lists.blocklists.empty() && config->lists.allowlists.empty()) {
+        log("no block lists configured");
+    } else if (auto loaded = lists.load()) {
+        log_lists(*loaded);
+    } else {
+        log(loaded.error());
+        log("the public lists come from config/lists/download_feeds.sh; policy.blocklists names the files to read");
+        return 1;
+    }
 
     // ─── Components, destroyed in reverse: listener first, loop last ────────
     auto loop = net::EventLoop::create();
@@ -120,7 +153,7 @@ int main(int argc, char** argv) {
     }
     cache::Cache                cache(config->cache);
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
-    server::QueryProcessor      processor(resolver, policy::AccessControl(config->access));
+    server::QueryProcessor      processor(resolver, policy::AccessControl(config->access), lists);
     resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
         char server[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &alert.server, server, sizeof server);
@@ -143,12 +176,55 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ─── Reloading the lists: on SIGHUP, and when a list file changes ───────
+    // The files are read on a worker thread; the loop checks for the new
+    // lists every 100 ms until they are ready, then uses them.
+    std::function<void()> collect_reload = [&] {
+        if (auto outcome = lists.finish_reload()) {
+            if (*outcome) {
+                log_lists(**outcome);
+            } else {
+                warn("reload failed, still using the previous lists: " + outcome->error());
+            }
+        } else {
+            (*loop)->add_timer(std::chrono::milliseconds(100), collect_reload);
+        }
+    };
+    auto reload = [&](const std::string& why) {
+        if (!lists.start_reload()) return;  // one is already under way
+        log("reloading the lists (" + why + ")");
+        (*loop)->add_timer(std::chrono::milliseconds(100), collect_reload);
+    };
+    std::function<void()> check_files = [&] {
+        if (lists.files_changed()) reload("a list file changed");
+        (*loop)->add_timer(std::chrono::seconds(config->lists.reload_check_seconds), check_files);
+    };
+    if (config->lists.reload_check_seconds > 0) {
+        (*loop)->add_timer(std::chrono::seconds(config->lists.reload_check_seconds), check_files);
+    }
+
+    g_reload_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_reload_fd < 0) {
+        log("cannot create an eventfd: " + std::error_code(errno, std::system_category()).message());
+        return 1;
+    }
+    if (auto error = (*loop)->add_fd(g_reload_fd, net::kReadable, [&](uint32_t) {
+            uint64_t count = 0;
+            [[maybe_unused]] const ssize_t n = read(g_reload_fd, &count, sizeof count);
+            reload("SIGHUP");
+        })) {
+        log("cannot watch the reload eventfd: " + error.message());
+        return 1;
+    }
+
     g_loop = loop->get();
     struct sigaction action{};
     action.sa_handler = on_signal;
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, nullptr);
     sigaction(SIGTERM, &action, nullptr);
+    action.sa_handler = on_reload_signal;
+    sigaction(SIGHUP, &action, nullptr);
 
     resolver.prime_root([](std::expected<void, resolver::ResolveError> primed) {
         if (primed) {
@@ -165,5 +241,9 @@ int main(int argc, char** argv) {
     action.sa_handler = SIG_DFL;  // a second Ctrl-C now just exits
     sigaction(SIGINT, &action, nullptr);
     sigaction(SIGTERM, &action, nullptr);
+    action.sa_handler = SIG_IGN;  // the eventfd is about to close
+    sigaction(SIGHUP, &action, nullptr);
+    (*loop)->remove_fd(g_reload_fd);
+    close(g_reload_fd);
     return 0;
 }

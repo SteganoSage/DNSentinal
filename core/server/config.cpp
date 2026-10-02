@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <cstring>
@@ -201,6 +202,52 @@ void read_access(Section& top, policy::AccessConfig& out) {
     access.finish();
 }
 
+/// One path, or a list of them.
+void read_paths(Section& section, const std::string& key, std::vector<std::string>& out) {
+    auto node = section.take(key);
+    if (!node || node->IsNull()) return;
+    const std::string name = section.name(key);
+    std::vector<YAML::Node> items;
+    if (node->IsSequence()) {
+        for (const auto& item : *node) items.push_back(item);
+    } else {
+        items.push_back(*node);
+    }
+    out.clear();
+    for (const auto& item : items) {
+        const std::string path = scalar_or_empty(item);
+        if (path.empty()) fail(item, name + " must be a file path or a list of them");
+        if (std::find(out.begin(), out.end(), path) != out.end()) fail(item, name + ": " + path + " is listed twice");
+        out.push_back(path);
+    }
+}
+
+/// policy: the block and allow lists (plan §5.6), and checks still to come.
+void read_policy(Section& top, Config& c) {
+    Section              policy(top.take("policy"), "policy");
+    policy::ListsConfig& lists = c.lists;
+    read_paths(policy, "blocklists", lists.blocklists);
+    read_paths(policy, "allowlist", lists.allowlists);
+    if (auto response = policy.take("block_response")) {
+        const std::string r = scalar_or_empty(*response);
+        if (r == "null_ip") {
+            lists.response = policy::BlockResponse::NullIp;
+        } else if (r == "nxdomain") {
+            lists.response = policy::BlockResponse::NxDomain;
+        } else {
+            fail(*response, policy.name("block_response") + " must be 'null_ip' or 'nxdomain'");
+        }
+    }
+    policy.read_uint("block_ttl", lists.block_ttl, 0, 86400);
+    policy.read_uint("reload_check_seconds", lists.reload_check_seconds, 0, 86400);
+
+    bool check_cname_chain = false;
+    policy.read_bool("check_cname_chain", check_cname_chain);
+    if (check_cname_chain) c.not_implemented.push_back("policy.check_cname_chain");
+    if (policy.take("rebinding_protection")) c.not_implemented.push_back("policy.rebinding_protection");
+    policy.finish();
+}
+
 Config parse(const YAML::Node& document) {
     Config  c;
     Section top(document, "");
@@ -269,9 +316,10 @@ Config parse(const YAML::Node& document) {
     if (k.prefetch) c.not_implemented.push_back("cache.prefetch");
 
     read_access(top, c.access);
+    read_policy(top, c);
 
     // Sections for modules still to come (plan §5-§7).
-    for (const char* key : {"policy", "rate_limit", "ml", "telemetry"}) {
+    for (const char* key : {"rate_limit", "ml", "telemetry"}) {
         if (top.take(key)) c.not_implemented.push_back(key);
     }
     top.finish();

@@ -34,7 +34,7 @@ import time
 IN_NETNS = "DNSENTINEL_E2E_IN_NETNS"
 SKIP = 77
 
-A, NS, CNAME, SOA, TXT = 1, 2, 5, 6, 16
+A, NS, CNAME, SOA, TXT, AAAA = 1, 2, 5, 6, 16, 28
 CLASS_IN, CLASS_CH = 1, 3
 NOERROR, SERVFAIL, NXDOMAIN, REFUSED = 0, 2, 3, 5
 
@@ -121,7 +121,7 @@ class Response:
             name, off = read_name(buf, off)
             self.questions.append(name)
             off += 4
-        self.answers, self.authority = [], []  # (lower-case name, type, A address / target name)
+        self.answers, self.authority = [], []  # (lower-case name, type, address / target name)
         for section, count in ((self.answers, ancount), (self.authority, nscount)):
             for _ in range(count):
                 name, off = read_name(buf, off)
@@ -129,6 +129,8 @@ class Response:
                 off += 10
                 if rtype == A:
                     data = socket.inet_ntoa(buf[off : off + rdlength])
+                elif rtype == AAAA:
+                    data = socket.inet_ntop(socket.AF_INET6, buf[off : off + rdlength])
                 elif rtype in (NS, CNAME):
                     data = read_name(buf, off)[0]
                 else:
@@ -338,12 +340,13 @@ class Daemon:
         return status
 
 
-def write_config(tmp, stub_zone=False, access=None):
-    """access: (allowed subnets, deny action), or None for the default (localhost)."""
+def write_config(tmp, stub_zone=False, access=None, policy=None):
+    """access: (allowed subnets, deny action), or None for the default (localhost).
+    policy: the policy section's settings (indented YAML), or None for none."""
     hints = os.path.join(tmp, "lab.root")
     with open(hints, "w") as f:
         f.write(f".  NS  a.root-servers.test.\na.root-servers.test.  A  {ROOT_IP}\n")
-    name = "stub" if stub_zone else f"access-{access[1]}" if access else "root"
+    name = "stub" if stub_zone else f"access-{access[1]}" if access else "policy" if policy else "root"
     path = os.path.join(tmp, name + ".yaml")
     with open(path, "w") as f:
         f.write(f'listen:\n  udp: "{DAEMON[0]}:{DAEMON[1]}"\n')
@@ -353,6 +356,8 @@ def write_config(tmp, stub_zone=False, access=None):
         if access:
             subnets = ", ".join(f'"{s}"' for s in access[0])
             f.write(f"access:\n  allow: [{subnets}]\n  deny_action: {access[1]}\n")
+        if policy:
+            f.write("policy:\n" + policy)
     return path
 
 
@@ -460,6 +465,53 @@ def rejecting_a_bad_config(binary, servers, tmp):
     r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
     check(r.returncode == 1 and "line 2: resolver.edns_buffer" in r.stderr, "startup stops and names the bad line")
 
+    missing = os.path.join(tmp, "missing.txt")
+    path = write_config(tmp, policy=f"  blocklists: [{missing}]\n")
+    r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
+    check(r.returncode == 1 and f"cannot open {missing}" in r.stderr, "a block list that can't be read stops startup")
+
+
+def blocking_listed_names(binary, servers, tmp):
+    block, allow = os.path.join(tmp, "block.txt"), os.path.join(tmp, "allow.txt")
+    with open(block, "w") as f:
+        f.write("# a hosts file\n0.0.0.0 example.lab\n127.0.0.1 localhost\nnot a domain\n")
+    with open(allow, "w") as f:
+        f.write("www.example.lab\n")
+    policy = f"  blocklists: [{block}]\n  allowlist: {allow}\n  reload_check_seconds: 1\n"
+
+    def body(daemon):
+        check(any(f"block {block}: 1 domains (1 unusable lines skipped)" in line for line in daemon.log)
+              and any("lists: 2 distinct domains" in line for line in daemon.log),
+              "startup log counts the domains on each list")
+
+        before = len(servers.seen)
+        r = ask("ads.example.lab")
+        check(r.id_matches and r.rcode == NOERROR and r.answers == [("ads.example.lab.", A, "0.0.0.0")],
+              "a name under a blocked domain gets 0.0.0.0")
+        r = ask("ads.example.lab", AAAA)
+        check(r.answers == [("ads.example.lab.", AAAA, "::")], "...and :: for AAAA")
+        check(len(servers.seen) == before, "...without any upstream query")
+        r = ask("www.example.lab")
+        check(r.answers == [("www.example.lab.", A, "192.0.2.1")], "an allowlisted name under it is resolved")
+
+        daemon.proc.send_signal(signal.SIGHUP)
+        check(daemon.wait_for("reloading the lists (SIGHUP)") and daemon.wait_for("lists: 2 distinct domains"),
+              "SIGHUP reloads the lists")
+
+        with open(block, "a") as f:
+            f.write("dead\n")
+        check(daemon.wait_for("reloading the lists (a list file changed)")
+              and daemon.wait_for("lists: 3 distinct domains"), "an edited list is reloaded without a restart")
+        r = ask("www.dead")
+        check(r.answers == [("www.dead.", A, "0.0.0.0")], "...and its new rule applies at once")
+
+        os.remove(allow)
+        check(daemon.wait_for("reload failed, still using the previous lists"), "a list that disappears is reported")
+        r = ask("www.example.lab")
+        check(r.answers == [("www.example.lab.", A, "192.0.2.1")], "...and the lists in use stay as they were")
+
+    run_daemon(binary, write_config(tmp, policy=policy), body)
+
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -516,7 +568,8 @@ def main():
     servers = FakeServers()
     with tempfile.TemporaryDirectory() as tmp:
         for scenario in (resolving_from_the_root, resolving_a_stub_zone,
-                         refusing_clients_outside_the_allowed_subnets, rejecting_a_bad_config):
+                         refusing_clients_outside_the_allowed_subnets, blocking_listed_names,
+                         rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
                 scenario(binary, servers, tmp)

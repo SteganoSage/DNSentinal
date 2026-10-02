@@ -1,0 +1,6 @@
+# Allowlist (plan §5.6): never blocked, whatever any blocklist says.
+# A domain here covers every name below it too. Alerts marked as false alarms
+# on the dashboard (plan §7.5) end up here.
+#
+# One domain per line, e.g.:
+#   cdn.example.com

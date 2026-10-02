@@ -94,7 +94,8 @@ add_library(dnsentinel_core STATIC
 
     # Policy
     core/policy/acl.cpp
-    # core/policy/blocklist_trie.cpp
+    core/policy/blocklist_trie.cpp
+    core/policy/blocklists.cpp
     # core/policy/cname_check.cpp
     # core/policy/rebinding.cpp
     # core/policy/rate_limiter.cpp
@@ -164,7 +165,8 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/server/test_query_processor.cpp
         tests/unit/security/test_zero_x20.cpp
         tests/unit/policy/test_acl.cpp
-        # tests/unit/policy/test_blocklist_trie.cpp
+        tests/unit/policy/test_blocklist_trie.cpp
+        tests/unit/policy/test_blocklists.cpp
         # tests/unit/policy/test_rebinding.cpp
         # tests/unit/ml/test_dga_classifier.cpp
     )
