@@ -407,3 +407,74 @@ TEST_F(UpstreamTest, CaseIsNotCheckedUnlessAsked) {
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->has_value());
 }
+
+// ─── Spoof detection (plan §5.4) ────────────────────────────────────────────
+
+namespace {
+
+/// `count` replies to `q` with wrong IDs: an off-path spoofer's guesses.
+std::vector<std::vector<uint8_t>> forged_replies(const Message& q, int count) {
+    std::vector<std::vector<uint8_t>> out;
+    for (int i = 0; i < count; ++i) {
+        Message f   = wire::make_response(q);
+        f.header.id = static_cast<uint16_t>(q.header.id + 1 + i);
+        out.push_back(wire::build(f));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_F(UpstreamTest, FloodOfForgedRepliesIsReportedWithoutWaiting) {
+    RawServer server(*loop);
+    server.reply = [](const Message& q) { return forged_replies(q, 5); };
+    UpstreamClient client(*loop);  // default threshold: 5
+    std::optional<Result> result;
+    const auto start = Clock::now();
+    client.send(loopback(server.port), query_for("www.example.test"), 2s, [&](Result r) {
+        result = std::move(r);
+        loop->stop();
+    });
+    run_for(3s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error(), UpstreamError::SpoofSuspected);
+    EXPECT_LT(Clock::now() - start, 1s);  // didn't wait for the 2 s timeout
+    EXPECT_EQ(client.stats().mismatched, 5u);
+    EXPECT_EQ(client.stats().spoof_alerts, 1u);
+}
+
+TEST_F(UpstreamTest, WrongCaseRepliesCountAsForgeries) {
+    RawServer server(*loop);
+    server.reply = [](const Message& q) {
+        std::vector<std::vector<uint8_t>> out;
+        for (int i = 0; i < 5; ++i) out.push_back(lower_case_echo(q));
+        return out;
+    };
+    UpstreamClient client(*loop);
+    std::optional<Result> result;
+    client.send(loopback(server.port), query_for("wWw.ExAmPlE.tEsT"), 2s, [&](Result r) {
+        result = std::move(r);
+        loop->stop();
+    }, UpstreamTransport::Udp, /*match_case=*/true);
+    run_for(3s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error(), UpstreamError::SpoofSuspected);
+}
+
+TEST_F(UpstreamTest, SpoofThresholdZeroNeverReports) {
+    RawServer server(*loop);
+    server.reply = [](const Message& q) { return forged_replies(q, 10); };
+    UpstreamClient client(*loop, /*spoof_threshold=*/0);
+    std::optional<Result> result;
+    client.send(loopback(server.port), query_for("www.example.test"), 50ms, [&](Result r) {
+        result = std::move(r);
+        loop->stop();
+    });
+    run_for(2s);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error(), UpstreamError::Timeout);
+    EXPECT_EQ(client.stats().spoof_alerts, 0u);
+}

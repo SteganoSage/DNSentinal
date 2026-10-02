@@ -62,6 +62,8 @@ struct ResolverConfig {
     uint32_t max_query_timeout_ms = 3000;
     uint32_t overall_deadline_ms  = 5000;
     uint32_t explore_one_in       = 20;     // ask a random server once in this many picks; 0: never
+    uint32_t spoof_tcp_threshold  = 5;      // forged-looking replies to one query before asking
+                                            // again over TCP (plan §5.4); 0: never
     uint16_t upstream_port        = 53;     // tests and the lab only
     std::vector<StubZone> stub_zones;
 };
@@ -80,6 +82,17 @@ struct ResolveResult {
 
 using ResolveCallback = std::function<void(std::expected<ResolveResult, ResolveError>)>;
 using PrimeCallback   = std::function<void(std::expected<void, ResolveError>)>;
+
+/// Raised when one upstream query draws so many forged-looking replies that
+/// someone is probably trying to poison the cache (plan §5.4). The resolver
+/// has already switched that query to TCP, which an off-path attacker can't
+/// spoof; the alert is for logging and the dashboard.
+struct SpoofAlert {
+    Question question;  // what was asked, as sent upstream
+    uint32_t server  = 0;  // the server being impersonated: IPv4, network byte order
+    uint32_t replies = 0;  // forged-looking replies to that one query
+};
+using SpoofAlertFn = std::function<void(const SpoofAlert&)>;
 
 /// The recursive resolver engine. Use it only from the loop's thread.
 class RecursiveResolver {
@@ -117,6 +130,10 @@ public:
     /// Prime the cache with the root NS set (done once at startup). Same
     /// callback guarantees as resolve().
     void prime_root(PrimeCallback done);
+
+    /// Call `alert` for every suspected spoofing attempt. It runs on the
+    /// loop's thread and must not destroy the resolver.
+    void on_spoof_alert(SpoofAlertFn alert);
 
 private:
     struct Impl;

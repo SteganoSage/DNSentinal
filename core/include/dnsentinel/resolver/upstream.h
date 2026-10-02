@@ -22,6 +22,8 @@ enum class UpstreamError {
     NetworkError,  // could not send, the server's port is closed, or a TCP exchange broke off
     CaseMismatch,  // timed out, but a reply matched in all but letter case (0x20): the server
                    // probably normalises case (or that reply was forged)
+    SpoofSuspected,  // over UDP, so many forged-looking replies that someone is probably
+                     // trying to poison us (plan §5.4): ask again over TCP
 };
 
 enum class UpstreamTransport {
@@ -42,10 +44,13 @@ public:
         uint64_t errors     = 0;
         uint64_t mismatched = 0;  // wrong ID / question, or unparseable (possible spoofing)
         uint64_t case_mismatches = 0;  // right ID and question, wrong letter case (0x20)
+        uint64_t spoof_alerts    = 0;  // queries ended early with SpoofSuspected
     };
 
-    /// `loop` must outlive the client.
-    explicit UpstreamClient(net::EventLoop& loop);
+    /// `loop` must outlive the client. `spoof_threshold`: forged-looking UDP
+    /// replies to one query (wrong ID or question, unparseable, or wrong 0x20
+    /// case) before it ends with SpoofSuspected; 0 never does (plan §5.4).
+    explicit UpstreamClient(net::EventLoop& loop, uint32_t spoof_threshold = 5);
 
     /// Cancels every query in flight without calling its callback.
     ~UpstreamClient();
@@ -88,6 +93,7 @@ private:
         Callback                done;
         bool                    match_case      = false;  // 0x20
         bool                    wrong_case_seen = false;
+        uint32_t                suspicious      = 0;  // forged-looking replies so far
         // TCP only
         std::vector<uint8_t> out;  // the framed query
         size_t               written = 0;
@@ -100,6 +106,7 @@ private:
     void release(Pending& p);
 
     net::EventLoop&                      loop_;
+    uint32_t                             spoof_threshold_;
     QueryId                              next_id_ = 1;
     std::unordered_map<QueryId, Pending> pending_;
     std::vector<uint8_t>                 buffer_;

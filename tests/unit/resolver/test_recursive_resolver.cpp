@@ -655,6 +655,52 @@ TEST_F(ResolverTest, CaseNormalisingServerIsAskedAgainWithout0x20) {
     }
 }
 
+// ─── Spoof detection → TCP (plan §5.4) ─────────────────────────────────────
+
+TEST_F(ResolverTest, ForgedRepliesSwitchTheQueryToTcp) {
+    // Kaminsky-style race: forged replies reach the resolver's port before
+    // the real answer. At 5 (the default threshold) it stops trusting UDP for
+    // that query and asks the same server over TCP, raising an alert.
+    ex1->forged_replies = ex2->forged_replies = 5;
+    std::vector<SpoofAlert> alerts;
+    resolver().on_spoof_alert([&](const SpoofAlert& a) { alerts.push_back(a); });
+
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(ex1->tcp_queries + ex2->tcp_queries, 1);
+    EXPECT_EQ(ex1->queries + ex2->queries, 2);  // the raced UDP query, then TCP to the same server
+
+    ASSERT_EQ(alerts.size(), 1u);
+    EXPECT_EQ(alerts[0].question.qname, name("www.example.test"));
+    EXPECT_EQ(alerts[0].question.qtype, 1);
+    EXPECT_EQ(alerts[0].replies, 5u);
+    const std::string asked = ip(ex1->tcp_queries ? 3 : 7);
+    EXPECT_EQ(alerts[0].server, ipv4(asked.c_str()).addr);
+}
+
+TEST_F(ResolverTest, AFewForgedRepliesAreJustIgnored) {
+    ex1->forged_replies = ex2->forged_replies = 4;  // below the threshold
+    int alerts = 0;
+    resolver().on_spoof_alert([&](const SpoofAlert&) { ++alerts; });
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(ex1->tcp_queries + ex2->tcp_queries, 0);
+    EXPECT_EQ(alerts, 0);
+}
+
+TEST_F(ResolverTest, SpoofDetectionCanBeTurnedOff) {
+    config.spoof_tcp_threshold = 0;
+    ex1->forged_replies = ex2->forged_replies = 20;
+    int alerts = 0;
+    resolver().on_spoof_alert([&](const SpoofAlert&) { ++alerts; });
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(ex1->tcp_queries + ex2->tcp_queries, 0);  // the real UDP answer, after all 20
+    EXPECT_EQ(alerts, 0);
+}
+
 // ─── In-flight deduplication (plan §4.4) ───────────────────────────────────
 
 TEST_F(ResolverTest, IdenticalQueriesInFlightShareOneResolution) {

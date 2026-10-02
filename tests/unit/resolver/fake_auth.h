@@ -75,6 +75,10 @@ public:
     std::function<bool(const Message& query, Message& response)> tamper;
     std::chrono::milliseconds                                    delay{0};
     bool truncate_udp = false;  // over UDP, send only TC=1, as for an answer too big for it
+    /// Over UDP, send this many forged replies (wrong IDs) before the real
+    /// one. They leave from this server's own address and port, exactly as an
+    /// off-path spoofer racing the server would make them look.
+    int forged_replies = 0;
 
     int                   queries     = 0;
     int                   tcp_queries = 0;  // of `queries`
@@ -97,6 +101,13 @@ private:
             response.answers.clear();
             response.authority.clear();
             response.additional.clear();
+        }
+        if (transport == net::Transport::Udp) {
+            for (int i = 0; i < forged_replies; ++i) {
+                Message forged = response;
+                forged.header.id = static_cast<uint16_t>(query.header.id + 1 + i);
+                respond(forged);  // the UDP responder sends every time it's called
+            }
         }
         if (tamper && !tamper(query, response)) return;
         if (delay.count() > 0) {

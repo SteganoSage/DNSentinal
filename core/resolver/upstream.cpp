@@ -37,7 +37,8 @@ Match match(const std::expected<Message, wire::ParseError>& msg, uint16_t txid, 
 
 }  // namespace
 
-UpstreamClient::UpstreamClient(net::EventLoop& loop) : loop_(loop), buffer_(kMaxDatagram) {}
+UpstreamClient::UpstreamClient(net::EventLoop& loop, uint32_t spoof_threshold)
+    : loop_(loop), spoof_threshold_(spoof_threshold), buffer_(kMaxDatagram) {}
 
 UpstreamClient::~UpstreamClient() {
     for (auto& [id, p] : pending_) release(p);
@@ -142,16 +143,24 @@ void UpstreamClient::on_readable(QueryId id) {
 
         auto msg = wire::parse(std::span<const uint8_t>(buffer_.data(), static_cast<size_t>(n)));
         const Match m = match(msg, p.txid, p.question, p.match_case);
-        if (m == Match::WrongCase) {
-            // Forged (the forger didn't know our case pattern), or a server
-            // that normalises case. Keep waiting: if the server does echo
-            // case, its real answer is still on the way.
-            ++stats_.case_mismatches;
-            p.wrong_case_seen = true;
-            continue;
-        }
-        if (m == Match::No) {
-            ++stats_.mismatched;
+        if (m != Match::Yes) {
+            if (m == Match::WrongCase) {
+                // Forged (the forger didn't know our case pattern), or a server
+                // that normalises case. Keep waiting: if the server does echo
+                // case, its real answer is still on the way.
+                ++stats_.case_mismatches;
+                p.wrong_case_seen = true;
+            } else {
+                ++stats_.mismatched;
+            }
+            // The socket is connected, so these came from the server's
+            // address to our random port: someone who guessed the port, or is
+            // spraying all of them, is racing the real answer (Kaminsky).
+            if (spoof_threshold_ != 0 && ++p.suspicious >= spoof_threshold_) {
+                ++stats_.spoof_alerts;
+                finish(id, std::unexpected(UpstreamError::SpoofSuspected));
+                return;
+            }
             continue;  // keep waiting for the real answer
         }
         ++stats_.answered;

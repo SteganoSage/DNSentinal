@@ -125,6 +125,13 @@ int main(int argc, char** argv) {
     cache::Cache                cache(config->cache);
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
     server::QueryProcessor      processor(resolver);
+    resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
+        char server[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &alert.server, server, sizeof server);
+        warn("possible spoofing: " + std::to_string(alert.replies) + " forged-looking replies for " +
+             alert.question.qname.to_string() + " (type " + std::to_string(alert.question.qtype) +
+             ") from " + server + "; asking it again over TCP");
+    });
 
     auto handler = [&processor](Message query, const net::ClientInfo& client, net::Responder respond) {
         processor.handle(std::move(query), client, std::move(respond));

@@ -55,6 +55,7 @@ ZONES = {
             ("www.example.lab", A): ["192.0.2.1"],
             ("big.example.lab", A): [f"192.0.2.{i}" for i in range(1, 101)],  # ~1.6 KB: needs TCP
             ("slow.example.lab", A): ["192.0.2.7"],  # answered late: see SLOW_NAMES
+            ("spoofed.example.lab", A): ["192.0.2.8"],  # raced by forged replies: see SPOOFED_NAMES
             ("ns.lab", A): [LAB_IP],
         },
         "cnames": {"alias.example.lab": "www.example.lab"},
@@ -64,6 +65,10 @@ ZONES = {
 # Answered over UDP only after this delay, so identical queries pile up meanwhile.
 # Kept under the resolver's 100 ms minimum timeout for a server it has measured as fast.
 SLOW_NAMES, SLOW_DELAY = {"slow.example.lab"}, 0.05
+
+# Over UDP, these get forged replies (wrong IDs) first, from the server's own
+# address: what an off-path spoofer racing the real answer sends (plan §5.4).
+SPOOFED_NAMES, FORGED_REPLIES = {"spoofed.example.lab"}, 5
 
 # ─── Wire format ─────────────────────────────────────────────────────────────
 
@@ -247,6 +252,10 @@ class FakeServers:
                     if transport == "udp":
                         data, peer = key.fileobj.recvfrom(4096)
                         reply = self._reply(server, data, tcp=False)
+                        if self.seen[-1][1] in SPOOFED_NAMES:
+                            qid = struct.unpack(">H", reply[:2])[0]
+                            for i in range(FORGED_REPLIES):
+                                key.fileobj.sendto(struct.pack(">H", (qid + 1 + i) & 0xFFFF) + reply[2:], peer)
                         if self.seen[-1][1] in SLOW_NAMES:
                             threading.Timer(SLOW_DELAY, key.fileobj.sendto, (reply, peer)).start()
                         else:
@@ -399,6 +408,13 @@ def resolving_from_the_root(binary, servers, tmp):
               "10 identical queries in flight at once all get the answer")
         check(servers.seen[before:] == [(LAB_IP, "slow.example.lab", A)],
               "...from one upstream query (in-flight deduplication)")
+
+        r = ask("spoofed.example.lab")
+        check(r.rcode == NOERROR and r.answers == [("spoofed.example.lab.", A, "192.0.2.8")],
+              "right answer while forged replies race it")
+        check((LAB_IP, "spoofed.example.lab", A) in servers.seen_tcp,
+              "...because the resolver switched that query to TCP")
+        check(daemon.wait_for("possible spoofing"), "the daemon logs a spoofing alert")
 
         check(ask("www.dead").rcode == SERVFAIL, "unreachable name server gives SERVFAIL")
 

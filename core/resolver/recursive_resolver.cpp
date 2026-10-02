@@ -184,7 +184,7 @@ struct RecursiveResolver::Impl {
     Impl(const ResolverConfig& cfg, RootHints root_hints, net::EventLoop& event_loop,
          cache::Cache& answer_cache)
         : config(cfg), hints(std::move(root_hints)), loop(event_loop), cache(answer_cache),
-          upstream(event_loop), selection(cfg.explore_one_in) {
+          upstream(event_loop, cfg.spoof_tcp_threshold), selection(cfg.explore_one_in) {
         for (const auto& stub : config.stub_zones) {
             auto& servers = stubs[stub.zone];
             servers.insert(servers.end(), stub.servers.begin(), stub.servers.end());
@@ -210,6 +210,7 @@ struct RecursiveResolver::Impl {
     std::unordered_map<uint64_t, std::unique_ptr<Task>> tasks;
     std::unordered_map<Question, uint64_t, QuestionHash> in_flight;  // client question → its task
     std::unordered_set<in_addr_t>                        no_0x20;    // servers that don't echo letter case
+    SpoofAlertFn                                         spoof_alert;
 
     // ─── Task lifecycle ─────────────────────────────────────────────────────
 
@@ -536,6 +537,17 @@ struct RecursiveResolver::Impl {
         if (!t) return;
         t->upstream    = 0;
         const auto rtt = std::chrono::duration_cast<microseconds>(Clock::now() - t->sent_at);
+        if (!response && response.error() == UpstreamError::SpoofSuspected) {
+            // Forged replies are racing this server's answer (plan §5.4). Ask
+            // it again over TCP, where an off-path attacker can't inject.
+            // Neither a failed try nor an SRTT penalty: it's not the server's fault.
+            if (spoof_alert) {
+                spoof_alert(SpoofAlert{Question{t->qname, t->question.qtype, kClassIN}, t->asked,
+                                       config.spoof_tcp_threshold});
+            }
+            send_query(id, t->asked, UpstreamTransport::Tcp);
+            return;
+        }
         if (!response && response.error() == UpstreamError::CaseMismatch) {
             // It answered, but not in the case we asked: it normalises case.
             // Ask again without 0x20, from now on. Not the server's fault, so
@@ -726,5 +738,7 @@ void RecursiveResolver::resolve(const Question& question, ResolveCallback done) 
 }
 
 void RecursiveResolver::prime_root(PrimeCallback done) { impl_->prime(std::move(done)); }
+
+void RecursiveResolver::on_spoof_alert(SpoofAlertFn alert) { impl_->spoof_alert = std::move(alert); }
 
 }  // namespace dnsentinel::resolver

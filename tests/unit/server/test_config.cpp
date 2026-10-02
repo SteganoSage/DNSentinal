@@ -63,6 +63,13 @@ TEST(Config, OnlyFeaturesThatAreOnAreReportedMissing) {
     EXPECT_FALSE(c->resolver.use_0x20);
 }
 
+TEST(Config, SpoofDetectionCanBeTurnedOff) {
+    auto c = parse_config("resolver:\n  spoof_tcp_threshold: 0\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_EQ(c->resolver.spoof_tcp_threshold, 0u);
+    EXPECT_EQ(parse_config("")->resolver.spoof_tcp_threshold, 5u);  // on by default
+}
+
 TEST(Config, ParsesStubZones) {
     auto c = parse_config(
         "resolver:\n"

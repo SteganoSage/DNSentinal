@@ -206,6 +206,7 @@ Config parse(const YAML::Node& document) {
     res.read_uint("query_timeout_ms", r.query_timeout_ms, 1);
     res.read_uint("max_query_timeout_ms", r.max_query_timeout_ms, 1);
     res.read_uint("overall_deadline_ms", r.overall_deadline_ms, 1);
+    res.read_uint("spoof_tcp_threshold", r.spoof_tcp_threshold);
     read_stub_zones(res, r.stub_zones);
     res.finish();
     if (r.query_timeout_ms > r.max_query_timeout_ms) {
