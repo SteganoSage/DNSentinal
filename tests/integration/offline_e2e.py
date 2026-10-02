@@ -156,7 +156,7 @@ def make_query(qname, qtype=A, qclass=CLASS_IN):
     return qid, struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + encode_name(qname) + struct.pack(">HH", qtype, qclass)
 
 
-def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False):
+def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False, timeout=5):
     """Send one query to the daemon and return its Response."""
     qid, query = make_query(qname, qtype, qclass)
     if tcp:
@@ -166,7 +166,7 @@ def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False):
             response = Response(recv_exact(sock, length))
     else:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(5)
+            sock.settimeout(timeout)
             sock.sendto(query, DAEMON)
             response = Response(sock.recv(65535))
     response.id_matches = response.id == qid
@@ -338,16 +338,21 @@ class Daemon:
         return status
 
 
-def write_config(tmp, stub_zone=False):
+def write_config(tmp, stub_zone=False, access=None):
+    """access: (allowed subnets, deny action), or None for the default (localhost)."""
     hints = os.path.join(tmp, "lab.root")
     with open(hints, "w") as f:
         f.write(f".  NS  a.root-servers.test.\na.root-servers.test.  A  {ROOT_IP}\n")
-    path = os.path.join(tmp, "stub.yaml" if stub_zone else "root.yaml")
+    name = "stub" if stub_zone else f"access-{access[1]}" if access else "root"
+    path = os.path.join(tmp, name + ".yaml")
     with open(path, "w") as f:
         f.write(f'listen:\n  udp: "{DAEMON[0]}:{DAEMON[1]}"\n')
         f.write(f"resolver:\n  root_hints: {hints}\n  overall_deadline_ms: 2000\n")
         if stub_zone:
             f.write(f'  stub_zones:\n    lab.: ["{LAB_IP}"]\n')
+        if access:
+            subnets = ", ".join(f'"{s}"' for s in access[0])
+            f.write(f"access:\n  allow: [{subnets}]\n  deny_action: {access[1]}\n")
     return path
 
 
@@ -473,6 +478,29 @@ def reexec_in_netns():
     return subprocess.run(unshare + [sys.executable, os.path.abspath(__file__), *sys.argv[1:]], env=env).returncode
 
 
+def refusing_clients_outside_the_allowed_subnets(binary, servers, tmp):
+    # We query from 127.0.0.1, which these configs leave out.
+    def refused(daemon):
+        check(any("answering clients in 10.0.0.0/8; others are refused" in line for line in daemon.log),
+              "startup log says who is answered")
+        before = len(servers.seen)
+        r = ask("www.example.lab")
+        check(r.id_matches and r.rcode == REFUSED and not r.answers, "a client outside access.allow is refused")
+        check(len(servers.seen) == before, "...without any upstream query")
+
+    run_daemon(binary, write_config(tmp, access=(["10.0.0.0/8"], "refuse")), refused)
+
+    def dropped(daemon):
+        try:
+            ask("www.example.lab", timeout=1)
+            answered = True
+        except TimeoutError:
+            answered = False
+        check(not answered, "with deny_action: drop it gets no reply at all")
+
+    run_daemon(binary, write_config(tmp, access=(["10.0.0.0/8"], "drop")), dropped)
+
+
 def main():
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} <path to the dnsentinel binary>", file=sys.stderr)
@@ -487,7 +515,8 @@ def main():
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     servers = FakeServers()
     with tempfile.TemporaryDirectory() as tmp:
-        for scenario in (resolving_from_the_root, resolving_a_stub_zone, rejecting_a_bad_config):
+        for scenario in (resolving_from_the_root, resolving_a_stub_zone,
+                         refusing_clients_outside_the_allowed_subnets, rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
                 scenario(binary, servers, tmp)

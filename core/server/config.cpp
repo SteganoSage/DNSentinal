@@ -174,6 +174,33 @@ void read_stub_zones(Section& section, std::vector<resolver::StubZone>& out) {
     }
 }
 
+/// access: who may use the resolver (plan §5.5).
+void read_access(Section& top, policy::AccessConfig& out) {
+    Section access(top.take("access"), "access");
+    if (auto allow = access.take("allow")) {
+        const std::string name = access.name("allow");
+        if (!allow->IsSequence()) fail(*allow, name + " must be a list of subnets, like [\"192.168.0.0/16\"]");
+        out.allow.clear();
+        for (const auto& item : *allow) {
+            auto subnet = policy::parse_subnet(scalar_or_empty(item));
+            if (!subnet) fail(item, name + ": " + subnet.error());
+            out.allow.push_back(*subnet);
+        }
+        if (out.allow.empty()) fail(*allow, name + " is empty: no client could use the resolver");
+    }
+    if (auto deny = access.take("deny_action")) {
+        const std::string action = scalar_or_empty(*deny);
+        if (action == "refuse") {
+            out.deny = policy::DenyAction::Refuse;
+        } else if (action == "drop") {
+            out.deny = policy::DenyAction::Drop;
+        } else {
+            fail(*deny, access.name("deny_action") + " must be 'refuse' or 'drop'");
+        }
+    }
+    access.finish();
+}
+
 Config parse(const YAML::Node& document) {
     Config  c;
     Section top(document, "");
@@ -241,8 +268,10 @@ Config parse(const YAML::Node& document) {
     if (k.serve_stale) c.not_implemented.push_back("cache.serve_stale");
     if (k.prefetch) c.not_implemented.push_back("cache.prefetch");
 
+    read_access(top, c.access);
+
     // Sections for modules still to come (plan §5-§7).
-    for (const char* key : {"access", "policy", "rate_limit", "ml", "telemetry"}) {
+    for (const char* key : {"policy", "rate_limit", "ml", "telemetry"}) {
         if (top.take(key)) c.not_implemented.push_back(key);
     }
     top.finish();

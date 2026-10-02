@@ -23,6 +23,7 @@
 #include <string>
 
 using namespace dnsentinel;
+using namespace dnsentinel::policy;
 using namespace dnsentinel::resolver;
 using namespace dnsentinel::server;
 using namespace dnsentinel::test;
@@ -47,7 +48,7 @@ protected:
         hints.ns.push_back(make_rr(".", RRType::NS, RDataNS{name("a.root.lab")}));
         hints.addresses.push_back(make_rr("a.root.lab", RRType::A, ipv4(ip.c_str())));
         resolver  = std::make_unique<RecursiveResolver>(config, hints, *loop, cache);
-        processor = std::make_unique<QueryProcessor>(*resolver);
+        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}));  // localhost only
     }
 
     static Message query(std::string_view qname, uint16_t qtype = 1, uint16_t qclass = 1) {
@@ -64,10 +65,18 @@ protected:
         loop->cancel_timer(guard);
     }
 
-    std::optional<Message> ask(Message q) {
+    static net::ClientInfo client_at(const char* ip) {
+        net::ClientInfo client;
+        auto* v4       = reinterpret_cast<sockaddr_in*>(&client.addr);
+        v4->sin_family = AF_INET;
+        inet_pton(AF_INET, ip, &v4->sin_addr);
+        return client;
+    }
+
+    std::optional<Message> ask(Message q, const char* from = "127.0.0.1") {
         std::optional<Message> out;
         int calls = 0;
-        processor->handle(std::move(q), net::ClientInfo{}, [&](const Message& r) {
+        processor->handle(std::move(q), client_at(from), [&](const Message& r) {
             ++calls;
             out = r;
             loop->stop();  // if this runs inside handle(), run() below returns at once
@@ -190,4 +199,35 @@ TEST_F(QueryProcessorTest, ServesAClientOverUdp) {
     EXPECT_EQ(reply->header.rcode, 0);
     ASSERT_EQ(reply->answers.size(), 1u);
     EXPECT_EQ(reply->answers[0].rdata, RData{ipv4("192.0.2.1")});
+}
+
+// ─── Access control (plan §5.5) ─────────────────────────────────────────────
+
+TEST_F(QueryProcessorTest, ClientsOutsideTheAllowedSubnetsAreRefused) {
+    auto r = ask(query("www.example.test"), "192.0.2.99");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::Refused));
+    EXPECT_EQ(r->header.id, 0x4242);
+    EXPECT_TRUE(r->answers.empty());
+    EXPECT_EQ(auth->queries, 0);  // never resolved: outsiders can't make us send anything upstream
+}
+
+TEST_F(QueryProcessorTest, ClientsOutsideCanBeIgnoredInstead) {
+    processor = std::make_unique<QueryProcessor>(
+        *resolver, AccessControl(AccessConfig{AccessConfig::localhost(), DenyAction::Drop}));
+    int calls = 0;
+    processor->handle(query("www.example.test"), client_at("192.0.2.99"), [&](const Message&) { ++calls; });
+    run_for(100ms);
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(auth->queries, 0);
+}
+
+TEST_F(QueryProcessorTest, AccessIsCheckedBeforeAnythingElse) {
+    // An outsider learns nothing about what we'd do with its query: a status
+    // query (NOTIMP for an allowed client) still just gets REFUSED.
+    Message q         = query("www.example.test");
+    q.header.opcode   = 2;
+    auto r = ask(q, "192.0.2.99");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::Refused));
 }

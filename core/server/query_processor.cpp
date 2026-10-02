@@ -39,9 +39,18 @@ std::optional<RCode> reject_reason(const Message& query) {
 
 }  // namespace
 
-QueryProcessor::QueryProcessor(resolver::RecursiveResolver& resolver) : resolver_(resolver) {}
+QueryProcessor::QueryProcessor(resolver::RecursiveResolver& resolver, policy::AccessControl access)
+    : resolver_(resolver), access_(std::move(access)) {}
 
-void QueryProcessor::handle(Message query, const net::ClientInfo& /*client*/, net::Responder respond) {
+void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::Responder respond) {
+    // Access control first (plan §5.5): outsiders cost us nothing further,
+    // and never cause an upstream query.
+    if (!access_.allows(client.addr)) {
+        if (access_.deny_action() == policy::DenyAction::Refuse) {
+            respond(wire::make_response(query, RCode::Refused));
+        }
+        return;
+    }
     if (auto rcode = reject_reason(query)) {
         respond(wire::make_response(query, *rcode));
         return;

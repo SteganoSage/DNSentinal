@@ -12,10 +12,12 @@ listen:
     key: certs/server.key
 
 access:
-  allow:
+  allow:                 # only these clients get answers (plan §5.5)
     - "127.0.0.0/8"
+    - "::1/128"
     - "192.168.0.0/16"
     - "10.0.0.0/8"
+  deny_action: refuse    # refuse (send REFUSED) | drop (send nothing)
 
 resolver:
   mode: recursive        # recursive | forward

@@ -34,11 +34,32 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->cache.num_shards, 16u);
     EXPECT_FALSE(lists(*c, "listen.tcp"));
     for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation",
-                                "cache.serve_stale", "access", "policy", "telemetry"}) {
+                                "cache.serve_stale", "policy", "telemetry"}) {
         EXPECT_TRUE(lists(*c, feature)) << feature;
     }
     EXPECT_TRUE(c->resolver.use_0x20);
     EXPECT_FALSE(lists(*c, "resolver.use_0x20"));  // implemented (plan §5.2)
+    EXPECT_FALSE(lists(*c, "access"));             // implemented (plan §5.5)
+    std::vector<std::string> allowed;
+    for (const auto& subnet : c->access.allow) allowed.push_back(subnet.to_string());
+    EXPECT_EQ(allowed, (std::vector<std::string>{"127.0.0.0/8", "::1/128", "192.168.0.0/16", "10.0.0.0/8"}));
+    EXPECT_EQ(c->access.deny, policy::DenyAction::Refuse);
+}
+
+TEST(Config, AccessDefaultsToLocalhostOnly) {
+    auto c = parse_config("");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_EQ(c->access.allow, policy::AccessConfig::localhost());
+    EXPECT_EQ(c->access.deny, policy::DenyAction::Refuse);
+}
+
+TEST(Config, ParsesAccess) {
+    auto c = parse_config("access:\n  allow: [\"10.0.0.0/8\", \"fd00::/8\", \"192.0.2.7\"]\n  deny_action: drop\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    std::vector<std::string> allowed;
+    for (const auto& subnet : c->access.allow) allowed.push_back(subnet.to_string());
+    EXPECT_EQ(allowed, (std::vector<std::string>{"10.0.0.0/8", "fd00::/8", "192.0.2.7/32"}));
+    EXPECT_EQ(c->access.deny, policy::DenyAction::Drop);
 }
 
 TEST(Config, EmptyConfigKeepsDefaults) {
@@ -135,6 +156,11 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"resolver:\n  stub_zones:\n    a..b: [\"10.0.0.1\"]\n", "invalid zone name 'a..b'"},
         {"resolver:\n  stub_zones:\n    lab: [\"10.0.0.1\"]\n    lab.: [\"10.0.0.2\"]\n", "lab. is listed twice"},
         {"resolver:\n  stub_zones: [\"10.0.0.1\"]\n", "must map zone names to lists of server addresses"},
+        {"access:\n  allow:\n    - \"10.0.0.0/8\"\n    - \"10.1.2.3/8\"\n", "line 4: access.allow: '10.1.2.3/8' has host bits set; did you mean 10.0.0.0/8?"},
+        {"access:\n  allow: \"10.0.0.0/8\"\n", "access.allow must be a list of subnets"},
+        {"access:\n  allow: []\n", "access.allow is empty: no client could use the resolver"},
+        {"access:\n  deny_action: reject\n", "access.deny_action must be 'refuse' or 'drop'"},
+        {"access:\n  alow: [\"10.0.0.0/8\"]\n", "unknown setting 'access.alow'"},
     };
     for (const auto& c : cases) {
         auto config = parse_config(c.yaml);

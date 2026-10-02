@@ -7,6 +7,7 @@
 #include "dnsentinel/cache/cache.h"
 #include "dnsentinel/net/tcp_listener.h"
 #include "dnsentinel/net/udp_listener.h"
+#include "dnsentinel/policy/acl.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
 
 #include <expected>
@@ -21,6 +22,7 @@ struct Config {
     net::TcpListenerConfig   tcp;  // listen.tcp, else wherever UDP listens
     resolver::ResolverConfig resolver;
     cache::CacheConfig       cache;
+    policy::AccessConfig     access;  // default: localhost only
 
     /// Features the config turns on (in the file, or by default) that this
     /// build doesn't implement yet ("listen.dot", "policy", ...), so startup

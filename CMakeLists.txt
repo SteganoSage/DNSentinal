@@ -93,7 +93,7 @@ add_library(dnsentinel_core STATIC
     # core/security/rrl.cpp
 
     # Policy
-    # core/policy/acl.cpp
+    core/policy/acl.cpp
     # core/policy/blocklist_trie.cpp
     # core/policy/cname_check.cpp
     # core/policy/rebinding.cpp
@@ -163,6 +163,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/server/test_config.cpp
         tests/unit/server/test_query_processor.cpp
         tests/unit/security/test_zero_x20.cpp
+        tests/unit/policy/test_acl.cpp
         # tests/unit/policy/test_blocklist_trie.cpp
         # tests/unit/policy/test_rebinding.cpp
         # tests/unit/ml/test_dga_classifier.cpp

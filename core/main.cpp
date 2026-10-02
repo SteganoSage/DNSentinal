@@ -55,13 +55,6 @@ void cannot_listen(const char* transport, const std::string& where, uint16_t por
     }
 }
 
-bool is_loopback(const std::string& address) {
-    in_addr v4{};
-    if (inet_pton(AF_INET, address.c_str(), &v4) == 1) return (ntohl(v4.s_addr) >> 24) == 127;
-    in6_addr v6{};
-    return inet_pton(AF_INET6, address.c_str(), &v6) == 1 && IN6_IS_ADDR_LOOPBACK(&v6);
-}
-
 std::string ipv4_text(uint32_t address) {
     char text[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &address, text, sizeof text);
@@ -107,8 +100,11 @@ int main(int argc, char** argv) {
     }
     const std::string udp_at = endpoint(config->udp.address, config->udp.port);
     const std::string tcp_at = endpoint(config->tcp.address, config->tcp.port);
-    if (!is_loopback(config->udp.address) || !is_loopback(config->tcp.address)) {
-        warn("no access control yet (plan §5.5): anyone who can reach the listeners can use this resolver");
+    {
+        std::vector<std::string> allowed;
+        for (const auto& subnet : config->access.allow) allowed.push_back(subnet.to_string());
+        log("answering clients in " + join(allowed) + "; others are " +
+            (config->access.deny == policy::DenyAction::Refuse ? "refused" : "ignored"));
     }
     for (const auto& stub : config->resolver.stub_zones) {
         std::vector<std::string> servers;
@@ -124,7 +120,7 @@ int main(int argc, char** argv) {
     }
     cache::Cache                cache(config->cache);
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
-    server::QueryProcessor      processor(resolver);
+    server::QueryProcessor      processor(resolver, policy::AccessControl(config->access));
     resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
         char server[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &alert.server, server, sizeof server);
