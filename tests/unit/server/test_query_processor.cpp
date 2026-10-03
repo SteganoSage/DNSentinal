@@ -49,7 +49,13 @@ protected:
         hints.ns.push_back(make_rr(".", RRType::NS, RDataNS{name("a.root.lab")}));
         hints.addresses.push_back(make_rr("a.root.lab", RRType::A, ipv4(ip.c_str())));
         resolver  = std::make_unique<RecursiveResolver>(config, hints, *loop, cache);
-        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}), *lists);  // localhost only
+        rebuild();
+    }
+
+    /// A processor for localhost clients with the current lists and `rebinding`.
+    void rebuild() {
+        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}), *lists,
+                                                     RebindingFilter(rebinding));
     }
 
     /// Use these block and allow lists from now on.
@@ -58,7 +64,7 @@ protected:
         lists = std::make_unique<Blocklists>(std::move(config));
         auto loaded = lists->load();
         ASSERT_TRUE(loaded.has_value()) << loaded.error();
-        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}), *lists);
+        rebuild();
     }
 
     static Message query(std::string_view qname, uint16_t qtype = 1, uint16_t qclass = 1) {
@@ -101,6 +107,7 @@ protected:
     cache::Cache                       cache{cache::CacheConfig{}};
     std::unique_ptr<RecursiveResolver> resolver;
     std::unique_ptr<Blocklists>        lists = std::make_unique<Blocklists>(ListsConfig{});
+    RebindingConfig                    rebinding;  // on, default exemptions
     std::unique_ptr<QueryProcessor>    processor;
 };
 
@@ -225,7 +232,8 @@ TEST_F(QueryProcessorTest, ClientsOutsideTheAllowedSubnetsAreRefused) {
 
 TEST_F(QueryProcessorTest, ClientsOutsideCanBeIgnoredInstead) {
     processor = std::make_unique<QueryProcessor>(
-        *resolver, AccessControl(AccessConfig{AccessConfig::localhost(), DenyAction::Drop}), *lists);
+        *resolver, AccessControl(AccessConfig{AccessConfig::localhost(), DenyAction::Drop}), *lists,
+        RebindingFilter(rebinding));
     int calls = 0;
     processor->handle(query("www.example.test"), client_at("192.0.2.99"), [&](const Message&) { ++calls; });
     run_for(100ms);
@@ -449,4 +457,99 @@ TEST_F(QueryProcessorTest, CnameAndDirectBlocksAreReportedApart) {
     EXPECT_EQ(events[0].question.qname.original_case, direct.questions[0].qname.original_case);
     EXPECT_EQ(events[0].match.rule, "www.example.test.");
     EXPECT_TRUE(events[1].via_cname());
+}
+
+// ─── Rebinding protection (plan §5.8) ───────────────────────────────────────
+
+TEST_F(QueryProcessorTest, RebindingStripsPrivateAddresses) {
+    auth->add("mixed.example.test", RRType::A, ipv4("192.0.2.9"));
+    auth->add("mixed.example.test", RRType::A, ipv4("10.1.2.3"));  // a multi-answer rebinding attempt
+    std::vector<RebindingEvent> events;
+    processor->on_rebinding([&](const RebindingEvent& e) { events.push_back(e); });
+
+    const Message q = query("Mixed.Example.TEST");
+    auto r = ask(q);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, 0);
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.0.2.9")});
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].question.qname.original_case, q.questions[0].qname.original_case);
+    ASSERT_EQ(events[0].removed.size(), 1u);
+    EXPECT_EQ(events[0].removed[0].rdata, RData{ipv4("10.1.2.3")});
+    EXPECT_FALSE(events[0].emptied);
+}
+
+TEST_F(QueryProcessorTest, RebindingLeavesNothingButNxdomain) {
+    auth->add("router.example.test", RRType::A, ipv4("192.168.1.1"));
+    auth->add("alias.example.test", RRType::CNAME, RDataCNAME{name("router.example.test")});
+    std::vector<RebindingEvent> events;
+    processor->on_rebinding([&](const RebindingEvent& e) { events.push_back(e); });
+
+    for (const char* qname : {"router.example.test", "alias.example.test"}) {
+        auto r = ask(query(qname));
+        ASSERT_TRUE(r.has_value()) << qname;
+        EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::NXDomain)) << qname;
+        EXPECT_TRUE(r->answers.empty()) << qname;  // the CNAME goes too
+        EXPECT_TRUE(r->authority.empty()) << qname;
+    }
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_TRUE(events[0].emptied);
+    EXPECT_TRUE(events[1].emptied);
+}
+
+TEST_F(QueryProcessorTest, RebindingSparesExemptNames) {
+    auth->add("router.example.test", RRType::A, ipv4("192.168.1.1"));
+    rebinding.exempt = {name("example.test")};
+    rebuild();
+    int events = 0;
+    processor->on_rebinding([&](const RebindingEvent&) { ++events; });
+    auto r = ask(query("router.example.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.168.1.1")});
+    EXPECT_EQ(events, 0);
+}
+
+TEST_F(QueryProcessorTest, RebindingProtectionCanBeTurnedOff) {
+    auth->add("router.example.test", RRType::A, ipv4("192.168.1.1"));
+    rebinding.enabled = false;
+    rebuild();
+    auto r = ask(query("router.example.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.168.1.1")});
+}
+
+TEST_F(QueryProcessorTest, RebindingAppliesToCachedAnswers) {
+    auth->add("router.example.test", RRType::A, ipv4("192.168.1.1"));
+    rebinding.enabled = false;  // cached while unprotected
+    rebuild();
+    ASSERT_EQ(ask(query("router.example.test"))->answers.size(), 1u);
+    const int upstream = auth->queries;
+
+    rebinding.enabled = true;
+    rebuild();
+    auto r = ask(query("router.example.test"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::NXDomain));
+    EXPECT_EQ(auth->queries, upstream);  // from the cache, and still filtered
+}
+
+TEST_F(QueryProcessorTest, RebindingNeverTouchesBlockedAnswers) {
+    // Blocked answers point at 0.0.0.0, a "private" address, on purpose.
+    add_cloaked_tracker(*auth);
+    const ListFile block("tracker.test\nwww.example.test\n");
+    use_lists({.blocklists = {block.path()}});
+    int events = 0;
+    processor->on_rebinding([&](const RebindingEvent&) { ++events; });
+    for (const char* qname : {"www.example.test", "metrics.shop.test"}) {  // listed, and cloaked
+        auto r = ask(query(qname));
+        ASSERT_TRUE(r.has_value()) << qname;
+        EXPECT_EQ(r->header.rcode, 0) << qname;
+        ASSERT_EQ(r->answers.size(), 1u) << qname;
+        EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")}) << qname;
+    }
+    EXPECT_EQ(events, 0);
 }

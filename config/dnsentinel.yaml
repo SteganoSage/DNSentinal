@@ -58,9 +58,9 @@ policy:
   block_ttl: 60
   reload_check_seconds: 60 # reload the lists when a file changes; 0 = only on SIGHUP
   check_cname_chain: true
-  rebinding_protection:
+  rebinding_protection:    # plan §5.8: public names may not resolve to private addresses
     enabled: true
-    exempt_tlds: ["home", "lan", "local"]
+    exempt: [home.arpa, internal, localhost, local, lan, home]  # local names (and below); stub zones are added
 
 rate_limit:
   per_client:

@@ -73,6 +73,14 @@ std::string ipv4_text(uint32_t address) {
     return text;
 }
 
+/// An A or AAAA record's address as text.
+std::string address_text(const RData& rdata) {
+    char text[INET6_ADDRSTRLEN] = "?";
+    if (const auto* a = std::get_if<RDataA>(&rdata)) inet_ntop(AF_INET, &a->addr, text, sizeof text);
+    if (const auto* aaaa = std::get_if<RDataAAAA>(&rdata)) inet_ntop(AF_INET6, aaaa->addr, text, sizeof text);
+    return text;
+}
+
 std::string join(const std::vector<std::string>& items) {
     std::string out;
     for (const auto& item : items) out += (out.empty() ? "" : ", ") + item;
@@ -134,6 +142,13 @@ int main(int argc, char** argv) {
         for (uint32_t a : stub.servers) servers.push_back(ipv4_text(a));
         log("stub zone " + stub.zone.to_string() + " -> " + join(servers));
     }
+    if (config->rebinding.enabled) {
+        std::vector<std::string> exempt;
+        for (const auto& zone : config->rebinding.exempt) exempt.push_back(zone.to_string());
+        log("rebinding protection on; names that may resolve to private addresses: " + join(exempt));
+    } else {
+        warn("rebinding protection is off: public names may resolve to private addresses");
+    }
     policy::Blocklists lists(config->lists);
     if (config->lists.blocklists.empty() && config->lists.allowlists.empty()) {
         log("no block lists configured");
@@ -153,7 +168,8 @@ int main(int argc, char** argv) {
     }
     cache::Cache                cache(config->cache);
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
-    server::QueryProcessor      processor(resolver, policy::AccessControl(config->access), lists);
+    server::QueryProcessor      processor(resolver, policy::AccessControl(config->access), lists,
+                                          policy::RebindingFilter(config->rebinding));
     processor.on_block([](const server::BlockEvent& block) {
         // Names blocked by their own list entry are too many to log here (the
         // query log will record them); cloaked ones are rare and worth seeing.
@@ -161,6 +177,13 @@ int main(int argc, char** argv) {
         std::string path;
         for (const auto& hop : block.chain) path += (path.empty() ? "" : " -> ") + hop.to_string();
         log("blocked a cloaked name: " + path + " (rule " + block.match.rule + " in " + block.match.source + ")");
+    });
+    processor.on_rebinding([](const server::RebindingEvent& event) {
+        std::vector<std::string> addresses;
+        for (const auto& rr : event.removed) addresses.push_back(address_text(rr.rdata));
+        warn("possible DNS rebinding: " + event.question.qname.to_string() + " resolved to " + join(addresses) +
+             " (private); " + (event.emptied ? "answered NXDOMAIN" : "removed from the answer") +
+             ". If it is a local name, add it to policy.rebinding_protection.exempt");
     });
     resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
         char server[INET_ADDRSTRLEN] = "?";

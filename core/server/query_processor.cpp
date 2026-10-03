@@ -1,5 +1,6 @@
 /// @file server/query_processor.cpp
-/// Query checks and the block lists, then resolution, then the CNAME check.
+/// Query checks and the block lists, then resolution, then the checks on
+/// the answer: the CNAME chain and rebinding protection.
 
 #include "dnsentinel/server/query_processor.h"
 
@@ -7,6 +8,7 @@
 #include "dnsentinel/resolver/recursive_resolver.h"
 #include "dnsentinel/wire/builder.h"
 
+#include <algorithm>
 #include <optional>
 #include <utility>
 
@@ -67,8 +69,8 @@ Message blocked(Message response, const policy::ListsConfig& lists) {
 }  // namespace
 
 QueryProcessor::QueryProcessor(resolver::RecursiveResolver& resolver, policy::AccessControl access,
-                               const policy::Blocklists& lists)
-    : resolver_(resolver), access_(std::move(access)), lists_(lists) {}
+                               const policy::Blocklists& lists, policy::RebindingFilter rebinding)
+    : resolver_(resolver), access_(std::move(access)), lists_(lists), rebinding_(std::move(rebinding)) {}
 
 void QueryProcessor::report(const Question& question, std::vector<Name> chain, policy::TrieLookupResult match) {
     if (on_block_) on_block_(BlockEvent{question, std::move(chain), std::move(match)});
@@ -115,8 +117,22 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
                 return;
             }
         }
+        // Rebinding protection (plan §5.8), on real answers only: our own
+        // blocked answers point at 0.0.0.0 on purpose.
+        auto& answers = result->response.answers;
+        if (auto removed = rebinding_.strip(asked.qname, answers); !removed.empty()) {
+            const bool emptied = std::none_of(answers.begin(), answers.end(), [](const RR& rr) {
+                return rr.type == RRType::A || rr.type == RRType::AAAA;
+            });
+            if (on_rebinding_) on_rebinding_(RebindingEvent{asked, std::move(removed), emptied});
+            if (emptied) {  // the name pointed only inside the network
+                response.header.rcode = static_cast<uint8_t>(RCode::NXDomain);
+                respond(response);
+                return;
+            }
+        }
         response.header.rcode = result->response.header.rcode;
-        response.answers      = std::move(result->response.answers);
+        response.answers      = std::move(answers);
         response.authority    = std::move(result->response.authority);
         respond(response);
     });

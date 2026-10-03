@@ -57,6 +57,8 @@ ZONES = {
             ("slow.example.lab", A): ["192.0.2.7"],  # answered late: see SLOW_NAMES
             ("spoofed.example.lab", A): ["192.0.2.8"],  # raced by forged replies: see SPOOFED_NAMES
             ("collect.tracker.lab", A): ["192.0.2.66"],
+            ("router.example.lab", A): ["192.168.1.1"],  # a public name pointing into the LAN: rebinding
+            ("mixed.example.lab", A): ["192.0.2.9", "10.0.0.5"],  # the multi-answer variant
             ("ns.lab", A): [LAB_IP],
         },
         "cnames": {"alias.example.lab": "www.example.lab",
@@ -444,6 +446,16 @@ def resolving_from_the_root(binary, servers, tmp):
         r = ask("big.example.lab", tcp=True)
         check(not r.tc and len(r.answers) == 100, "the client's retry over TCP gets all 100 records")
 
+        check(any("rebinding protection on; names that may resolve to private addresses: home.arpa." in line
+                  for line in daemon.log), "startup log lists the names exempt from rebinding protection")
+        r = ask("router.example.lab")
+        check(r.rcode == NXDOMAIN and not r.answers, "a public name resolving to 192.168.1.1 gets NXDOMAIN (rebinding)")
+        check(daemon.wait_for("possible DNS rebinding: router.example.lab. resolved to 192.168.1.1 (private); "
+                              "answered NXDOMAIN"), "...and the daemon warns about it")
+        r = ask("mixed.example.lab")
+        check(r.answers == [("mixed.example.lab.", A, "192.0.2.9")],
+              "only the public address is left when an answer mixes public and private ones")
+
     run_daemon(binary, write_config(tmp), body)
 
 
@@ -456,6 +468,9 @@ def resolving_a_stub_zone(binary, servers, tmp):
         check(servers.queries_to(ROOT_IP) == [(ROOT_IP, "", NS)], "root asked only for priming")
         check(servers.queries_to(LAB_IP)[:1] == [(LAB_IP, "www.example.lab", A)],
               "lab. names go straight to the stub zone's server")
+        r = ask("router.example.lab")
+        check(r.answers == [("router.example.lab.", A, "192.168.1.1")],
+              "names in a stub zone may resolve to private addresses (exempt from rebinding protection)")
 
     run_daemon(binary, write_config(tmp, stub_zone=True), body)
 

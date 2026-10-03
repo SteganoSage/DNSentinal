@@ -9,6 +9,7 @@
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/policy/acl.h"
 #include "dnsentinel/policy/blocklists.h"
+#include "dnsentinel/policy/rebinding.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
 
 #include <expected>
@@ -25,6 +26,7 @@ struct Config {
     cache::CacheConfig       cache;
     policy::AccessConfig     access;  // default: localhost only
     policy::ListsConfig      lists;   // default: no lists, nothing blocked
+    policy::RebindingConfig  rebinding;  // default: on; stub zones are always exempt
 
     /// Features the config turns on (in the file, or by default) that this
     /// build doesn't implement yet ("listen.dot", "policy", ...), so startup

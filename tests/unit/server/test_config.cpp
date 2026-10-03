@@ -34,7 +34,7 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->cache.num_shards, 16u);
     EXPECT_FALSE(lists(*c, "listen.tcp"));
     for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation", "cache.serve_stale",
-                                "policy.rebinding_protection", "telemetry"}) {
+                                "telemetry"}) {
         EXPECT_TRUE(lists(*c, feature)) << feature;
     }
     EXPECT_TRUE(c->resolver.use_0x20);
@@ -53,6 +53,41 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->lists.block_ttl, 60u);
     EXPECT_TRUE(c->lists.check_cname_chain);
     EXPECT_FALSE(lists(*c, "policy.check_cname_chain"));  // implemented (plan §5.7)
+    EXPECT_FALSE(lists(*c, "policy.rebinding_protection"));  // implemented (plan §5.8)
+    EXPECT_TRUE(c->rebinding.enabled);
+    EXPECT_EQ(c->rebinding.exempt, policy::RebindingConfig::default_exempt());
+}
+
+TEST(Config, RebindingProtectionIsOnByDefault) {
+    auto c = parse_config("");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_TRUE(c->rebinding.enabled);
+    EXPECT_EQ(c->rebinding.exempt, policy::RebindingConfig::default_exempt());
+}
+
+TEST(Config, RebindingExemptListReplacesTheDefaults) {
+    auto c = parse_config(
+        "policy:\n"
+        "  rebinding_protection:\n"
+        "    enabled: false\n"
+        "    exempt: [plex.direct, Corp.Example.]\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_FALSE(c->rebinding.enabled);
+    EXPECT_EQ(c->rebinding.exempt, (std::vector<Name>{name("plex.direct"), name("corp.example")}));
+}
+
+TEST(Config, RebindingExemptsStubZones) {
+    auto c = parse_config(
+        "resolver:\n"
+        "  stub_zones:\n"
+        "    lab.: [\"10.10.0.2\"]\n"
+        "    corp.example: [\"10.10.0.3\"]\n"
+        "policy:\n"
+        "  rebinding_protection:\n"
+        "    exempt: [example]\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    // corp.example is already covered by example; lab. is added.
+    EXPECT_EQ(c->rebinding.exempt, (std::vector<Name>{name("example"), name("lab")}));
 }
 
 TEST(Config, CnameCheckIsOnUnlessTurnedOff) {
@@ -216,6 +251,11 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"policy:\n  block_ttl: 100000\n", "policy.block_ttl must be between 0 and 86400"},
         {"policy:\n  blocklist: [a.txt]\n", "unknown setting 'policy.blocklist'"},
         {"policy:\n  check_cname_chain: sometimes\n", "policy.check_cname_chain must be true or false"},
+        {"policy:\n  rebinding_protection:\n    exempt: home\n", "policy.rebinding_protection.exempt must be a list of domains"},
+        {"policy:\n  rebinding_protection:\n    exempt: [a..b]\n", "line 3: policy.rebinding_protection.exempt: invalid domain name 'a..b'"},
+        {"policy:\n  rebinding_protection:\n    exempt: [\".\"]\n", "exempting the root exempts everything; use enabled: false"},
+        {"policy:\n  rebinding_protection:\n    exempt: [lan, LAN.]\n", "lan. is listed twice"},
+        {"policy:\n  rebinding_protection:\n    exempt_tlds: [lan]\n", "unknown setting 'policy.rebinding_protection.exempt_tlds'"},
     };
     for (const auto& c : cases) {
         auto config = parse_config(c.yaml);

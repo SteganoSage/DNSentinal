@@ -222,7 +222,39 @@ void read_paths(Section& section, const std::string& key, std::vector<std::strin
     }
 }
 
-/// policy: the block and allow lists (plan §5.6), and checks still to come.
+/// policy.rebinding_protection (plan §5.8).
+void read_rebinding(Section& policy, Config& c) {
+    Section                  section(policy.take("rebinding_protection"), "policy.rebinding_protection");
+    policy::RebindingConfig& r = c.rebinding;
+    section.read_bool("enabled", r.enabled);
+    if (auto exempt = section.take("exempt")) {
+        const std::string name = section.name("exempt");
+        if (!exempt->IsSequence()) fail(*exempt, name + " must be a list of domains, like [home, lan]");
+        r.exempt.clear();
+        for (const auto& item : *exempt) {
+            const std::string text   = scalar_or_empty(item);
+            auto              domain = Name::from_string(text);
+            if (!domain) fail(item, name + ": invalid domain name '" + text + "'");
+            if (domain->label_count() == 0) fail(item, name + ": exempting the root exempts everything; use enabled: false");
+            if (std::find(r.exempt.begin(), r.exempt.end(), *domain) != r.exempt.end()) {
+                fail(item, name + ": " + domain->to_string() + " is listed twice");
+            }
+            r.exempt.push_back(*domain);
+        }
+    }
+    section.finish();
+
+    // Stub zones point at servers the operator chose, usually local ones,
+    // so private answers from them are expected (the lab, a home network).
+    for (const auto& stub : c.resolver.stub_zones) {
+        const bool covered = std::any_of(r.exempt.begin(), r.exempt.end(),
+                                         [&](const Name& zone) { return stub.zone.is_subdomain_of(zone); });
+        if (!covered) r.exempt.push_back(stub.zone);
+    }
+}
+
+/// policy: the block and allow lists (plan §5.6), the CNAME check (§5.7) and
+/// rebinding protection (§5.8).
 void read_policy(Section& top, Config& c) {
     Section              policy(top.take("policy"), "policy");
     policy::ListsConfig& lists = c.lists;
@@ -242,7 +274,7 @@ void read_policy(Section& top, Config& c) {
     policy.read_uint("reload_check_seconds", lists.reload_check_seconds, 0, 86400);
 
     policy.read_bool("check_cname_chain", lists.check_cname_chain);
-    if (policy.take("rebinding_protection")) c.not_implemented.push_back("policy.rebinding_protection");
+    read_rebinding(policy, c);
     policy.finish();
 }
 

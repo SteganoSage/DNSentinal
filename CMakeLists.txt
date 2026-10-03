@@ -97,7 +97,7 @@ add_library(dnsentinel_core STATIC
     core/policy/blocklist_trie.cpp
     core/policy/blocklists.cpp
     core/policy/cname_check.cpp
-    # core/policy/rebinding.cpp
+    core/policy/rebinding.cpp
     # core/policy/rate_limiter.cpp
 
     # Telemetry
@@ -168,7 +168,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/policy/test_blocklist_trie.cpp
         tests/unit/policy/test_blocklists.cpp
         tests/unit/policy/test_cname_check.cpp
-        # tests/unit/policy/test_rebinding.cpp
+        tests/unit/policy/test_rebinding.cpp
         # tests/unit/ml/test_dga_classifier.cpp
     )
     target_link_libraries(dnsentinel_tests PRIVATE

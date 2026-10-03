@@ -728,6 +728,14 @@ Root
     - IPv6: `::1`, `fc00::/7` (ULA), `fe80::/10` (link-local), IPv4-mapped forms
   - If public domain AND private IP → **strip that record** from the answer. If all records are stripped, return NXDOMAIN.
 
+**As built** (`policy/rebinding.{h,cpp}`, applied in `QueryProcessor` after the CNAME check):
+- **Ranges:** the list above plus `::/128`, because on Linux connecting to `::` (like `0.0.0.0`) reaches the local host. IPv4-mapped forms are matched by reusing the ACL's `Subnet`.
+- **"Public" is decided by the query name only.** That is the origin the browser trusts, so `evil.com` CNAME → `router.home` → 192.168.1.1 is still stripped. A local query name may alias anything.
+- **Exempt names** (`policy.rebinding_protection.exempt`, subdomains included). The default is `home.arpa` (RFC 8375), `internal` (reserved for private use), `localhost`, `local`, `lan` and `home`. The resolver's **stub zones are added automatically**, since their servers are ones the operator chose (the lab's 10.x addresses keep working).
+- **Only real answers are filtered:** our own blocked answers point at `0.0.0.0` on purpose. The filter also runs on cached answers.
+- **NXDOMAIN when no A/AAAA is left;** the CNAMEs go too. Remaining records keep the server's order.
+- Every change raises a `RebindingEvent` (question, removed records, whether it was emptied) for the dashboard's "rebinding blocks". The daemon logs it as a warning that says how to exempt a local name (`plex.direct`-style services are the usual false positive).
+
 ### 5.9 Module: Response Rate Limiting (`security/rrl.cpp`)
 
 **What it is:** Limits the rate of identical responses sent to the same client network. Defeats DNS amplification attacks.
