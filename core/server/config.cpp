@@ -348,6 +348,17 @@ Config parse(const YAML::Node& document) {
     res.read_uint("overall_deadline_ms", r.overall_deadline_ms, 1);
     res.read_uint("spoof_tcp_threshold", r.spoof_tcp_threshold);
     read_stub_zones(res, r.stub_zones);
+#ifdef DNSENTINEL_WEAK_MODE
+    if (auto node = res.take("weak_mode"); node && !node->IsNull()) {
+        Section weak(node, "resolver.weak_mode");  // lab-only (plan §5.10)
+        r.weak.weaken = true;
+        weak.read_uint("txid_bits", r.weak.txid_bits, 1, 16);
+        weak.read_bool("sequential_txid", r.weak.sequential_txid);
+        weak.read_uint("fixed_source_port", r.weak.fixed_source_port, 0, 65535);
+        weak.read_bool("accept_out_of_bailiwick", r.weak.accept_out_of_bailiwick);
+        weak.finish();
+    }
+#endif
     res.finish();
     if (r.query_timeout_ms > r.max_query_timeout_ms) {
         throw ConfigError{"resolver.query_timeout_ms (" + std::to_string(r.query_timeout_ms) +

@@ -5,6 +5,9 @@
 
 #include "dnsentinel/net/event_loop.h"
 #include "dnsentinel/types.h"
+#ifdef DNSENTINEL_WEAK_MODE
+#include "dnsentinel/resolver/weak_mode.h"
+#endif
 
 #include <netinet/in.h>
 
@@ -82,6 +85,14 @@ public:
     /// Abandon a query without calling its callback. Unknown ids are ignored.
     void cancel(QueryId id);
 
+#ifdef DNSENTINEL_WEAK_MODE
+    /// Lab-only (plan §5.10): make the next queries guessable — predictable
+    /// or low-entropy IDs, a fixed source port — so the poisoning attack can
+    /// be run against the defence ladder. Does nothing in a release build,
+    /// which never compiles this.
+    void set_weak_mode(WeakMode weak) { weak_ = weak; }
+#endif
+
     [[nodiscard]] const Stats& stats() const { return stats_; }
 
 private:
@@ -107,6 +118,10 @@ private:
 
     net::EventLoop&                      loop_;
     uint32_t                             spoof_threshold_;
+#ifdef DNSENTINEL_WEAK_MODE
+    WeakMode                             weak_;
+    uint16_t                             weak_seq_ = 0;  // sequential-ID counter
+#endif
     QueryId                              next_id_ = 1;
     std::unordered_map<QueryId, Pending> pending_;
     std::vector<uint8_t>                 buffer_;

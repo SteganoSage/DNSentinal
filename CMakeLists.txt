@@ -12,6 +12,7 @@ option(DNSENTINEL_ENABLE_ML     "Enable ML fast-path inference"   ON)
 option(DNSENTINEL_ENABLE_TESTS  "Build unit and integration tests" ON)
 option(DNSENTINEL_ENABLE_FUZZ   "Build fuzz targets"              OFF)
 option(DNSENTINEL_SANITIZERS    "Enable ASan + UBSan"             OFF)
+option(DNSENTINEL_WEAK_MODE     "Lab-only: allow deliberately weakened anti-spoofing (plan §5.10)" OFF)
 
 # ─── Dependencies ────────────────────────────────────────────────────────────
 find_package(OpenSSL REQUIRED)
@@ -139,6 +140,14 @@ if(DNSENTINEL_ENABLE_ML)
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_ML=1)
 endif()
 
+# ─── Weak mode (lab-only, plan §5.10) ───────────────────────────────────────
+# OFF by default: a release build literally cannot compile the weakening code,
+# so no configuration can turn the resolver's anti-spoofing off.
+if(DNSENTINEL_WEAK_MODE)
+    target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_WEAK_MODE=1)
+    message(WARNING "DNSENTINEL_WEAK_MODE is ON: this build is for the attack lab only, never for real use.")
+endif()
+
 # ─── Main executable ────────────────────────────────────────────────────────
 add_executable(dnsentinel core/main.cpp)
 target_link_libraries(dnsentinel PRIVATE dnsentinel_core)
@@ -159,6 +168,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/resolver/test_upstream.cpp
         tests/unit/resolver/test_recursive_resolver.cpp
         tests/unit/resolver/test_server_selection.cpp
+        tests/unit/resolver/test_weak_mode.cpp  # compiles to nothing unless DNSENTINEL_WEAK_MODE=ON
         # negative caching is tested in tests/unit/resolver/test_recursive_resolver.cpp
         tests/unit/security/test_bailiwick.cpp
         tests/unit/server/test_config.cpp

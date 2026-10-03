@@ -791,6 +791,11 @@ A Scapy-based attack script (`lab/attacks/kaminsky.py`) that demonstrates the Ka
 > [!WARNING]
 > All poisoning attacks are run ONLY inside isolated network namespaces against our own resolver and our own fake authoritative server. Never against real resolvers or domains.
 
+**As built:**
+- **Weak mode is a compile-time flag, OFF by default** (`-DDNSENTINEL_WEAK_MODE=ON`, `core/include/dnsentinel/resolver/weak_mode.h`). A release build doesn't compile the weakening code at all, so no configuration can switch it on — a config with a `resolver.weak_mode:` section is simply rejected as an unknown setting. When on, the daemon prints a loud startup warning. The knobs: `txid_bits` (shrink the ID space, E5 part A), `sequential_txid` (predictable IDs, L0), `fixed_source_port` (L0–L1), `accept_out_of_bailiwick` (L0–L3, E5 part C). 0x20 and spoof detection use the ordinary `use_0x20` and `spoof_tcp_threshold` knobs, so the whole ladder L0–L5 is reachable.
+- **The attack** (`lab/attacks/kaminsky.py`, Python standard library, no Scapy dependency) builds its own isolated lab in a user+network namespace (`unshare -rn`): a root, a deliberately slow `lab` TLD, the real `target.lab` server, and the attacker's server. It fires a query for a random name under `target.lab`, then floods referrals spoofed from the TLD that re-delegate `target.lab` to its own name server, racing the slow real referral. If one forged packet matches the resolver's query, `www.target.lab` then resolves to the attacker's `6.6.6.6`.
+- **Measured here:** against a weak resolver (8-bit IDs, known fixed port, no 0x20) the first pass of 256 forged packets poisons it; a hardened resolver (16-bit random ID, random port) resists a 5,000-packet flood. The script runs the full E5 ladder and measurement later; this module delivers the hooks and the attack, verified end to end.
+
 ---
 
 ## 6. Phase 5 — Privacy & ML Integration (Weeks 9–10)

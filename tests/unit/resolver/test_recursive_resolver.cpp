@@ -412,6 +412,23 @@ TEST_F(ResolverTest, OutOfBailiwickRecordsAreNeverCached) {
     EXPECT_FALSE(cache.lookup({name("ns.bank.net"), 1, 1}).entry.has_value());
 }
 
+#ifdef DNSENTINEL_WEAK_MODE
+TEST_F(ResolverTest, WeakModeBelievesOutOfBailiwickRecords) {
+    // With the bailiwick filter off for the lab (plan §5.10, E5 part C), the
+    // same injection as InjectedCnameTargetIsNotBelieved now succeeds:
+    // example.test answers a CNAME to www.glueless.test and slips in a forged
+    // address for it, which the resolver believes instead of resolving it.
+    config.weak = {.weaken = true, .accept_out_of_bailiwick = true};
+    ex1->tamper = ex2->tamper = [](const Message&, Message& r) {
+        r.answers.push_back(make_rr("www.glueless.test", RRType::A, ipv4("6.6.6.6")));
+        return true;
+    };
+    auto r = resolve("ext.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"6.6.6.6"}));  // poisoned, not the real 192.0.2.66
+}
+#endif
+
 TEST_F(ResolverTest, InjectedCnameTargetIsNotBelieved) {
     // The CNAME points out of the zone; a forged address for the target in
     // the same response must be ignored and the target resolved properly.

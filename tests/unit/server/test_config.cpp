@@ -307,6 +307,30 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
     }
 }
 
+#ifdef DNSENTINEL_WEAK_MODE
+TEST(Config, WeakModeSectionIsParsed) {
+    auto c = parse_config(
+        "resolver:\n"
+        "  weak_mode:\n"
+        "    txid_bits: 4\n"
+        "    sequential_txid: true\n"
+        "    fixed_source_port: 5300\n"
+        "    accept_out_of_bailiwick: true\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_TRUE(c->resolver.weak.weaken);
+    EXPECT_EQ(c->resolver.weak.txid_bits, 4);
+    EXPECT_TRUE(c->resolver.weak.sequential_txid);
+    EXPECT_EQ(c->resolver.weak.fixed_source_port, 5300);
+    EXPECT_TRUE(c->resolver.weak.accept_out_of_bailiwick);
+}
+
+TEST(Config, NoWeakModeSectionMeansFullStrength) {
+    auto c = parse_config("");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_FALSE(c->resolver.weak.weaken);
+}
+#endif
+
 TEST(Config, MissingFileIsAnError) {
     auto c = load_config("/nonexistent/dnsentinel.yaml");
     ASSERT_FALSE(c.has_value());

@@ -189,6 +189,9 @@ struct RecursiveResolver::Impl {
             auto& servers = stubs[stub.zone];
             servers.insert(servers.end(), stub.servers.begin(), stub.servers.end());
         }
+#ifdef DNSENTINEL_WEAK_MODE
+        upstream.set_weak_mode(config.weak);
+#endif
     }
 
     ~Impl() {
@@ -627,7 +630,10 @@ struct RecursiveResolver::Impl {
         }
 
         // Only records inside the zone we asked about are believed.
-        security::filter_to_bailiwick(response, t.zone);
+#ifdef DNSENTINEL_WEAK_MODE
+        if (!config.weak.accept_out_of_bailiwick)
+#endif
+            security::filter_to_bailiwick(response, t.zone);
         const uint16_t  qtype       = t.question.qtype;
         const TrustRank answer_rank = response.header.aa ? TrustRank::Answer : TrustRank::Authority;
 

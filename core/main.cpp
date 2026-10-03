@@ -189,6 +189,17 @@ int main(int argc, char** argv) {
         for (uint32_t a : stub.servers) servers.push_back(ipv4_text(a));
         log("stub zone " + stub.zone.to_string() + " -> " + join(servers));
     }
+#ifdef DNSENTINEL_WEAK_MODE
+    if (config->resolver.weak.weaken) {
+        warn("WEAK MODE: anti-spoofing is deliberately weakened (txid_bits=" +
+             std::to_string(config->resolver.weak.txid_bits) +
+             (config->resolver.weak.sequential_txid ? ", sequential IDs" : "") +
+             (config->resolver.weak.fixed_source_port ? ", fixed source port " +
+                  std::to_string(config->resolver.weak.fixed_source_port) : "") +
+             (config->resolver.weak.accept_out_of_bailiwick ? ", bailiwick off" : "") +
+             "). FOR THE ATTACK LAB ONLY (plan §5.10).");
+    }
+#endif
     log(describe_limits(*config));
     if (config->rebinding.enabled) {
         std::vector<std::string> exempt;

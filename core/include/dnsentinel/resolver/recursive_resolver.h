@@ -24,6 +24,10 @@ namespace dnsentinel::net {
 class EventLoop;
 }
 
+#ifdef DNSENTINEL_WEAK_MODE
+#include "dnsentinel/resolver/weak_mode.h"
+#endif
+
 namespace dnsentinel::resolver {
 
 enum class ResolveError {
@@ -49,6 +53,9 @@ struct StubZone {
 };
 
 struct ResolverConfig {
+#ifdef DNSENTINEL_WEAK_MODE
+    WeakMode weak;  // lab-only anti-spoofing knobs (plan §5.10); absent from a release build
+#endif
     std::string root_hints_path = "config/named.root";  // loaded by the caller: see RootHints
     bool     qname_minimisation   = true;   // not implemented yet (plan §6.1)
     bool     use_0x20             = true;   // random letter case in upstream queries (plan §5.2)
