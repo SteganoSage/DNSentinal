@@ -9,7 +9,9 @@
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/policy/acl.h"
 #include "dnsentinel/policy/blocklists.h"
+#include "dnsentinel/policy/rate_limiter.h"
 #include "dnsentinel/policy/rebinding.h"
+#include "dnsentinel/security/rrl.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
 
 #include <expected>
@@ -25,6 +27,8 @@ struct Config {
     resolver::ResolverConfig resolver;
     cache::CacheConfig       cache;
     policy::AccessConfig     access;  // default: localhost only
+    policy::RateLimitConfig  rate_limit;  // default: 100 queries/s per client, burst 200
+    security::RrlConfig      rrl;         // default: off
     policy::ListsConfig      lists;   // default: no lists, nothing blocked
     policy::RebindingConfig  rebinding;  // default: on; stub zones are always exempt
 

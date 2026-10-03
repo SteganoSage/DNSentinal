@@ -87,6 +87,53 @@ std::string join(const std::vector<std::string>& items) {
     return out;
 }
 
+std::string describe_limits(const server::Config& c) {
+    std::string out = "rate limits: ";
+    if (c.rate_limit.qps == 0) {
+        out += "none per client";
+    } else {
+        out += std::to_string(c.rate_limit.qps) + " queries/s per client (burst " + std::to_string(c.rate_limit.burst) +
+               ", then " + (c.rate_limit.action == policy::DenyAction::Drop ? "dropped" : "refused") + ")";
+    }
+    if (c.rrl.responses_per_second == 0) {
+        out += "; response rate limiting off";
+    } else {
+        out += "; " + std::to_string(c.rrl.responses_per_second) + " identical responses/s per /" +
+               std::to_string(c.rrl.ipv4_prefix) + " or /" + std::to_string(c.rrl.ipv6_prefix) + " network";
+        if (c.rrl.slip == 0) {
+            out += " (more are dropped)";
+        } else if (c.rrl.slip == 1) {
+            out += " (more are sent truncated)";
+        } else {
+            out += " (1 in " + std::to_string(c.rrl.slip) + " more is sent truncated, the rest dropped)";
+        }
+    }
+    if (!c.rate_limit.exempt.empty()) {
+        std::vector<std::string> exempt;
+        for (const auto& s : c.rate_limit.exempt) exempt.push_back(s.to_string());
+        out += "; exempt: " + join(exempt);
+    }
+    return out;
+}
+
+/// The rate limiters' counters, for the periodic and final summaries.
+struct LimitCounts {
+    uint64_t over_client_limit = 0, rrl_dropped = 0, rrl_truncated = 0;
+
+    static LimitCounts of(const server::Checks& checks) {
+        return {checks.rate_limit.limited(), checks.rrl.dropped(), checks.rrl.slipped()};
+    }
+    LimitCounts operator-(const LimitCounts& o) const {
+        return {over_client_limit - o.over_client_limit, rrl_dropped - o.rrl_dropped, rrl_truncated - o.rrl_truncated};
+    }
+    bool operator==(const LimitCounts&) const = default;
+
+    [[nodiscard]] std::string describe() const {
+        return std::to_string(over_client_limit) + " queries over a client's limit; " + std::to_string(rrl_dropped) +
+               " responses dropped and " + std::to_string(rrl_truncated) + " truncated by RRL";
+    }
+};
+
 void log_lists(const policy::LoadReport& report) {
     for (const auto& file : report.files) {
         std::string line = (file.action == policy::ListAction::Block ? "  block " : "  allow ") + file.path + ": " +
@@ -142,6 +189,7 @@ int main(int argc, char** argv) {
         for (uint32_t a : stub.servers) servers.push_back(ipv4_text(a));
         log("stub zone " + stub.zone.to_string() + " -> " + join(servers));
     }
+    log(describe_limits(*config));
     if (config->rebinding.enabled) {
         std::vector<std::string> exempt;
         for (const auto& zone : config->rebinding.exempt) exempt.push_back(zone.to_string());
@@ -168,8 +216,10 @@ int main(int argc, char** argv) {
     }
     cache::Cache                cache(config->cache);
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
-    server::QueryProcessor      processor(resolver, policy::AccessControl(config->access), lists,
-                                          policy::RebindingFilter(config->rebinding));
+    server::QueryProcessor      processor(resolver, lists,
+                                          {policy::AccessControl(config->access), policy::RateLimiter(config->rate_limit),
+                                           policy::RebindingFilter(config->rebinding),
+                                           security::ResponseRateLimiter(config->rrl)});
     processor.on_block([](const server::BlockEvent& block) {
         // Names blocked by their own list entry are too many to log here (the
         // query log will record them); cloaked ones are rare and worth seeing.
@@ -234,6 +284,16 @@ int main(int argc, char** argv) {
         (*loop)->add_timer(std::chrono::seconds(config->lists.reload_check_seconds), check_files);
     }
 
+    // ─── What the rate limits did: every 10 s while they act, and at exit ────
+    LimitCounts           reported;
+    std::function<void()> report_limits = [&] {
+        const LimitCounts now = LimitCounts::of(processor.checks());
+        if (now != reported) log("rate limiting in the last 10 s: " + (now - reported).describe());
+        reported = now;
+        (*loop)->add_timer(std::chrono::seconds(10), report_limits);
+    };
+    (*loop)->add_timer(std::chrono::seconds(10), report_limits);
+
     g_reload_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_reload_fd < 0) {
         log("cannot create an eventfd: " + std::error_code(errno, std::system_category()).message());
@@ -268,6 +328,9 @@ int main(int argc, char** argv) {
 
     log("listening on udp " + udp_at + " and tcp " + tcp_at);
     (*loop)->run();
+    if (const LimitCounts total = LimitCounts::of(processor.checks()); total != LimitCounts{}) {
+        log("rate limiting since startup: " + total.describe());
+    }
     log("shutting down");
     action.sa_handler = SIG_DFL;  // a second Ctrl-C now just exits
     sigaction(SIGINT, &action, nullptr);

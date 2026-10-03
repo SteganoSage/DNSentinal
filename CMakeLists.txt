@@ -90,7 +90,7 @@ add_library(dnsentinel_core STATIC
     # core/security/randomisation.cpp
     core/security/zero_x20.cpp
     core/security/bailiwick.cpp
-    # core/security/rrl.cpp
+    core/security/rrl.cpp
 
     # Policy
     core/policy/acl.cpp
@@ -98,7 +98,7 @@ add_library(dnsentinel_core STATIC
     core/policy/blocklists.cpp
     core/policy/cname_check.cpp
     core/policy/rebinding.cpp
-    # core/policy/rate_limiter.cpp
+    core/policy/rate_limiter.cpp
 
     # Telemetry
     # core/telemetry/event_bus.cpp
@@ -169,6 +169,8 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/policy/test_blocklists.cpp
         tests/unit/policy/test_cname_check.cpp
         tests/unit/policy/test_rebinding.cpp
+        tests/unit/policy/test_rate_limiter.cpp
+        tests/unit/security/test_rrl.cpp
         # tests/unit/ml/test_dga_classifier.cpp
     )
     target_link_libraries(dnsentinel_tests PRIVATE

@@ -9,6 +9,7 @@
 #include "dnsentinel/wire/builder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <utility>
 
@@ -68,19 +69,40 @@ Message blocked(Message response, const policy::ListsConfig& lists) {
 
 }  // namespace
 
-QueryProcessor::QueryProcessor(resolver::RecursiveResolver& resolver, policy::AccessControl access,
-                               const policy::Blocklists& lists, policy::RebindingFilter rebinding)
-    : resolver_(resolver), access_(std::move(access)), lists_(lists), rebinding_(std::move(rebinding)) {}
+QueryProcessor::QueryProcessor(resolver::RecursiveResolver& resolver, const policy::Blocklists& lists, Checks checks)
+    : resolver_(resolver), lists_(lists), checks_(std::move(checks)) {}
 
 void QueryProcessor::report(const Question& question, std::vector<Name> chain, policy::TrieLookupResult match) {
     if (on_block_) on_block_(BlockEvent{question, std::move(chain), std::move(match)});
 }
 
 void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::Responder respond) {
+    using Clock = std::chrono::steady_clock;
+
+    // Response rate limiting (plan §5.9) sees every UDP response on its way
+    // out, refusals included: a forged source address can't be told apart
+    // from a real one, and every response goes to whoever owns it.
+    if (client.transport == net::Transport::Udp && checks_.rrl.enabled()) {
+        respond = [this, addr = client.addr, send = std::move(respond)](const Message& response) {
+            switch (checks_.rrl.check(addr, response, Clock::now())) {
+            case security::RrlVerdict::Send: send(response); break;
+            case security::RrlVerdict::Slip: send(security::truncated(response)); break;
+            case security::RrlVerdict::Drop: break;
+            }
+        };
+    }
+
     // Access control first (plan §5.5): outsiders cost us nothing further,
     // and never cause an upstream query.
-    if (!access_.allows(client.addr)) {
-        if (access_.deny_action() == policy::DenyAction::Refuse) {
+    if (!checks_.access.allows(client.addr)) {
+        if (checks_.access.deny_action() == policy::DenyAction::Refuse) {
+            respond(wire::make_response(query, RCode::Refused));
+        }
+        return;
+    }
+    // Then the client's own rate limit (plan §5.9).
+    if (!checks_.rate_limit.allow(client.addr, Clock::now())) {
+        if (checks_.rate_limit.config().action == policy::DenyAction::Refuse) {
             respond(wire::make_response(query, RCode::Refused));
         }
         return;
@@ -120,7 +142,7 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
         // Rebinding protection (plan §5.8), on real answers only: our own
         // blocked answers point at 0.0.0.0 on purpose.
         auto& answers = result->response.answers;
-        if (auto removed = rebinding_.strip(asked.qname, answers); !removed.empty()) {
+        if (auto removed = checks_.rebinding.strip(asked.qname, answers); !removed.empty()) {
             const bool emptied = std::none_of(answers.begin(), answers.end(), [](const RR& rr) {
                 return rr.type == RRType::A || rr.type == RRType::AAAA;
             });

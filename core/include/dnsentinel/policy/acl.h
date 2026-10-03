@@ -9,12 +9,36 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 namespace dnsentinel::policy {
+
+/// A client's IP address. An IPv4-mapped IPv6 address (::ffff:a.b.c.d) is
+/// turned back into the IPv4 address it is, so both forms of one client
+/// count as one (for access control, and per-client and per-network limits).
+struct IpAddress {
+    sa_family_t             family = AF_UNSPEC;
+    std::array<uint8_t, 16> bytes{};  // IPv4 uses the first 4
+
+    /// The address of its network: every bit past the first `prefix` cleared.
+    [[nodiscard]] IpAddress network(uint8_t prefix) const;
+
+    /// e.g. "192.168.1.5" or "fd00::1".
+    [[nodiscard]] std::string to_string() const;
+
+    bool operator==(const IpAddress&) const = default;
+};
+
+struct IpAddressHash {
+    size_t operator()(const IpAddress& a) const noexcept;
+};
+
+/// `client`'s IP address, or nullopt if it isn't an IPv4 or IPv6 address.
+[[nodiscard]] std::optional<IpAddress> ip_address(const sockaddr_storage& client);
 
 /// An IPv4 or IPv6 network in CIDR form.
 struct Subnet {

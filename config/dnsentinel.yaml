@@ -62,14 +62,18 @@ policy:
     enabled: true
     exempt: [home.arpa, internal, localhost, local, lan, home]  # local names (and below); stub zones are added
 
-rate_limit:
-  per_client:
-    qps: 100
-    burst: 200
-  rrl:
-    responses_per_second: 10
-    slip: 2
+rate_limit:                # plan §5.9
+  per_client:              # token bucket per client IP
+    qps: 100               # sustained queries per second; 0 = no limit
+    burst: 200             # what a quiet client may send at once
+    action: drop           # drop | refuse
+  rrl:                     # identical UDP responses per client network (anti-amplification)
+    responses_per_second: 10   # 0 = off; raise it for many clients behind one /24
+    slip: 2                # every 2nd response over the cap goes out truncated (retry over TCP)
     window_seconds: 1
+    ipv4_prefix: 24        # a client network is a /24 ...
+    ipv6_prefix: 56        # ... or a /56
+  exempt: []               # subnets neither limit applies to, e.g. a router forwarding a whole LAN
 
 ml:
   mode: monitor           # monitor | enforce

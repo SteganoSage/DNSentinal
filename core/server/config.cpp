@@ -175,31 +175,67 @@ void read_stub_zones(Section& section, std::vector<resolver::StubZone>& out) {
     }
 }
 
+/// A list of subnets, like ["192.168.0.0/16", "fd00::/8"]. Returns the node, if set.
+std::optional<YAML::Node> read_subnets(Section& section, const std::string& key, std::vector<policy::Subnet>& out) {
+    auto list = section.take(key);
+    if (!list) return list;
+    const std::string name = section.name(key);
+    if (!list->IsSequence()) fail(*list, name + " must be a list of subnets, like [\"192.168.0.0/16\"]");
+    out.clear();
+    for (const auto& item : *list) {
+        auto subnet = policy::parse_subnet(scalar_or_empty(item));
+        if (!subnet) fail(item, name + ": " + subnet.error());
+        out.push_back(*subnet);
+    }
+    return list;
+}
+
+/// "refuse" or "drop".
+void read_deny_action(Section& section, const std::string& key, policy::DenyAction& out) {
+    auto node = section.take(key);
+    if (!node) return;
+    const std::string action = scalar_or_empty(*node);
+    if (action == "refuse") {
+        out = policy::DenyAction::Refuse;
+    } else if (action == "drop") {
+        out = policy::DenyAction::Drop;
+    } else {
+        fail(*node, section.name(key) + " must be 'refuse' or 'drop'");
+    }
+}
+
 /// access: who may use the resolver (plan §5.5).
 void read_access(Section& top, policy::AccessConfig& out) {
     Section access(top.take("access"), "access");
-    if (auto allow = access.take("allow")) {
-        const std::string name = access.name("allow");
-        if (!allow->IsSequence()) fail(*allow, name + " must be a list of subnets, like [\"192.168.0.0/16\"]");
-        out.allow.clear();
-        for (const auto& item : *allow) {
-            auto subnet = policy::parse_subnet(scalar_or_empty(item));
-            if (!subnet) fail(item, name + ": " + subnet.error());
-            out.allow.push_back(*subnet);
-        }
-        if (out.allow.empty()) fail(*allow, name + " is empty: no client could use the resolver");
+    if (auto allow = read_subnets(access, "allow", out.allow); allow && out.allow.empty()) {
+        fail(*allow, access.name("allow") + " is empty: no client could use the resolver");
     }
-    if (auto deny = access.take("deny_action")) {
-        const std::string action = scalar_or_empty(*deny);
-        if (action == "refuse") {
-            out.deny = policy::DenyAction::Refuse;
-        } else if (action == "drop") {
-            out.deny = policy::DenyAction::Drop;
-        } else {
-            fail(*deny, access.name("deny_action") + " must be 'refuse' or 'drop'");
-        }
-    }
+    read_deny_action(access, "deny_action", out.deny);
     access.finish();
+}
+
+/// rate_limit: queries per client, and identical responses per client
+/// network (plan §5.9).
+void read_rate_limit(Section& top, Config& c) {
+    Section section(top.take("rate_limit"), "rate_limit");
+
+    Section per_client(section.take("per_client"), "rate_limit.per_client");
+    per_client.read_uint("qps", c.rate_limit.qps);
+    per_client.read_uint("burst", c.rate_limit.burst, 1);
+    read_deny_action(per_client, "action", c.rate_limit.action);
+    per_client.finish();
+
+    Section rrl(section.take("rrl"), "rate_limit.rrl");
+    rrl.read_uint("responses_per_second", c.rrl.responses_per_second);
+    rrl.read_uint("window_seconds", c.rrl.window_seconds, 1, 3600);
+    rrl.read_uint("slip", c.rrl.slip, 0, 10);
+    rrl.read_uint("ipv4_prefix", c.rrl.ipv4_prefix, 8, 32);
+    rrl.read_uint("ipv6_prefix", c.rrl.ipv6_prefix, 16, 128);
+    rrl.finish();
+
+    read_subnets(section, "exempt", c.rate_limit.exempt);  // from both limits
+    c.rrl.exempt = c.rate_limit.exempt;
+    section.finish();
 }
 
 /// One path, or a list of them.
@@ -346,10 +382,11 @@ Config parse(const YAML::Node& document) {
     if (k.prefetch) c.not_implemented.push_back("cache.prefetch");
 
     read_access(top, c.access);
+    read_rate_limit(top, c);
     read_policy(top, c);
 
     // Sections for modules still to come (plan §5-§7).
-    for (const char* key : {"rate_limit", "ml", "telemetry"}) {
+    for (const char* key : {"ml", "telemetry"}) {
         if (top.take(key)) c.not_implemented.push_back(key);
     }
     top.finish();

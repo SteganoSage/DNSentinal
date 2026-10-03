@@ -757,6 +757,14 @@ Root
   - Every Nth excess response (the "slip" rate, e.g. every 2nd) is sent with the **TC bit set** and the answer section empty. This tells a legitimate client "retry over TCP." A legitimate client whose IP happens to be the attacker's spoofed source can recover. A DDoS attacker gets nothing useful.
 - Counters reset every window (e.g. 1 second).
 
+**As built** (`policy/rate_limiter.{h,cpp}`, `security/rrl.{h,cpp}`, wired into `QueryProcessor`):
+- **Order:** access control, then the per-client limit, then everything else. Outsiders never reach the limiter. RRL wraps the responder, so it sees **every UDP response**, ACL refusals included: a forged source address gets limited refusals too. TCP responses are never limited, since a TCP client has completed a handshake from its address.
+- **Per client:** the bucket starts full and refills at `qps` up to `burst`. The `action` over the limit is `drop` (default) or `refuse`. IPv4-mapped IPv6 counts as the same client, via `policy::IpAddress`, shared with the ACL. Defaults: 100/s, burst 200.
+- **RRL fingerprint:** client network (/24, /56), name, qtype, rcode. **For NXDOMAIN and empty answers the name is the zone** (the SOA owner), as in BIND's RRL; otherwise a random-subdomain flood would make every response unique. Over the cap, 1 in `slip` responses goes out truncated (TC, no records) and the rest are dropped. Default off in code (0); the repo config turns it on at 10/s.
+- **Bounded memory under spoofed floods:** both tables have a size cap (65,536). When full, idle/expired entries are swept at most once a second; if still full, new keys **share one bucket/counter**. A flood from many forged addresses can't grow the table or escape the limit.
+- `rate_limit.exempt` (subnets) applies to both limits, e.g. a router forwarding a whole LAN.
+- **Counters** (`limited`, `dropped`, `slipped`) are exposed via `QueryProcessor::checks()` for the metrics (§7.4). The daemon logs a summary every 10 s while limits act, and totals at exit.
+
 ### 5.10 Attack Lab: Kaminsky Poisoning
 
 **What to build:**

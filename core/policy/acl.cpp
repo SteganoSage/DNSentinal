@@ -24,35 +24,51 @@ void mask(std::array<uint8_t, 16>& bytes, size_t length, uint8_t prefix) {
     }
 }
 
-/// The client's address as (family, bytes), with IPv4-mapped IPv6 unmapped.
-bool client_address(const sockaddr_storage& client, sa_family_t& family, std::array<uint8_t, 16>& bytes) {
+}  // namespace
+
+std::optional<IpAddress> ip_address(const sockaddr_storage& client) {
+    IpAddress ip;
     if (client.ss_family == AF_INET) {
-        family = AF_INET;
-        std::memcpy(bytes.data(), &reinterpret_cast<const sockaddr_in*>(&client)->sin_addr, 4);
-        return true;
+        ip.family = AF_INET;
+        std::memcpy(ip.bytes.data(), &reinterpret_cast<const sockaddr_in*>(&client)->sin_addr, 4);
+        return ip;
     }
     if (client.ss_family == AF_INET6) {
         const auto& a6 = reinterpret_cast<const sockaddr_in6*>(&client)->sin6_addr;
         if (IN6_IS_ADDR_V4MAPPED(&a6)) {
-            family = AF_INET;
-            std::memcpy(bytes.data(), a6.s6_addr + 12, 4);
+            ip.family = AF_INET;
+            std::memcpy(ip.bytes.data(), a6.s6_addr + 12, 4);
         } else {
-            family = AF_INET6;
-            std::memcpy(bytes.data(), a6.s6_addr, 16);
+            ip.family = AF_INET6;
+            std::memcpy(ip.bytes.data(), a6.s6_addr, 16);
         }
-        return true;
+        return ip;
     }
-    return false;  // not an IP client: never allowed
+    return std::nullopt;  // not an IP client
 }
 
-}  // namespace
+IpAddress IpAddress::network(uint8_t prefix) const {
+    IpAddress net = *this;
+    mask(net.bytes, address_bytes(family), prefix);
+    return net;
+}
+
+std::string IpAddress::to_string() const {
+    char text[INET6_ADDRSTRLEN] = "?";
+    if (family == AF_INET || family == AF_INET6) inet_ntop(family, bytes.data(), text, sizeof text);
+    return text;
+}
+
+size_t IpAddressHash::operator()(const IpAddress& a) const noexcept {
+    uint64_t h = 1469598103934665603ULL ^ a.family;  // FNV-1a
+    for (uint8_t b : a.bytes) h = (h ^ b) * 1099511628211ULL;
+    return static_cast<size_t>(h);
+}
 
 bool Subnet::contains(const sockaddr_storage& client) const {
-    sa_family_t             client_family;
-    std::array<uint8_t, 16> bytes{};
-    if (!client_address(client, client_family, bytes) || client_family != family) return false;
-    mask(bytes, address_bytes(family), prefix);
-    return std::equal(bytes.begin(), bytes.begin() + static_cast<long>(address_bytes(family)), network.begin());
+    auto ip = ip_address(client);
+    if (!ip || ip->family != family) return false;  // not an IP client, or the other family
+    return ip->network(prefix).bytes == network;
 }
 
 std::string Subnet::to_string() const {

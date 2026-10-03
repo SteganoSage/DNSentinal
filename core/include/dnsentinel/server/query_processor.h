@@ -1,17 +1,20 @@
 #pragma once
 /// @file server/query_processor.h
 /// The fast path (plan §1): every well-formed query from every transport
-/// comes through here. Stages so far: access control, rejecting queries we
-/// can't answer, the block and allow lists, resolution (the resolver
-/// answers from the cache when it can), checking the answer's CNAME chain
-/// against the lists, then removing private addresses from answers for
-/// public names (rebinding protection). Rate limiting and ML slot in around
-/// them as they land.
+/// comes through here. Stages so far: access control, the per-client rate
+/// limit, rejecting queries we can't answer, the block and allow lists,
+/// resolution (the resolver answers from the cache when it can), checking
+/// the answer's CNAME chain against the lists, then removing private
+/// addresses from answers for public names (rebinding protection). Every
+/// UDP response, whatever produced it, passes response rate limiting on
+/// its way out. ML slots in as it lands.
 
 #include "dnsentinel/net/query_handler.h"
 #include "dnsentinel/policy/acl.h"
 #include "dnsentinel/policy/blocklists.h"
+#include "dnsentinel/policy/rate_limiter.h"
 #include "dnsentinel/policy/rebinding.h"
+#include "dnsentinel/security/rrl.h"
 #include "dnsentinel/types.h"
 
 #include <functional>
@@ -44,6 +47,14 @@ struct RebindingEvent {
     bool            emptied = false;  // no address was left, so the client got NXDOMAIN
 };
 
+/// The processor's own checks, each built from its config section.
+struct Checks {
+    policy::AccessControl         access;      // who may use the resolver (§5.5)
+    policy::RateLimiter           rate_limit;  // queries per client (§5.9)
+    policy::RebindingFilter       rebinding;   // private addresses in answers (§5.8)
+    security::ResponseRateLimiter rrl;         // identical UDP responses per client network (§5.9)
+};
+
 class QueryProcessor {
 public:
     using BlockFn     = std::function<void(const BlockEvent&)>;
@@ -51,33 +62,35 @@ public:
 
     /// `resolver` and `lists` must outlive the processor, and resolutions it
     /// started must not complete after it is gone: destroy it only once the
-    /// loop has stopped, or with the resolver (which abandons them). `access`
-    /// decides who may use it.
-    QueryProcessor(resolver::RecursiveResolver& resolver, policy::AccessControl access,
-                   const policy::Blocklists& lists, policy::RebindingFilter rebinding);
+    /// loop has stopped, or with the resolver (which abandons them).
+    QueryProcessor(resolver::RecursiveResolver& resolver, const policy::Blocklists& lists, Checks checks);
 
     /// Called for every blocked answer, before it is sent.
     void on_block(BlockFn fn) { on_block_ = std::move(fn); }
     /// Called whenever rebinding protection changes an answer, before it is sent.
     void on_rebinding(RebindingFn fn) { on_rebinding_ = std::move(fn); }
 
+    /// The checks, for their counters.
+    [[nodiscard]] const Checks& checks() const { return checks_; }
+
     /// A net::QueryHandler. A client outside the allowed subnets gets
-    /// REFUSED, or nothing (DenyAction::Drop), before anything else happens.
+    /// REFUSED, or nothing (DenyAction::Drop), before anything else happens;
+    /// so does a client over its rate limit, according to its own setting.
     /// Queries that can't be answered get their error response at once, and
     /// so do blocked names (never sent upstream); the rest once resolution
     /// finishes (SERVFAIL if it fails), blocked after all if a name in the
     /// answer's CNAME chain is, and without private addresses unless the
     /// name is exempt (NXDOMAIN if no address is left). The response echoes
-    /// the client's question exactly, case included.
+    /// the client's question exactly, case included. Over UDP, a response
+    /// over the RRL cap is dropped or sent truncated instead.
     void handle(Message query, const net::ClientInfo& client, net::Responder respond);
 
 private:
     void report(const Question& question, std::vector<Name> chain, policy::TrieLookupResult match);
 
     resolver::RecursiveResolver& resolver_;
-    policy::AccessControl        access_;
     const policy::Blocklists&    lists_;
-    policy::RebindingFilter      rebinding_;
+    Checks                       checks_;
     BlockFn                      on_block_;
     RebindingFn                  on_rebinding_;
 };

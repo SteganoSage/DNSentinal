@@ -56,6 +56,42 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_FALSE(lists(*c, "policy.rebinding_protection"));  // implemented (plan §5.8)
     EXPECT_TRUE(c->rebinding.enabled);
     EXPECT_EQ(c->rebinding.exempt, policy::RebindingConfig::default_exempt());
+    EXPECT_FALSE(lists(*c, "rate_limit"));  // implemented (plan §5.9)
+    EXPECT_EQ(c->rate_limit.qps, 100u);
+    EXPECT_EQ(c->rate_limit.burst, 200u);
+    EXPECT_EQ(c->rate_limit.action, policy::DenyAction::Drop);
+    EXPECT_EQ(c->rrl.responses_per_second, 10u);
+    EXPECT_EQ(c->rrl.slip, 2u);
+}
+
+TEST(Config, RateLimitDefaults) {
+    auto c = parse_config("");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_EQ(c->rate_limit.qps, 100u);
+    EXPECT_EQ(c->rate_limit.burst, 200u);
+    EXPECT_EQ(c->rate_limit.action, policy::DenyAction::Drop);
+    EXPECT_TRUE(c->rate_limit.exempt.empty());
+    EXPECT_EQ(c->rrl.responses_per_second, 0u);  // RRL is off unless configured
+}
+
+TEST(Config, RateLimitParsesEverySetting) {
+    auto c = parse_config(
+        "rate_limit:\n"
+        "  per_client: { qps: 50, burst: 80, action: refuse }\n"
+        "  rrl: { responses_per_second: 5, window_seconds: 2, slip: 3, ipv4_prefix: 28, ipv6_prefix: 64 }\n"
+        "  exempt: [\"192.168.1.1\", \"fd00::/8\"]\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_EQ(c->rate_limit.qps, 50u);
+    EXPECT_EQ(c->rate_limit.burst, 80u);
+    EXPECT_EQ(c->rate_limit.action, policy::DenyAction::Refuse);
+    EXPECT_EQ(c->rrl.responses_per_second, 5u);
+    EXPECT_EQ(c->rrl.window_seconds, 2u);
+    EXPECT_EQ(c->rrl.slip, 3u);
+    EXPECT_EQ(c->rrl.ipv4_prefix, 28);
+    EXPECT_EQ(c->rrl.ipv6_prefix, 64);
+    ASSERT_EQ(c->rate_limit.exempt.size(), 2u);
+    EXPECT_EQ(c->rate_limit.exempt[0].to_string(), "192.168.1.1/32");
+    EXPECT_EQ(c->rrl.exempt, c->rate_limit.exempt);  // one list for both limits
 }
 
 TEST(Config, RebindingProtectionIsOnByDefault) {
@@ -256,6 +292,13 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"policy:\n  rebinding_protection:\n    exempt: [\".\"]\n", "exempting the root exempts everything; use enabled: false"},
         {"policy:\n  rebinding_protection:\n    exempt: [lan, LAN.]\n", "lan. is listed twice"},
         {"policy:\n  rebinding_protection:\n    exempt_tlds: [lan]\n", "unknown setting 'policy.rebinding_protection.exempt_tlds'"},
+        {"rate_limit:\n  per_client:\n    burst: 0\n", "rate_limit.per_client.burst must be between 1 and"},
+        {"rate_limit:\n  per_client:\n    action: block\n", "rate_limit.per_client.action must be 'refuse' or 'drop'"},
+        {"rate_limit:\n  rrl:\n    slip: 11\n", "rate_limit.rrl.slip must be between 0 and 10"},
+        {"rate_limit:\n  rrl:\n    ipv4_prefix: 33\n", "rate_limit.rrl.ipv4_prefix must be between 8 and 32"},
+        {"rate_limit:\n  rrl:\n    window_seconds: 0\n", "rate_limit.rrl.window_seconds must be between 1 and 3600"},
+        {"rate_limit:\n  exempt: [\"10.1.2.3/8\"]\n", "line 2: rate_limit.exempt: '10.1.2.3/8' has host bits set"},
+        {"rate_limit:\n  rrl:\n    rate: 5\n", "unknown setting 'rate_limit.rrl.rate'"},
     };
     for (const auto& c : cases) {
         auto config = parse_config(c.yaml);

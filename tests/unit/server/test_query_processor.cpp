@@ -26,6 +26,7 @@
 using namespace dnsentinel;
 using namespace dnsentinel::policy;
 using namespace dnsentinel::resolver;
+using namespace dnsentinel::security;
 using namespace dnsentinel::server;
 using namespace dnsentinel::test;
 using namespace std::chrono_literals;
@@ -52,10 +53,11 @@ protected:
         rebuild();
     }
 
-    /// A processor for localhost clients with the current lists and `rebinding`.
+    /// A processor with the current lists and the configs below.
     void rebuild() {
-        processor = std::make_unique<QueryProcessor>(*resolver, AccessControl(AccessConfig{}), *lists,
-                                                     RebindingFilter(rebinding));
+        processor = std::make_unique<QueryProcessor>(
+            *resolver, *lists,
+            Checks{AccessControl(access), RateLimiter(rate_limit), RebindingFilter(rebinding), ResponseRateLimiter(rrl)});
     }
 
     /// Use these block and allow lists from now on.
@@ -107,7 +109,10 @@ protected:
     cache::Cache                       cache{cache::CacheConfig{}};
     std::unique_ptr<RecursiveResolver> resolver;
     std::unique_ptr<Blocklists>        lists = std::make_unique<Blocklists>(ListsConfig{});
-    RebindingConfig                    rebinding;  // on, default exemptions
+    AccessConfig                       access;      // localhost only
+    RateLimitConfig                    rate_limit;  // the defaults: 100/s, burst 200
+    RebindingConfig                    rebinding;   // on, default exemptions
+    RrlConfig                          rrl;         // off
     std::unique_ptr<QueryProcessor>    processor;
 };
 
@@ -231,9 +236,8 @@ TEST_F(QueryProcessorTest, ClientsOutsideTheAllowedSubnetsAreRefused) {
 }
 
 TEST_F(QueryProcessorTest, ClientsOutsideCanBeIgnoredInstead) {
-    processor = std::make_unique<QueryProcessor>(
-        *resolver, AccessControl(AccessConfig{AccessConfig::localhost(), DenyAction::Drop}), *lists,
-        RebindingFilter(rebinding));
+    access.deny = DenyAction::Drop;
+    rebuild();
     int calls = 0;
     processor->handle(query("www.example.test"), client_at("192.0.2.99"), [&](const Message&) { ++calls; });
     run_for(100ms);
@@ -552,4 +556,90 @@ TEST_F(QueryProcessorTest, RebindingNeverTouchesBlockedAnswers) {
         EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")}) << qname;
     }
     EXPECT_EQ(events, 0);
+}
+
+// ─── Rate limiting and RRL (plan §5.9) ──────────────────────────────────────
+
+TEST_F(QueryProcessorTest, RateLimitDropsQueriesOverAClientsLimit) {
+    rate_limit = {.qps = 1, .burst = 3};
+    rebuild();
+    int replies = 0;
+    for (int i = 0; i < 5; ++i) {
+        processor->handle(query("www.example.test"), client_at("127.0.0.1"), [&](const Message&) { ++replies; });
+    }
+    run_for(300ms);
+    EXPECT_EQ(replies, 3);
+    EXPECT_EQ(processor->checks().rate_limit.limited(), 2u);
+
+    // Another client is unaffected.
+    int other = 0;
+    processor->handle(query("www.example.test"), client_at("127.0.0.2"), [&](const Message&) { ++other; });
+    run_for(300ms);
+    EXPECT_EQ(other, 1);
+}
+
+TEST_F(QueryProcessorTest, RateLimitCanRefuseInstead) {
+    rate_limit = {.qps = 1, .burst = 1, .action = DenyAction::Refuse};
+    rebuild();
+    ASSERT_EQ(ask(query("www.example.test"))->header.rcode, 0);
+    const int upstream = auth->queries;
+    auto r = ask(query("nope.example.test"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::Refused));
+    EXPECT_EQ(auth->queries, upstream);  // refused before anything was resolved
+}
+
+TEST_F(QueryProcessorTest, RateLimitComesAfterAccessControl) {
+    // Outsiders are turned away by the ACL and never reach the limiter.
+    rate_limit = {.qps = 1, .burst = 1};
+    rebuild();
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(ask(query("www.example.test"), "192.0.2.99")->header.rcode, 5);
+    EXPECT_EQ(processor->checks().rate_limit.limited(), 0u);
+    EXPECT_EQ(processor->checks().rate_limit.tracked(), 0u);
+}
+
+TEST_F(QueryProcessorTest, RrlDropsAndTruncatesRepeatedUdpResponses) {
+    rrl = {.responses_per_second = 2, .slip = 2};
+    rebuild();
+    int full = 0, truncated = 0, total = 0;
+    for (int i = 0; i < 6; ++i) {
+        processor->handle(query("www.example.test"), client_at("127.0.0.1"), [&](const Message& r) {
+            ++total;
+            full += r.answers.size() == 1;
+            truncated += r.header.tc && r.answers.empty();
+        });
+    }
+    run_for(300ms);
+    EXPECT_EQ(full, 2);
+    EXPECT_EQ(truncated, 2);  // every 2nd over the cap: "ask again over TCP"
+    EXPECT_EQ(total, 4);      // the other 2 dropped
+    EXPECT_EQ(processor->checks().rrl.dropped(), 2u);
+    EXPECT_EQ(processor->checks().rrl.slipped(), 2u);
+}
+
+TEST_F(QueryProcessorTest, RrlLeavesTcpAlone) {
+    rrl = {.responses_per_second = 1, .slip = 0};
+    rebuild();
+    net::ClientInfo tcp_client = client_at("127.0.0.1");
+    tcp_client.transport       = net::Transport::Tcp;
+    int full = 0;
+    for (int i = 0; i < 5; ++i) {
+        processor->handle(query("www.example.test"), tcp_client, [&](const Message& r) { full += r.answers.size() == 1; });
+    }
+    run_for(300ms);
+    EXPECT_EQ(full, 5);  // a TCP client can't be spoofed
+}
+
+TEST_F(QueryProcessorTest, RrlAlsoLimitsRefusals) {
+    // Queries forged with a victim's address: even REFUSED answers would
+    // flood it, so they count too.
+    rrl = {.responses_per_second = 1, .slip = 0};
+    rebuild();
+    int replies = 0;
+    for (int i = 0; i < 4; ++i) {
+        processor->handle(query("www.example.test"), client_at("192.0.2.99"), [&](const Message&) { ++replies; });
+    }
+    run_for(100ms);
+    EXPECT_EQ(replies, 1);
+    EXPECT_EQ(processor->checks().rrl.dropped(), 3u);
 }

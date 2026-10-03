@@ -179,6 +179,22 @@ def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False, timeout=5):
     return response
 
 
+def ask_burst(qname, count, timeout=0.5):
+    """Send `count` identical queries back to back from one socket; return the
+    Responses that arrive within `timeout` of the last one sent."""
+    responses = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for _ in range(count):
+            sock.sendto(make_query(qname)[1], DAEMON)
+        sock.settimeout(timeout)
+        try:
+            while len(responses) < count:
+                responses.append(Response(sock.recv(65535)))
+        except TimeoutError:
+            pass
+    return responses
+
+
 def ask_many(qname, count):
     """Send `count` identical queries at once, each from its own socket, and
     return their Responses."""
@@ -344,13 +360,14 @@ class Daemon:
         return status
 
 
-def write_config(tmp, stub_zone=False, access=None, policy=None):
+def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None):
     """access: (allowed subnets, deny action), or None for the default (localhost).
-    policy: the policy section's settings (indented YAML), or None for none."""
+    policy, rate_limit: those sections' settings (indented YAML), or None for none."""
     hints = os.path.join(tmp, "lab.root")
     with open(hints, "w") as f:
         f.write(f".  NS  a.root-servers.test.\na.root-servers.test.  A  {ROOT_IP}\n")
-    name = "stub" if stub_zone else f"access-{access[1]}" if access else "policy" if policy else "root"
+    name = ("stub" if stub_zone else f"access-{access[1]}" if access else "policy" if policy
+            else f"rate-{abs(hash(rate_limit))}" if rate_limit else "root")
     path = os.path.join(tmp, name + ".yaml")
     with open(path, "w") as f:
         f.write(f'listen:\n  udp: "{DAEMON[0]}:{DAEMON[1]}"\n')
@@ -362,6 +379,8 @@ def write_config(tmp, stub_zone=False, access=None, policy=None):
             f.write(f"access:\n  allow: [{subnets}]\n  deny_action: {access[1]}\n")
         if policy:
             f.write("policy:\n" + policy)
+        if rate_limit:
+            f.write("rate_limit:\n" + rate_limit)
     return path
 
 
@@ -377,7 +396,8 @@ def check(ok, what):
 
 
 def run_daemon(binary, config, body):
-    """Start the daemon, run `body(daemon)` against it, then check it shuts down cleanly."""
+    """Start the daemon, run `body(daemon)` against it, then check it shuts down
+    cleanly. Returns its whole log."""
     daemon = Daemon(binary, config)
     failed_before = len(failures)
     try:
@@ -389,6 +409,7 @@ def run_daemon(binary, config, body):
     check(status == 0 and "dnsentinel: shutting down" in daemon.log, "Ctrl-C shuts it down cleanly")
     if len(failures) > failed_before:
         print("  daemon log:\n" + "\n".join("    " + line for line in daemon.log))
+    return daemon.log
 
 
 def resolving_from_the_root(binary, servers, tmp):
@@ -486,6 +507,36 @@ def rejecting_a_bad_config(binary, servers, tmp):
     path = write_config(tmp, policy=f"  blocklists: [{missing}]\n")
     r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
     check(r.returncode == 1 and f"cannot open {missing}" in r.stderr, "a block list that can't be read stops startup")
+
+
+def rate_limiting_a_flood(binary, servers, tmp):
+    def per_client(daemon):
+        check(any("rate limits: 1 queries/s per client (burst 5, then refused); response rate limiting off" in line
+                  for line in daemon.log), "startup log describes the limits")
+        rcodes = [ask("www.example.lab").rcode for _ in range(12)]
+        check(rcodes[:5] == [NOERROR] * 5 and rcodes[5:] == [REFUSED] * 7,
+              "a client over its rate limit (burst 5) is refused")
+
+    log = run_daemon(binary, write_config(tmp, rate_limit="  per_client: { qps: 1, burst: 5, action: refuse }\n"),
+                     per_client)
+    check(any("rate limiting since startup: 7 queries over a client's limit" in line for line in log),
+          "...and the daemon sums it up at exit")
+
+    def rrl(daemon):
+        ask("www.example.lab")  # cached, so the burst is answered at once
+        time.sleep(1.1)         # a fresh RRL window
+        rs = ask_burst("www.example.lab", 9)
+        full = [r for r in rs if r.answers == [("www.example.lab.", A, "192.0.2.1")]]
+        truncated = [r for r in rs if r.tc and not r.answers]
+        check(len(full) == 3 and len(truncated) == 3 and len(rs) == 6,
+              "9 identical responses with RRL at 3/s: 3 sent, 3 truncated, 3 dropped")
+        r = ask("www.example.lab", tcp=True)
+        check(r.answers == [("www.example.lab.", A, "192.0.2.1")], "...and the client gets its answer over TCP")
+
+    log = run_daemon(binary, write_config(tmp, rate_limit="  per_client: { qps: 0 }\n"
+                                                         "  rrl: { responses_per_second: 3, slip: 2 }\n"), rrl)
+    check(any("3 responses dropped and 3 truncated by RRL" in line for line in log),
+          "...and the daemon sums it up at exit")
 
 
 def blocking_listed_names(binary, servers, tmp):
@@ -592,7 +643,7 @@ def main():
     servers = FakeServers()
     with tempfile.TemporaryDirectory() as tmp:
         for scenario in (resolving_from_the_root, resolving_a_stub_zone,
-                         refusing_clients_outside_the_allowed_subnets, blocking_listed_names,
+                         refusing_clients_outside_the_allowed_subnets, rate_limiting_a_flood, blocking_listed_names,
                          rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
