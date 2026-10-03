@@ -36,6 +36,9 @@ struct ListsConfig {
     std::vector<std::string> allowlists{};
     BlockResponse            response  = BlockResponse::NullIp;
     uint32_t                 block_ttl = 60;  // short, so unblocking a name takes effect quickly
+    /// Also check every name an answer's CNAME chain goes through (plan §5.7);
+    /// off = name-only blocking, the baseline experiment E12 compares against.
+    bool check_cname_chain = true;
     /// How often to check the list files for changes, reloading them if any
     /// changed. 0 = reload only on SIGHUP.
     uint32_t reload_check_seconds = 60;
@@ -79,6 +82,8 @@ public:
     [[nodiscard]] bool files_changed() const;
 
     [[nodiscard]] TrieLookupResult lookup(const Name& name) const { return trie_->lookup(name); }
+    /// The lists in use: valid until the next load() or finish_reload().
+    [[nodiscard]] const BlocklistTrie& trie() const { return *trie_; }
     [[nodiscard]] size_t           size() const { return trie_->size(); }
     [[nodiscard]] const ListsConfig& config() const { return config_; }
 

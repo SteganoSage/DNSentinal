@@ -34,7 +34,7 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->cache.num_shards, 16u);
     EXPECT_FALSE(lists(*c, "listen.tcp"));
     for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation", "cache.serve_stale",
-                                "policy.check_cname_chain", "policy.rebinding_protection", "telemetry"}) {
+                                "policy.rebinding_protection", "telemetry"}) {
         EXPECT_TRUE(lists(*c, feature)) << feature;
     }
     EXPECT_TRUE(c->resolver.use_0x20);
@@ -51,6 +51,15 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->lists.allowlists, (std::vector<std::string>{"config/lists/allow.txt"}));
     EXPECT_EQ(c->lists.response, policy::BlockResponse::NullIp);
     EXPECT_EQ(c->lists.block_ttl, 60u);
+    EXPECT_TRUE(c->lists.check_cname_chain);
+    EXPECT_FALSE(lists(*c, "policy.check_cname_chain"));  // implemented (plan §5.7)
+}
+
+TEST(Config, CnameCheckIsOnUnlessTurnedOff) {
+    EXPECT_TRUE(parse_config("")->lists.check_cname_chain);
+    auto c = parse_config("policy:\n  check_cname_chain: false\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_FALSE(c->lists.check_cname_chain);
 }
 
 TEST(Config, ListsDefaultToNone) {
@@ -206,6 +215,7 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"policy:\n  block_response: sinkhole\n", "policy.block_response must be 'null_ip' or 'nxdomain'"},
         {"policy:\n  block_ttl: 100000\n", "policy.block_ttl must be between 0 and 86400"},
         {"policy:\n  blocklist: [a.txt]\n", "unknown setting 'policy.blocklist'"},
+        {"policy:\n  check_cname_chain: sometimes\n", "policy.check_cname_chain must be true or false"},
     };
     for (const auto& c : cases) {
         auto config = parse_config(c.yaml);

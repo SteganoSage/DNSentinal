@@ -241,9 +241,7 @@ void read_policy(Section& top, Config& c) {
     policy.read_uint("block_ttl", lists.block_ttl, 0, 86400);
     policy.read_uint("reload_check_seconds", lists.reload_check_seconds, 0, 86400);
 
-    bool check_cname_chain = false;
-    policy.read_bool("check_cname_chain", check_cname_chain);
-    if (check_cname_chain) c.not_implemented.push_back("policy.check_cname_chain");
+    policy.read_bool("check_cname_chain", lists.check_cname_chain);
     if (policy.take("rebinding_protection")) c.not_implemented.push_back("policy.rebinding_protection");
     policy.finish();
 }

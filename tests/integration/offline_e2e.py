@@ -56,9 +56,11 @@ ZONES = {
             ("big.example.lab", A): [f"192.0.2.{i}" for i in range(1, 101)],  # ~1.6 KB: needs TCP
             ("slow.example.lab", A): ["192.0.2.7"],  # answered late: see SLOW_NAMES
             ("spoofed.example.lab", A): ["192.0.2.8"],  # raced by forged replies: see SPOOFED_NAMES
+            ("collect.tracker.lab", A): ["192.0.2.66"],
             ("ns.lab", A): [LAB_IP],
         },
-        "cnames": {"alias.example.lab": "www.example.lab"},
+        "cnames": {"alias.example.lab": "www.example.lab",
+                   "metrics.shop.lab": "collect.tracker.lab"},  # a tracker cloaked as a first-party name
     },
 }
 
@@ -474,14 +476,14 @@ def rejecting_a_bad_config(binary, servers, tmp):
 def blocking_listed_names(binary, servers, tmp):
     block, allow = os.path.join(tmp, "block.txt"), os.path.join(tmp, "allow.txt")
     with open(block, "w") as f:
-        f.write("# a hosts file\n0.0.0.0 example.lab\n127.0.0.1 localhost\nnot a domain\n")
+        f.write("# a hosts file\n0.0.0.0 example.lab\n0.0.0.0 tracker.lab\n127.0.0.1 localhost\nnot a domain\n")
     with open(allow, "w") as f:
         f.write("www.example.lab\n")
     policy = f"  blocklists: [{block}]\n  allowlist: {allow}\n  reload_check_seconds: 1\n"
 
     def body(daemon):
-        check(any(f"block {block}: 1 domains (1 unusable lines skipped)" in line for line in daemon.log)
-              and any("lists: 2 distinct domains" in line for line in daemon.log),
+        check(any(f"block {block}: 2 domains (1 unusable lines skipped)" in line for line in daemon.log)
+              and any("lists: 3 distinct domains" in line for line in daemon.log),
               "startup log counts the domains on each list")
 
         before = len(servers.seen)
@@ -494,14 +496,21 @@ def blocking_listed_names(binary, servers, tmp):
         r = ask("www.example.lab")
         check(r.answers == [("www.example.lab.", A, "192.0.2.1")], "an allowlisted name under it is resolved")
 
+        r = ask("metrics.shop.lab")
+        check(r.answers == [("metrics.shop.lab.", A, "0.0.0.0")],
+              "a name whose CNAME leads to a blocked domain gets 0.0.0.0 (CNAME cloaking)")
+        check((LAB_IP, "metrics.shop.lab", A) in servers.seen, "...which only resolving it could show")
+        check(daemon.wait_for(f"blocked a cloaked name: metrics.shop.lab. -> collect.tracker.lab. "
+                              f"(rule tracker.lab. in {block})"), "...and the daemon logs the chain and the rule")
+
         daemon.proc.send_signal(signal.SIGHUP)
-        check(daemon.wait_for("reloading the lists (SIGHUP)") and daemon.wait_for("lists: 2 distinct domains"),
+        check(daemon.wait_for("reloading the lists (SIGHUP)") and daemon.wait_for("lists: 3 distinct domains"),
               "SIGHUP reloads the lists")
 
         with open(block, "a") as f:
             f.write("dead\n")
         check(daemon.wait_for("reloading the lists (a list file changed)")
-              and daemon.wait_for("lists: 3 distinct domains"), "an edited list is reloaded without a restart")
+              and daemon.wait_for("lists: 4 distinct domains"), "an edited list is reloaded without a restart")
         r = ask("www.dead")
         check(r.answers == [("www.dead.", A, "0.0.0.0")], "...and its new rule applies at once")
 

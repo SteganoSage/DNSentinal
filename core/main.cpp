@@ -154,6 +154,14 @@ int main(int argc, char** argv) {
     cache::Cache                cache(config->cache);
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
     server::QueryProcessor      processor(resolver, policy::AccessControl(config->access), lists);
+    processor.on_block([](const server::BlockEvent& block) {
+        // Names blocked by their own list entry are too many to log here (the
+        // query log will record them); cloaked ones are rare and worth seeing.
+        if (!block.via_cname()) return;
+        std::string path;
+        for (const auto& hop : block.chain) path += (path.empty() ? "" : " -> ") + hop.to_string();
+        log("blocked a cloaked name: " + path + " (rule " + block.match.rule + " in " + block.match.source + ")");
+    });
     resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
         char server[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &alert.server, server, sizeof server);

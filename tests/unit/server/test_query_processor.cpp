@@ -322,3 +322,131 @@ TEST_F(QueryProcessorTest, OutsidersAreRefusedEvenForBlockedNames) {
     EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::Refused));  // not 0.0.0.0
     EXPECT_TRUE(r->answers.empty());
 }
+
+// ─── CNAME cloaking (plan §5.7) ─────────────────────────────────────────────
+
+namespace {
+
+/// metrics.shop.test is a first-party alias of a tracker.
+void add_cloaked_tracker(FakeAuth& auth) {
+    auth.add("metrics.shop.test", RRType::CNAME, RDataCNAME{name("collect.tracker.test")});
+    auth.add("collect.tracker.test", RRType::A, ipv4("192.0.2.66"));
+}
+
+}  // namespace
+
+TEST_F(QueryProcessorTest, CnameCloakedTrackersAreBlocked) {
+    add_cloaked_tracker(*auth);
+    const ListFile block("tracker.test\n");
+    use_lists({.blocklists = {block.path()}});
+    std::vector<BlockEvent> events;
+    processor->on_block([&](const BlockEvent& e) { events.push_back(e); });
+
+    const Message q = query("Metrics.Shop.TEST");
+    auto r = ask(q);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, 0);
+    EXPECT_EQ(r->questions[0].qname.original_case, q.questions[0].qname.original_case);
+    ASSERT_EQ(r->answers.size(), 1u);  // no CNAME, nothing from the real answer
+    EXPECT_EQ(r->answers[0].name, name("metrics.shop.test"));
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")});
+    EXPECT_EQ(r->answers[0].ttl, 60u);
+    EXPECT_GT(auth->queries, 0);  // it had to be resolved to be seen
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_TRUE(events[0].via_cname());
+    EXPECT_EQ(events[0].chain, (std::vector<Name>{name("metrics.shop.test"), name("collect.tracker.test")}));
+    EXPECT_EQ(events[0].blocked_name(), name("collect.tracker.test"));
+    EXPECT_EQ(events[0].match.rule, "tracker.test.");
+    EXPECT_EQ(events[0].match.source, block.path());
+
+    // The tracker has no AAAA: the real answer is the CNAME plus the SOA.
+    r = ask(query("metrics.shop.test", static_cast<uint16_t>(RRType::AAAA)));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv6("::")});
+    EXPECT_TRUE(r->authority.empty());
+}
+
+TEST_F(QueryProcessorTest, CnameCloakedNamesGetNxdomainInNxdomainMode) {
+    add_cloaked_tracker(*auth);
+    const ListFile block("tracker.test\n");
+    use_lists({.blocklists = {block.path()}, .response = BlockResponse::NxDomain});
+    auto r = ask(query("metrics.shop.test"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::NXDomain));
+    EXPECT_TRUE(r->answers.empty());
+}
+
+TEST_F(QueryProcessorTest, CnameCheckCanBeTurnedOff) {
+    add_cloaked_tracker(*auth);
+    const ListFile block("tracker.test\n");
+    use_lists({.blocklists = {block.path()}, .check_cname_chain = false});  // name-only blocking (E12's baseline)
+    int blocks = 0;
+    processor->on_block([&](const BlockEvent&) { ++blocks; });
+
+    auto r = ask(query("metrics.shop.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 2u);
+    EXPECT_EQ(r->answers[0].type, RRType::CNAME);
+    EXPECT_EQ(r->answers[1].rdata, RData{ipv4("192.0.2.66")});  // the tracker slips through
+    EXPECT_EQ(blocks, 0);
+}
+
+TEST_F(QueryProcessorTest, CnameCheckSparesAllowlistedNames) {
+    add_cloaked_tracker(*auth);
+    const ListFile block("tracker.test\n");
+    const ListFile allow("metrics.shop.test\n");
+    use_lists({.blocklists = {block.path()}, .allowlists = {allow.path()}});
+    auto r = ask(query("metrics.shop.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 2u);
+    EXPECT_EQ(r->answers[1].rdata, RData{ipv4("192.0.2.66")});
+}
+
+TEST_F(QueryProcessorTest, CnameChainsToCleanNamesPass) {
+    auth->add("alias.shop.test", RRType::CNAME, RDataCNAME{name("www.example.test")});
+    const ListFile block("tracker.test\n");
+    use_lists({.blocklists = {block.path()}});
+    int blocks = 0;
+    processor->on_block([&](const BlockEvent&) { ++blocks; });
+
+    auto r = ask(query("alias.shop.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 2u);
+    EXPECT_EQ(r->answers[1].rdata, RData{ipv4("192.0.2.1")});
+    EXPECT_EQ(blocks, 0);
+}
+
+TEST_F(QueryProcessorTest, CnameCheckAppliesToCachedAnswers) {
+    // Resolved and cached while nothing was listed; then the lists change.
+    add_cloaked_tracker(*auth);
+    ASSERT_EQ(ask(query("metrics.shop.test"))->answers.size(), 2u);
+    const int upstream = auth->queries;
+
+    const ListFile block("tracker.test\n");
+    use_lists({.blocklists = {block.path()}});
+    auto r = ask(query("metrics.shop.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")});
+    EXPECT_EQ(auth->queries, upstream);  // answered from the cache, and still checked
+}
+
+TEST_F(QueryProcessorTest, CnameAndDirectBlocksAreReportedApart) {
+    add_cloaked_tracker(*auth);
+    const ListFile block("tracker.test\nwww.example.test\n");
+    use_lists({.blocklists = {block.path()}});
+    std::vector<BlockEvent> events;
+    processor->on_block([&](const BlockEvent& e) { events.push_back(e); });
+
+    const Message direct = query("WWW.example.test");
+    ask(direct);
+    ask(query("metrics.shop.test"));
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_FALSE(events[0].via_cname());
+    EXPECT_EQ(events[0].blocked_name(), name("www.example.test"));
+    EXPECT_EQ(events[0].question.qname.original_case, direct.questions[0].qname.original_case);
+    EXPECT_EQ(events[0].match.rule, "www.example.test.");
+    EXPECT_TRUE(events[1].via_cname());
+}

@@ -698,8 +698,15 @@ Root
 **Implementation:**
 1. After resolution produces an answer with CNAME records, extract the CNAME chain:
    `query_name → CNAME target₁ → CNAME target₂ → ... → final A/AAAA`
-2. Look up each name and each name's **registrable domain** (eTLD+1) in the blocklist trie.
+2. Look up each name in the blocklist trie. One lookup per hop also covers its **registrable domain** (eTLD+1): rules cover their subdomains, so looking up `collect.tracker.net` finds a rule on `tracker.net`. No public-suffix list is needed here.
 3. If any hop matches a block rule, replace the entire response with a blocked response (0.0.0.0 or NXDOMAIN) and log which CNAME hop triggered the block.
+
+**As built** (`policy/cname_check.{h,cpp}`, called from `QueryProcessor` when resolution finishes):
+- The chain is followed from the query name through the answer section, in any record order. Records off the chain are ignored, and a loop ends it.
+- The **first** blocked hop is reported. An allowlisted hop is fine itself but doesn't vouch for the hops after it. An **allowlisted query name skips the check**: whatever it aliases was vouched for too.
+- It runs on every answer, cached ones included, so a list reload also applies to names already in the cache.
+- `policy.check_cname_chain: false` gives name-only blocking, the baseline for experiment E12.
+- Every blocked answer raises a `BlockEvent` (question, chain, rule, list), so direct and CNAME blocks can be counted apart (E12) and later sent to the query log and dashboard. The daemon logs the cloaked ones: `blocked a cloaked name: metrics.shop.lab. -> collect.tracker.lab. (rule tracker.lab. in ...)`.
 
 **Cost:** One trie lookup per CNAME hop. A typical chain is 1–3 hops. Negligible.
 
