@@ -23,6 +23,7 @@ models/*.onnx
 models/*.cpp
 models/*.bin
 models/*.pkl
+models/*.joblib
 
 # ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
