@@ -564,6 +564,130 @@ TEST_F(ResolverTest, OnlyTheInternetClassIsResolved) {
     EXPECT_EQ(total_queries(), 0);
 }
 
+// ─── QNAME minimisation (plan §6.1) ─────────────────────────────────────────
+
+namespace {
+
+Question q(std::string_view qname, RRType type) { return {name(qname), static_cast<uint16_t>(type), 1}; }
+
+/// What example.test's servers were asked; with exploration off, one of them gets it all.
+std::vector<Question> asked_example(const FakeAuth* ex1, const FakeAuth* ex2) {
+    std::vector<Question> all = ex1->seen;
+    all.insert(all.end(), ex2->seen.begin(), ex2->seen.end());
+    return all;
+}
+
+}  // namespace
+
+TEST_F(ResolverTest, MinimisationRevealsOneMoreLabelPerServer) {
+    config.explore_one_in = 0;
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(root->seen, (std::vector<Question>{q("test", RRType::NS)}));
+    EXPECT_EQ(tld->seen, (std::vector<Question>{q("example.test", RRType::NS)}));
+    EXPECT_EQ(asked_example(ex1, ex2), (std::vector<Question>{q("www.example.test", RRType::A)}));
+    EXPECT_EQ(r->upstream_queries_used, 3u);  // no extra round trips: every step was a zone cut
+    EXPECT_EQ(resolver().stats().minimised_queries, 2u);
+}
+
+TEST_F(ResolverTest, MinimisationOffSendsTheFullNameEverywhere) {
+    config.qname_minimisation = false;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());
+    EXPECT_EQ(root->seen, (std::vector<Question>{q("www.example.test", RRType::A)}));
+    EXPECT_EQ(tld->seen, (std::vector<Question>{q("www.example.test", RRType::A)}));
+    EXPECT_EQ(resolver().stats().minimised_queries, 0u);
+}
+
+TEST_F(ResolverTest, MinimisationWalksThroughAnEmptyNonTerminalAndRemembersIt) {
+    config.explore_one_in = 0;
+    ex1->add("c.b.example.test", RRType::A, ipv4("192.0.2.10"));
+    ex2->add("c.b.example.test", RRType::A, ipv4("192.0.2.10"));
+
+    auto r = resolve("a.b.example.test", RRType::A);  // b.example.test has no records of its own
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.9"}));
+    EXPECT_EQ(asked_example(ex1, ex2),
+              (std::vector<Question>{q("b.example.test", RRType::NS), q("a.b.example.test", RRType::A)}));
+
+    // Known now: no zone cut at b.example.test, so a sibling skips that step.
+    ex1->seen.clear();
+    ex2->seen.clear();
+    ASSERT_TRUE(resolve("c.b.example.test", RRType::A).has_value());
+    EXPECT_EQ(asked_example(ex1, ex2), (std::vector<Question>{q("c.b.example.test", RRType::A)}));
+}
+
+TEST_F(ResolverTest, MinimisationFallsBackWhenAnEmptyNonTerminalIsNxdomain) {
+    // A broken server: NXDOMAIN for b.example.test, which exists as an
+    // empty non-terminal (RFC 9156 §2.3).
+    ex1->tamper = ex2->tamper = [](const Message& query, Message& r) {
+        if (query.questions.at(0).qtype == static_cast<uint16_t>(RRType::NS)) {
+            r.header.rcode = static_cast<uint8_t>(RCode::NXDomain);
+        }
+        return true;
+    };
+    auto r = resolve("a.b.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(r->response.header.rcode, 0);
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.9"}));
+    EXPECT_EQ(resolver().stats().minimisation_fallbacks, 1u);
+}
+
+TEST_F(ResolverTest, MinimisationFallsBackWhenAServerRefusesNsQueries) {
+    config.explore_one_in = 0;
+    root->tamper = [](const Message& query, Message& r) {  // e.g. a middlebox that refuses NS queries
+        if (query.questions.at(0).qtype == static_cast<uint16_t>(RRType::NS)) {
+            r = wire::make_response(query, RCode::Refused);
+        }
+        return true;
+    };
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(root->seen, (std::vector<Question>{q("test", RRType::NS), q("www.example.test", RRType::A)}));
+    EXPECT_EQ(tld->seen, (std::vector<Question>{q("example.test", RRType::NS)}));  // only that zone falls back
+    EXPECT_EQ(resolver().stats().minimisation_fallbacks, 1u);
+}
+
+TEST_F(ResolverTest, MinimisationFindsACutInAnAuthoritativeNsAnswer) {
+    // example.test's servers also serve sub.example.test, so asked
+    // "sub.example.test NS?" they answer with the NS set, not a referral.
+    for (FakeAuth* ex : {ex1, ex2}) {
+        ex->add("sub.example.test", RRType::NS, RDataNS{name("ns.sub.example.test")});
+        ex->add("ns.sub.example.test", RRType::A, ipv4(ip(3).c_str()));
+        ex->add("www.sub.example.test", RRType::A, ipv4("192.0.2.77"));
+    }
+    auto r = resolve("www.sub.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.77"}));
+    auto cut = cache.lookup({name("sub.example.test"), 2, 1});
+    ASSERT_TRUE(cut.entry.has_value());
+    EXPECT_EQ(cut.entry->trust, TrustRank::Answer);
+}
+
+TEST_F(ResolverTest, MinimisationTreatsAnIntermediateCnameAsNoCut) {
+    // alias.example.test is a CNAME. Asked for x.alias.example.test, the
+    // resolver must not follow the intermediate name's alias.
+    auto r = resolve("x.alias.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(r->response.header.rcode, static_cast<uint8_t>(RCode::NXDomain));
+    EXPECT_TRUE(r->response.answers.empty());
+}
+
+TEST_F(ResolverTest, MinimisationCapsQueriesForLongNames) {
+    config.explore_one_in = 0;
+    std::string deep = "example.test";
+    for (int i = 18; i >= 1; --i) deep = "l" + std::to_string(i) + "." + deep;  // 20 labels
+    ex1->add(deep, RRType::A, ipv4("192.0.2.99"));
+    ex2->add(deep, RRType::A, ipv4("192.0.2.99"));
+
+    auto r = resolve(deep, RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.99"}));
+    EXPECT_LE(resolver().stats().minimised_queries, 10u);  // RFC 9156 MAX_MINIMISE_COUNT
+    EXPECT_LT(ex1->queries + ex2->queries, 18);            // not one per label
+}
+
 // ─── Stub zones ─────────────────────────────────────────────────────────────
 
 TEST_F(ResolverTest, StubZoneSkipsTheRoot) {

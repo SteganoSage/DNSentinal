@@ -24,6 +24,7 @@ import selectors
 import shutil
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -41,6 +42,7 @@ NOERROR, SERVFAIL, NXDOMAIN, REFUSED = 0, 2, 3, 5
 ROOT_IP, LAB_IP = "127.0.0.2", "127.0.0.3"
 DEAD_IP = "127.0.0.9"  # delegated to, but nothing listens there
 DAEMON = ("127.0.0.1", 5353)
+DOT = ("127.0.0.1", 8853)
 
 # The hierarchy. Names are lower-case, without the trailing dot; "" is the root.
 ZONES = {
@@ -177,6 +179,32 @@ def ask(qname, qtype=A, qclass=CLASS_IN, tcp=False, timeout=5):
             response = Response(sock.recv(65535))
     response.id_matches = response.id == qid
     return response
+
+
+def ask_dot(qname, cafile):
+    """One query over DNS over TLS, trusting only `cafile`; the Response also
+    records the ALPN protocol agreed."""
+    qid, query = make_query(qname)
+    context = ssl.create_default_context(cafile=cafile)
+    context.set_alpn_protocols(["dot"])
+    with socket.create_connection(DOT, timeout=5) as raw, context.wrap_socket(raw, server_hostname=DOT[0]) as sock:
+        sock.sendall(struct.pack(">H", len(query)) + query)
+        length = struct.unpack(">H", recv_exact(sock, 2))[0]
+        response = Response(recv_exact(sock, length))
+        response.alpn = sock.selected_alpn_protocol()
+    response.id_matches = response.id == qid
+    return response
+
+
+def make_cert(tmp):
+    """A throwaway certificate for 127.0.0.1: (cert, key), or None without the openssl command."""
+    if not shutil.which("openssl"):
+        return None
+    cert, key = os.path.join(tmp, "dot.crt"), os.path.join(tmp, "dot.key")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                    "-days", "1", "-keyout", key, "-out", cert, "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"], check=True, capture_output=True)
+    return cert, key
 
 
 def ask_burst(qname, count, timeout=0.5):
@@ -360,17 +388,20 @@ class Daemon:
         return status
 
 
-def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None):
+def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None, dot=None):
     """access: (allowed subnets, deny action), or None for the default (localhost).
-    policy, rate_limit: those sections' settings (indented YAML), or None for none."""
+    policy, rate_limit: those sections' settings (indented YAML), or None for none.
+    dot: (cert, key) for a DoT listener on DOT, or None for none."""
     hints = os.path.join(tmp, "lab.root")
     with open(hints, "w") as f:
         f.write(f".  NS  a.root-servers.test.\na.root-servers.test.  A  {ROOT_IP}\n")
     name = ("stub" if stub_zone else f"access-{access[1]}" if access else "policy" if policy
-            else f"rate-{abs(hash(rate_limit))}" if rate_limit else "root")
+            else f"rate-{abs(hash(rate_limit))}" if rate_limit else "dot" if dot else "root")
     path = os.path.join(tmp, name + ".yaml")
     with open(path, "w") as f:
         f.write(f'listen:\n  udp: "{DAEMON[0]}:{DAEMON[1]}"\n')
+        if dot:
+            f.write(f'  dot:\n    addr: "{DOT[0]}:{DOT[1]}"\n    cert: {dot[0]}\n    key: {dot[1]}\n')
         f.write(f"resolver:\n  root_hints: {hints}\n  overall_deadline_ms: 2000\n")
         if stub_zone:
             f.write(f'  stub_zones:\n    lab.: ["{LAB_IP}"]\n')
@@ -436,6 +467,10 @@ def resolving_from_the_root(binary, servers, tmp):
               "repeat query answered from the cache")
         check(r.questions == ["WwW.ExAmPlE.LaB."], "question echoed in the client's case")
         check(len(servers.queries_to(ROOT_IP)) == 2, "root asked only twice: priming, then the lab. referral")
+        check(servers.queries_to(ROOT_IP)[1] == (ROOT_IP, "lab", NS),
+              "QNAME minimisation: the root only learns the TLD ('lab NS?'), never the full name")
+        check((LAB_IP, "www.example.lab", A) in servers.seen and (LAB_IP, "example.lab", NS) in servers.seen,
+              "...and the lab. server is asked 'example.lab NS?' before the full name")
 
         before = len(servers.seen)
         rs = ask_many("slow.example.lab", 10)
@@ -487,7 +522,7 @@ def resolving_a_stub_zone(binary, servers, tmp):
         r = ask("www.example.lab")
         check(r.rcode == NOERROR and r.answers == [("www.example.lab.", A, "192.0.2.1")], "A record found")
         check(servers.queries_to(ROOT_IP) == [(ROOT_IP, "", NS)], "root asked only for priming")
-        check(servers.queries_to(LAB_IP)[:1] == [(LAB_IP, "www.example.lab", A)],
+        check((LAB_IP, "www.example.lab", A) in servers.queries_to(LAB_IP),
               "lab. names go straight to the stub zone's server")
         r = ask("router.example.lab")
         check(r.answers == [("router.example.lab.", A, "192.168.1.1")],
@@ -503,10 +538,47 @@ def rejecting_a_bad_config(binary, servers, tmp):
     r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
     check(r.returncode == 1 and "line 2: resolver.edns_buffer" in r.stderr, "startup stops and names the bad line")
 
+    path = write_config(tmp, dot=(os.path.join(tmp, "nope.crt"), os.path.join(tmp, "nope.key")))
+    r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
+    check(r.returncode == 1 and "listen.dot: cannot open" in r.stderr and "certs/make_certs.sh" in r.stderr,
+          "a DoT certificate that can't be read stops startup, and says how to make one")
+
     missing = os.path.join(tmp, "missing.txt")
     path = write_config(tmp, policy=f"  blocklists: [{missing}]\n")
     r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
     check(r.returncode == 1 and f"cannot open {missing}" in r.stderr, "a block list that can't be read stops startup")
+
+
+def answering_over_tls(binary, servers, tmp):
+    made = make_cert(tmp)
+    if not made:
+        print("  skip  no openssl command to make a certificate with")
+        return
+    cert, key = made
+
+    def body(daemon):
+        check(any(f"dot {DOT[0]}:{DOT[1]}" in line for line in daemon.log if "listening on" in line),
+              "startup log lists the DoT listener")
+        r = ask_dot("www.example.lab", cert)
+        check(r.id_matches and r.answers == [("www.example.lab.", A, "192.0.2.1")],
+              "answers over DNS over TLS, to a client that verified the certificate")
+        check(r.alpn == "dot", "...and agrees on the ALPN protocol 'dot'")
+
+        # Unencrypted DNS on the TLS port is a failed handshake: no answer.
+        query = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + encode_name("www.example.lab") + \
+            struct.pack(">HH", A, CLASS_IN)
+        with socket.create_connection(DOT, timeout=5) as sock:
+            sock.sendall(struct.pack(">H", len(query)) + query)
+            reply = b""
+            try:
+                while chunk := sock.recv(4096):
+                    reply += chunk
+            except ConnectionResetError:  # closed with our bytes unread: the kernel resets
+                pass
+        check(not (len(reply) >= 4 and reply[2:4] == b"\x12\x34"),
+              "plain DNS on the DoT port gets no answer, and the connection is closed")
+
+    run_daemon(binary, write_config(tmp, dot=(cert, key)), body)
 
 
 def rate_limiting_a_flood(binary, servers, tmp):
@@ -644,7 +716,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         for scenario in (resolving_from_the_root, resolving_a_stub_zone,
                          refusing_clients_outside_the_allowed_subnets, rate_limiting_a_flood, blocking_listed_names,
-                         rejecting_a_bad_config):
+                         answering_over_tls, rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
                 scenario(binary, servers, tmp)

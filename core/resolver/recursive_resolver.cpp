@@ -6,8 +6,9 @@
 ///   step()             answer from the cache, or find the closest zone cut
 ///   next_server()      pick the fastest untried server (SRTT); if none, resolve a glueless
 ///                      NS; if none, retry the servers that timed out, waiting longer
-///   send_query()       ask it and return to the loop
+///   send_query()       ask it (QNAME-minimised until the last zone) and return to the loop
 ///   handle_response()  answer / CNAME / NXDOMAIN / referral / NODATA
+///   handle_minimised() is a zone cut at the name asked? descend, or reveal another label
 /// and never blocks: every wait is a return to the event loop.
 ///
 /// Convention: finish() runs the task's callback, which may start new work
@@ -57,6 +58,25 @@ constexpr size_t kMaxSubqueryDepth = 4;
 /// Extra rounds for a zone's servers that timed out, each with a doubled wait
 /// (plan §3.3). The query budget and the overall deadline still apply.
 constexpr uint8_t kMaxRetryRounds = 2;
+
+/// QNAME minimisation limits (RFC 9156 §2.3): the first minimised queries
+/// reveal one label each; after that, labels come in bigger steps, so even
+/// a long name (say under ip6.arpa) costs at most kMaxMinimiseCount of them.
+constexpr uint32_t kMaxMinimiseCount = 10;
+constexpr uint32_t kMinimiseOneLabel = 4;
+
+/// The ancestor of `name` (or `name` itself) with `labels` labels.
+Name ancestor(const Name& name, size_t labels) {
+    const size_t skip = name.label_count() - labels;
+    Name         out;
+    out.labels.assign(name.labels.begin() + static_cast<ptrdiff_t>(skip), name.labels.end());
+    if (name.original_case.size() == name.labels.size()) {
+        out.original_case.assign(name.original_case.begin() + static_cast<ptrdiff_t>(skip), name.original_case.end());
+    } else {
+        out.original_case = out.labels;
+    }
+    return out;
+}
 
 std::vector<RR> collect(const std::vector<RR>& section, const Name& name, uint16_t type) {
     std::vector<RR> out;
@@ -165,6 +185,12 @@ struct RecursiveResolver::Impl {
         in_addr_t              asked    = 0;      // the server asked last
         bool                   over_tcp = false;  // ... and whether over TCP
         bool                   sent_0x20 = false; // ... and whether with random letter case
+        Name                   sent_name;         // ... and the question sent: t.qname, or an ancestor
+        uint16_t               sent_type = 0;
+        bool                   minimised = false; // ... which was then a minimised one: sent_name NS?
+        bool                   minimise  = true;  // this zone still gets minimised queries (plan §6.1)
+        size_t                 known_labels   = 0;  // labels of qname known not to hide a deeper cut
+        uint32_t               minimise_count = 0;  // minimised steps taken for this target
         uint8_t                glueless_lookups = 0;
         uint16_t               referrals        = 0;
         uint32_t               timeouts         = 0;  // in this zone: each doubles the next wait
@@ -214,6 +240,7 @@ struct RecursiveResolver::Impl {
     std::unordered_map<Question, uint64_t, QuestionHash> in_flight;  // client question → its task
     std::unordered_set<in_addr_t>                        no_0x20;    // servers that don't echo letter case
     SpoofAlertFn                                         spoof_alert;
+    ResolverStats                                        stats;
 
     // ─── Task lifecycle ─────────────────────────────────────────────────────
 
@@ -347,6 +374,7 @@ struct RecursiveResolver::Impl {
             return;
         }
         const uint16_t qtype = t->question.qtype;
+        t->minimise_count    = 0;  // a new target (the question, or a CNAME's target)
 
         // Only authoritative answer data is served from the cache. Glue and
         // referral data (lower trust ranks) find servers; they never answer.
@@ -409,7 +437,9 @@ struct RecursiveResolver::Impl {
 
     /// Make `zone` the current zone cut, with no servers known yet.
     void reset_zone(Task& t, Name zone) {
-        t.zone = std::move(zone);
+        t.zone         = std::move(zone);
+        t.known_labels = t.zone.label_count();
+        t.minimise     = config.qname_minimisation;
         t.servers.clear();
         t.unresolved.clear();
         t.tried.clear();
@@ -439,6 +469,35 @@ struct RecursiveResolver::Impl {
         if (t.zone.label_count() == 0) {
             for (in_addr_t a : ipv4_addresses(hints.addresses)) add_server(t, a);
         }
+    }
+
+    /// How many of t.qname's labels the next query reveals (RFC 9156 §2.3):
+    /// the zone cut plus one, more once the first steps are spent, all of
+    /// them for the zone that holds the name or when minimisation is off.
+    /// Names the cache already knows are no zone cut are skipped.
+    size_t labels_to_ask(Task& t) {
+        const size_t full = t.qname.label_count();
+        while (t.minimise && t.known_labels < full && t.minimise_count < kMaxMinimiseCount) {
+            size_t next = t.known_labels + 1;
+            if (t.minimise_count >= kMinimiseOneLabel) {
+                const size_t left  = full - t.known_labels;
+                const size_t steps = kMaxMinimiseCount - t.minimise_count;
+                next               = t.known_labels + (left + steps - 1) / steps;
+            }
+            if (next >= full) break;
+            auto nodata = cache.lookup({ancestor(t.qname, next), kTypeNS, kClassIN});
+            if (!nodata.entry || !nodata.entry->is_negative) return next;
+            t.known_labels = next;
+        }
+        return full;
+    }
+
+    /// Only records inside the zone we asked about are believed.
+    void believe_only_bailiwick(Message& response, const Name& zone) const {
+#ifdef DNSENTINEL_WEAK_MODE
+        if (config.weak.accept_out_of_bailiwick) return;
+#endif
+        security::filter_to_bailiwick(response, zone);
     }
 
     bool would_cycle(const Task& t, const Question& q) const {
@@ -511,11 +570,19 @@ struct RecursiveResolver::Impl {
         // 0x20 (plan §5.2): over UDP, ask in random letter case and accept only
         // replies that echo it. TCP can't be spoofed off-path, so it needn't.
         t.sent_0x20 = config.use_0x20 && !t.over_tcp && !no_0x20.contains(address);
+        // QNAME minimisation (plan §6.1): above the zone that holds the name,
+        // ask only whether the next label down is a zone cut.
+        const size_t labels = labels_to_ask(t);
+        t.minimised         = labels < t.qname.label_count();
+        t.sent_name         = t.minimised ? ancestor(t.qname, labels) : t.qname;
+        t.sent_type         = t.minimised ? kTypeNS : t.question.qtype;
+        ++stats.upstream_queries;
+        if (t.minimised) ++stats.minimised_queries;
 
         Message query;
         query.header.rd = false;  // iterative: we do the recursion ourselves
         query.questions.push_back(
-            Question{t.sent_0x20 ? security::randomize_case(t.qname) : t.qname, t.question.qtype, kClassIN});
+            Question{t.sent_0x20 ? security::randomize_case(t.sent_name) : t.sent_name, t.sent_type, kClassIN});
         query.edns = EdnsInfo{.udp_payload_size = config.edns_buffer};
 
         // As long as this server usually takes, doubled for each timeout in this zone.
@@ -545,7 +612,7 @@ struct RecursiveResolver::Impl {
             // it again over TCP, where an off-path attacker can't inject.
             // Neither a failed try nor an SRTT penalty: it's not the server's fault.
             if (spoof_alert) {
-                spoof_alert(SpoofAlert{Question{t->qname, t->question.qtype, kClassIN}, t->asked,
+                spoof_alert(SpoofAlert{Question{t->sent_name, t->sent_type, kClassIN}, t->asked,
                                        config.spoof_tcp_threshold});
             }
             send_query(id, t->asked, UpstreamTransport::Tcp);
@@ -609,7 +676,7 @@ struct RecursiveResolver::Impl {
     void handle_response(uint64_t id, Message& response, microseconds rtt) {
         Task& t = *find(id);
         const auto rcode = static_cast<RCode>(response.header.rcode);
-        if (t.sent_0x20) restore_case(response, t.qname);
+        if (t.sent_0x20) restore_case(response, t.sent_name);
 
         // TC: the answer didn't fit in UDP. Ask the same server again over
         // TCP (plan §4.1); if even that comes back truncated, give up on it.
@@ -622,6 +689,10 @@ struct RecursiveResolver::Impl {
             }
             return;
         }
+        if (t.minimised) {
+            handle_minimised(id, response, rtt);
+            return;
+        }
         // Any error rcode: this server can't help.
         if (rcode != RCode::NoError && rcode != RCode::NXDomain) {
             rate(t, false, rtt);
@@ -629,11 +700,7 @@ struct RecursiveResolver::Impl {
             return;
         }
 
-        // Only records inside the zone we asked about are believed.
-#ifdef DNSENTINEL_WEAK_MODE
-        if (!config.weak.accept_out_of_bailiwick)
-#endif
-            security::filter_to_bailiwick(response, t.zone);
+        believe_only_bailiwick(response, t.zone);
         const uint16_t  qtype       = t.question.qtype;
         const TrustRank answer_rank = response.header.aa ? TrustRank::Answer : TrustRank::Authority;
 
@@ -690,19 +757,11 @@ struct RecursiveResolver::Impl {
         }
 
         if (!ns.empty()) {
-            if (!downward) {
+            if (downward) {
+                descend(id, ns, response.additional, TrustRank::Authority);
+            } else {
                 next_server(id);
-                return;
             }
-            if (++t.referrals > config.max_referral_depth) {
-                finish(id, std::unexpected(ResolveError::MaxDepthExceeded));
-                return;
-            }
-            const Name child = ns.front().name;
-            cache.insert({child, kTypeNS, kClassIN}, ns, TrustRank::Authority, min_ttl(ns));
-            cache_glue(response.additional, ns);
-            enter_zone(t, child, ns, response.additional);
-            next_server(id);
             return;
         }
 
@@ -716,6 +775,78 @@ struct RecursiveResolver::Impl {
             return;
         }
         next_server(id);  // nothing usable: a lame server
+    }
+
+    /// Follow a delegation to the zone `ns` names, already checked to lead
+    /// toward the name.
+    void descend(uint64_t id, const std::vector<RR>& ns, const std::vector<RR>& additional, TrustRank rank) {
+        Task& t = *find(id);
+        if (++t.referrals > config.max_referral_depth) {
+            finish(id, std::unexpected(ResolveError::MaxDepthExceeded));
+            return;
+        }
+        const Name child = ns.front().name;
+        cache.insert({child, kTypeNS, kClassIN}, ns, rank, min_ttl(ns));
+        cache_glue(additional, ns);
+        enter_zone(t, child, ns, additional);
+        next_server(id);
+    }
+
+    /// The answer to a minimised query, `t.sent_name NS?` (RFC 9156): is a
+    /// zone cut there? A delegation means yes, so descend; NODATA (or a
+    /// CNAME) means no, so the next query reveals more of the name.
+    void handle_minimised(uint64_t id, Message& response, microseconds rtt) {
+        Task& t = *find(id);
+        if (response.header.rcode != static_cast<uint8_t>(RCode::NoError)) {
+            // The name asked is an ancestor of the one being resolved, so
+            // NXDOMAIN (or an error) for it means the server mishandles
+            // minimised queries, typically at an empty non-terminal. Ask
+            // this zone the full name instead (RFC 9156 §2.3), starting with
+            // the same server: the full answer settles it.
+            ++stats.minimisation_fallbacks;
+            t.minimise = false;
+            std::erase(t.tried, t.asked);
+            send_query(id, t.asked);
+            return;
+        }
+
+        believe_only_bailiwick(response, t.zone);
+        // A delegation: a referral, or the NS set itself from a server
+        // authoritative for both sides of the cut.
+        const std::vector<RR> answer_ns = collect(response.answers, t.sent_name, kTypeNS);
+        const std::vector<RR> referral  = response.header.aa ? std::vector<RR>{} : referral_ns(response.authority);
+        const bool downward = !referral.empty() && referral.front().name.label_count() > t.zone.label_count() &&
+                              t.qname.is_subdomain_of(referral.front().name);
+        const bool alias    = !collect(response.answers, t.sent_name, kTypeCNAME).empty();
+        const RR*  soa      = find_soa(response.authority, t.sent_name);
+        const bool no_cut   = answer_ns.empty() && referral.empty() && (response.header.aa || soa || alias);
+        rate(t, !answer_ns.empty() || downward || no_cut, rtt);
+
+        if (!answer_ns.empty() || downward) {
+            ++t.minimise_count;
+            if (answer_ns.empty()) {
+                descend(id, referral, response.additional, TrustRank::Authority);
+            } else {
+                descend(id, answer_ns, response.additional,
+                        response.header.aa ? TrustRank::Answer : TrustRank::Authority);
+            }
+            return;
+        }
+        if (no_cut) {
+            ++t.minimise_count;
+            if (soa && !alias) {  // remembered, so later names under it skip this step
+                cache.insert({t.sent_name, kTypeNS, kClassIN}, {*soa}, TrustRank::Authority, negative_ttl(*soa),
+                             /*negative=*/true);
+            }
+            // Same zone, new question: every server may be asked again.
+            t.known_labels = t.sent_name.label_count();
+            t.tried.clear();
+            t.timed_out.clear();
+            t.retry_rounds = 0;
+            next_server(id);
+            return;
+        }
+        next_server(id);  // a lame server, or a referral leading elsewhere
     }
 
     void prime(PrimeCallback done) {
@@ -746,5 +877,7 @@ void RecursiveResolver::resolve(const Question& question, ResolveCallback done) 
 void RecursiveResolver::prime_root(PrimeCallback done) { impl_->prime(std::move(done)); }
 
 void RecursiveResolver::on_spoof_alert(SpoofAlertFn alert) { impl_->spoof_alert = std::move(alert); }
+
+const ResolverStats& RecursiveResolver::stats() const { return impl_->stats; }
 
 }  // namespace dnsentinel::resolver

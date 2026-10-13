@@ -74,6 +74,7 @@ add_library(dnsentinel_core STATIC
     core/net/event_loop.cpp
     core/net/udp_listener.cpp
     core/net/tcp_listener.cpp
+    core/net/tls.cpp
 
     # Resolver
     core/resolver/recursive_resolver.cpp
@@ -124,7 +125,8 @@ target_link_libraries(dnsentinel_core PRIVATE yaml-cpp::yaml-cpp)
 
 # ─── DoT listener ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_DOT)
-    # target_sources(dnsentinel_core PRIVATE core/net/dot_listener.cpp)
+    # DoT is the TCP listener with TLS (core/net/tcp_listener.cpp, core/net/tls.cpp),
+    # always built: OpenSSL is required anyway. This only defines the macro.
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_DOT=1)
 endif()
 
@@ -163,6 +165,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/net/test_event_loop.cpp
         tests/unit/net/test_udp_listener.cpp
         tests/unit/net/test_tcp_listener.cpp
+        tests/unit/net/test_tls.cpp
         tests/unit/cache/test_cache.cpp
         tests/unit/resolver/test_root_hints.cpp
         tests/unit/resolver/test_upstream.cpp

@@ -205,6 +205,9 @@ def write_config(tmp, level):
         f.write(f'listen:\n  udp: "{RESOLVER[0]}:{RESOLVER[1]}"\n')
         f.write(f"resolver:\n  root_hints: {hints}\n  overall_deadline_ms: 4000\n")
         f.write("  spoof_tcp_threshold: 0\n")  # don't flip to TCP: we are measuring the UDP race
+        # The ladder measures ID, port and 0x20 entropy, so keep the raced
+        # question the full name: minimised, the TLD would see "target.lab NS?".
+        f.write("  qname_minimisation: false\n")
         if level == "weak":
             # Below rung L3 of the ladder: low-entropy ID on a known port, and
             # no 0x20, so the attacker can match the query it is racing.

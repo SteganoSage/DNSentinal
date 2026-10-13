@@ -57,7 +57,7 @@ struct ResolverConfig {
     WeakMode weak;  // lab-only anti-spoofing knobs (plan §5.10); absent from a release build
 #endif
     std::string root_hints_path = "config/named.root";  // loaded by the caller: see RootHints
-    bool     qname_minimisation   = true;   // not implemented yet (plan §6.1)
+    bool     qname_minimisation   = true;   // reveal one more label per server (plan §6.1, RFC 9156)
     bool     use_0x20             = true;   // random letter case in upstream queries (plan §5.2)
     uint16_t edns_buffer          = 1232;
     uint32_t max_upstream_queries = 30;     // per client query, sub-queries included
@@ -85,6 +85,13 @@ struct ResolveResult {
     uint32_t upstream_queries_used = 0;      // caused by this query: 0 when coalesced
     uint32_t latency_us            = 0;      // from this query's resolve() call
     bool     coalesced             = false;  // joined an identical resolution in flight (plan §4.4)
+};
+
+/// Counters for metrics and experiments (plan §7.4; E6 counts minimisation).
+struct ResolverStats {
+    uint64_t upstream_queries       = 0;  // every query sent upstream, retries included
+    uint64_t minimised_queries      = 0;  // of those, QNAME-minimised ones (plan §6.1)
+    uint64_t minimisation_fallbacks = 0;  // a server mishandled one, so its zone got the full name
 };
 
 using ResolveCallback = std::function<void(std::expected<ResolveResult, ResolveError>)>;
@@ -141,6 +148,8 @@ public:
     /// Call `alert` for every suspected spoofing attempt. It runs on the
     /// loop's thread and must not destroy the resolver.
     void on_spoof_alert(SpoofAlertFn alert);
+
+    [[nodiscard]] const ResolverStats& stats() const;
 
 private:
     struct Impl;

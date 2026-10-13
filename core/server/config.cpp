@@ -139,6 +139,23 @@ void read_listen_address(Section& section, const std::string& key, std::string& 
     port    = static_cast<uint16_t>(*number);
 }
 
+/// An encrypted listener: { addr: "0.0.0.0:853", cert: ..., key: ... }, all three required.
+std::optional<TlsListenConfig> read_tls_listener(Section& listen, const std::string& key) {
+    auto node = listen.take(key);
+    if (!node || node->IsNull()) return std::nullopt;
+    Section         section(node, listen.name(key));
+    TlsListenConfig out;
+    out.tcp.address.clear();
+    read_listen_address(section, "addr", out.tcp.address, out.tcp.port);
+    section.read_string("cert", out.cert);
+    section.read_string("key", out.key);
+    section.finish();
+    if (out.tcp.address.empty() || out.cert.empty() || out.key.empty()) {
+        fail(*node, listen.name(key) + " needs addr, cert and key");
+    }
+    return out;
+}
+
 /// stub_zones: { "lab.": ["10.10.0.2", ...], ... }
 void read_stub_zones(Section& section, std::vector<resolver::StubZone>& out) {
     auto node = section.take("stub_zones");
@@ -323,9 +340,8 @@ Config parse(const YAML::Node& document) {
     c.tcp.address = c.udp.address;  // unless listen.tcp says otherwise
     c.tcp.port    = c.udp.port;
     read_listen_address(listen, "tcp", c.tcp.address, c.tcp.port);
-    for (const char* key : {"dot", "doh"}) {
-        if (listen.take(key)) c.not_implemented.push_back(listen.name(key));
-    }
+    c.dot = read_tls_listener(listen, "dot");
+    if (listen.take("doh")) c.not_implemented.push_back(listen.name("doh"));
     listen.finish();
 
     Section                   res(top.take("resolver"), "resolver");
@@ -365,7 +381,6 @@ Config parse(const YAML::Node& document) {
                           ") is above resolver.max_query_timeout_ms (" + std::to_string(r.max_query_timeout_ms) + ")"};
     }
     c.udp.max_response_size = r.edns_buffer;  // one EDNS buffer size, upstream and to clients
-    if (r.qname_minimisation) c.not_implemented.push_back("resolver.qname_minimisation");
 
     Section             cache(top.take("cache"), "cache");
     cache::CacheConfig& k  = c.cache;

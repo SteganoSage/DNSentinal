@@ -33,7 +33,14 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->cache.max_memory_bytes, size_t{256} << 20);
     EXPECT_EQ(c->cache.num_shards, 16u);
     EXPECT_FALSE(lists(*c, "listen.tcp"));
-    for (const char* feature : {"listen.dot", "listen.doh", "resolver.qname_minimisation", "cache.serve_stale",
+    EXPECT_FALSE(lists(*c, "resolver.qname_minimisation"));
+    EXPECT_FALSE(lists(*c, "listen.dot"));
+    ASSERT_TRUE(c->dot.has_value());
+    EXPECT_EQ(c->dot->tcp.address, "0.0.0.0");
+    EXPECT_EQ(c->dot->tcp.port, 853);
+    EXPECT_EQ(c->dot->cert, "certs/server.crt");
+    EXPECT_EQ(c->dot->key, "certs/server.key");
+    for (const char* feature : {"listen.doh", "cache.serve_stale",
                                 "telemetry"}) {
         EXPECT_TRUE(lists(*c, feature)) << feature;
     }
@@ -237,6 +244,25 @@ TEST(Config, TcpListensWhereUdpDoesUnlessToldOtherwise) {
     EXPECT_EQ(apart->udp.port, 5353);
 }
 
+TEST(Config, DotIsOffUnlessConfigured) {
+    auto off = parse_config("listen:\n  udp: \"127.0.0.1:5353\"\n");
+    ASSERT_TRUE(off.has_value()) << off.error();
+    EXPECT_FALSE(off->dot.has_value());
+
+    auto on = parse_config(
+        "listen:\n"
+        "  dot:\n"
+        "    addr: \"127.0.0.1:8853\"\n"
+        "    cert: /tmp/lab.crt\n"
+        "    key: /tmp/lab.key\n");
+    ASSERT_TRUE(on.has_value()) << on.error();
+    ASSERT_TRUE(on->dot.has_value());
+    EXPECT_EQ(on->dot->tcp.address, "127.0.0.1");
+    EXPECT_EQ(on->dot->tcp.port, 8853);
+    EXPECT_EQ(on->dot->cert, "/tmp/lab.crt");
+    EXPECT_EQ(on->dot->key, "/tmp/lab.key");
+}
+
 TEST(Config, ParsesIpv6ListenAddress) {
     auto c = parse_config("listen:\n  udp: \"[::1]:5353\"\n");
     ASSERT_TRUE(c.has_value()) << c.error();
@@ -268,6 +294,9 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"listen:\n  udp: \"300.0.0.1:53\"\n", "invalid IP address '300.0.0.1'"},
         {"listen:\n  udp: \"127.0.0.1:0\"\n", "port must be between 1 and 65535"},
         {"listen:\n  tcp: \"localhost:53\"\n", "listen.tcp: invalid IP address 'localhost'"},
+        {"listen:\n  dot:\n    addr: \"127.0.0.1:853\"\n    cert: a.crt\n", "line 3: listen.dot needs addr, cert and key"},
+        {"listen:\n  dot:\n    addr: \"127.0.0.1\"\n", "listen.dot.addr must be \"address:port\""},
+        {"listen:\n  dot:\n    port: 853\n", "unknown setting 'listen.dot.port'"},
         {"resolver: { edns_buffer: 1232\n", "invalid YAML"},
         {"resolver:\n  stub_zones:\n    lab.: [\"fd00::2\"]\n", "line 3: resolver.stub_zones: IPv6 server fd00::2"},
         {"resolver:\n  stub_zones:\n    lab.: [\"lab-root\"]\n", "invalid server address 'lab-root'"},

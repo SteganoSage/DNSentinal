@@ -1232,11 +1232,12 @@ cmake --build build -j
 ```bash
 # Port 53 needs privileges; grant the capability instead of running as root
 sudo setcap 'cap_net_bind_service=+ep' build/dnsentinel
+certs/make_certs.sh                       # lab CA + server certificate for DoT/DoH (git-ignored)
 ./build/dnsentinel --config config/dnsentinel.yaml
 
 # Test
 dig @127.0.0.1 example.com A
-kdig @127.0.0.1 +tls example.com          # DoT
+dig @127.0.0.1 +tls +tls-ca=certs/ca.crt +tls-hostname=localhost example.com   # DoT
 kdig @127.0.0.1 +https example.com        # DoH
 ```
 

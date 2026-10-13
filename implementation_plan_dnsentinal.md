@@ -827,6 +827,13 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 - **Empty non-terminals:** A name like `example.in` might exist only as a delegation point, not as a name with records. Some broken servers return NXDOMAIN for such intermediate queries. If we get NXDOMAIN for a minimised query, try the next longer name. If that also fails, fall back to the full name for this zone.
 - **Extra round trips:** Minimisation adds one query per delegation step on a cold cache. But once zone cuts are cached (the normal case), the cost disappears because we already know where to go. We measure this cost in experiment E6.
 
+**As built (`resolver/recursive_resolver.cpp`; there is no separate `qname_minimisation.cpp`, it is part of the resolver's state machine):**
+- Minimised queries are `<zone cut + one label> NS?`. A referral, or the NS set in an authoritative answer (one server serving both sides of the cut), means a zone cut: descend. NODATA, or a CNAME, means none: the next query reveals more of the name. Only the zone that holds the name gets the full question, so when every step is a real zone cut there is no extra round trip at all.
+- NODATA for an intermediate name is cached as a negative `NS` entry, so later names under it skip that step.
+- **Fallback, simplified from the edge case above:** NXDOMAIN or an error rcode for a minimised query sends that zone the full name at once (starting with the same server), rather than first trying the next longer name. It costs at most one extra query per broken zone, and the full answer settles it. Each one is counted (`ResolverStats::minimisation_fallbacks`, for E6), as are minimised queries.
+- RFC 9156 §2.3 limits: the first 4 minimised steps reveal one label each, then labels come in larger steps, at most 10 minimised queries per name (long names such as under `ip6.arpa`).
+- The Kaminsky lab turns minimisation off: the E5 ladder measures ID, port and 0x20 entropy, so the raced question stays the full name.
+
 ### 6.2 Module: DoT Listener (`net/dot_listener.cpp`)
 
 **What it is:** DNS-over-TLS on port 853 (RFC 7858). Wraps the TCP DNS framing inside a TLS connection.
@@ -844,6 +851,12 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 - Android's "Private DNS" setting is how we demo DoT with a real phone, **but it takes a hostname, not an IP, and only accepts a publicly trusted certificate**. It checks against the system CA store, and user-installed CAs are ignored. A self-signed or mkcert certificate will not work.
   - **Plan:** buy one cheap domain, point a hostname (e.g. `dns.<domain>`) at the resolver's LAN IP, and get a Let's Encrypt certificate with the **DNS-01 challenge**, which works even though the resolver is not reachable from the internet.
   - The same domain can also host the optional real-internet tunnel endpoint (§6.7).
+
+**As built (`net/tls.cpp`, `net/tcp_listener.cpp`; no separate `dot_listener.cpp`):**
+- DoT is the TCP listener with TLS underneath, so DoT connections get exactly the TCP limits: 200 connections, 10 per client IP, the idle timeout (which also ends a handshake that never completes), and back-pressure (at most 32 queries in flight per connection). The listener delegates message framing to a small internal interface (`net/framing.h`), so DoH (§6.3) reuses the same socket, TLS, limits and timeouts with HTTP framing.
+- TLS 1.2 or newer, ALPN `dot` agreed when offered, no renegotiation; a client that disconnects without `close_notify` is just gone. Plain DNS on the DoT port is a failed handshake: the connection closes, counted in `tls_failed`.
+- Configuration: `listen.dot: { addr, cert, key }`, all three required; the certificate is loaded at startup and a bad one stops the daemon with a message naming the file (an encrypted key is refused rather than prompting for a password). TLS writes can raise SIGPIPE, which the daemon ignores.
+- `certs/make_certs.sh` makes the lab certificates: a local CA (made once, kept) and a server certificate it signs for localhost, 127.0.0.1, ::1 and any names or addresses given. The repo config points DoT at `certs/server.crt`, so run it before using that config.
 
 ### 6.3 Module: DoH Listener (`net/doh_listener.cpp`)
 

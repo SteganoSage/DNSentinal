@@ -3,11 +3,13 @@
 #include "dnsentinel/wire/builder.h"
 #include "dnsentinel/wire/parser.h"
 #include "../wire/wire_test_util.h"
+#include "tls_test_util.h"
 
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -310,4 +312,114 @@ TEST_F(TcpListenerTest, RejectsInvalidAddress) {
     auto l = TcpListener::create(*loop, {.address = "not-an-ip", .port = 0}, answering_handler());
     ASSERT_FALSE(l.has_value());
     EXPECT_EQ(l.error(), std::errc::invalid_argument);
+}
+
+// ─── DNS over TLS (plan §6.2) ───────────────────────────────────────────────
+
+namespace {
+
+class DotListenerTest : public TcpListenerTest {
+protected:
+    void SetUp() override { signal(SIGPIPE, SIG_IGN); }  // as TcpListener::create asks of TLS users
+
+    std::unique_ptr<TcpListener> listen_dot(QueryHandler handler, TcpListenerConfig config = {}) {
+        auto tls = TlsContext::create_server(cert.cert, cert.key, {"dot"});
+        EXPECT_TRUE(tls.has_value()) << (tls ? "" : tls.error());
+        if (!tls) return nullptr;
+        config.address = "127.0.0.1";
+        config.port    = 0;
+        auto l         = TcpListener::create(*loop, config, std::move(handler), {.tls = *tls});
+        EXPECT_TRUE(l.has_value()) << (l ? "" : l.error().message());
+        return l ? std::move(*l) : nullptr;
+    }
+
+    test::TestCert cert;
+};
+
+std::vector<uint8_t> framed_queries(std::initializer_list<uint16_t> ids) {
+    std::vector<uint8_t> out;
+    for (uint16_t id : ids) {
+        auto framed = wire::build_tcp(query(id));
+        out.insert(out.end(), framed.begin(), framed.end());
+    }
+    return out;
+}
+
+std::function<bool(const std::vector<uint8_t>&)> until_replies(size_t n) {
+    return [n](const std::vector<uint8_t>& got) { return test::framed_messages(got).size() >= n; };
+}
+
+}  // namespace
+
+TEST_F(DotListenerTest, AnswersOverTls) {
+    auto listener = listen_dot(answering_handler());
+    ASSERT_TRUE(listener);
+    test::TlsClient client(*loop, listener->port(), cert.cert, framed_queries({0x1111}), until_replies(1), "dot");
+    ASSERT_TRUE(run(5s));
+    client.join();
+
+    EXPECT_TRUE(client.result.handshake);
+    EXPECT_EQ(client.result.alpn, "dot");
+    auto replies = test::framed_messages(client.result.received);
+    ASSERT_EQ(replies.size(), 1u);
+    EXPECT_EQ(replies[0].header.id, 0x1111);
+    ASSERT_EQ(clients.size(), 1u);
+    EXPECT_EQ(clients[0].transport, Transport::Dot);
+}
+
+TEST_F(DotListenerTest, LargeAnswersAndPipelinedQueries) {
+    answer_records = 300;  // ~5 KB each: several TLS records
+    auto listener  = listen_dot(answering_handler());
+    ASSERT_TRUE(listener);
+    test::TlsClient client(*loop, listener->port(), cert.cert, framed_queries({1, 2, 3}), until_replies(3));
+    ASSERT_TRUE(run(5s));
+    client.join();
+    auto replies = test::framed_messages(client.result.received);
+    ASSERT_EQ(replies.size(), 3u);
+    for (const auto& r : replies) EXPECT_EQ(r.answers.size(), 300u);
+}
+
+TEST_F(DotListenerTest, MoreQueriesThanMayBeInFlightAllGetAnswers) {
+    // 40 queries in one TLS write; at most 32 are handed over at once, and
+    // the rest must follow as answers go out.
+    size_t most_in_flight = 0, in_flight = 0;
+    auto listener = listen_dot([&](Message q, const ClientInfo&, Responder respond) {
+        most_in_flight = std::max(most_in_flight, ++in_flight);
+        loop->add_timer(10ms, [&, q, respond] {
+            --in_flight;
+            respond(wire::make_response(q));
+        });
+    });
+    ASSERT_TRUE(listener);
+    std::vector<uint8_t> forty;
+    for (uint16_t id = 0; id < 40; ++id) {
+        auto framed = wire::build_tcp(query(id));
+        forty.insert(forty.end(), framed.begin(), framed.end());
+    }
+    test::TlsClient client(*loop, listener->port(), cert.cert, forty, until_replies(40));
+    ASSERT_TRUE(run(5s));
+    client.join();
+    EXPECT_EQ(test::framed_messages(client.result.received).size(), 40u);
+    EXPECT_LE(most_in_flight, 32u);
+}
+
+TEST_F(DotListenerTest, PlainDnsOnTheTlsPortGetsNoAnswer) {
+    auto listener = listen_dot(answering_handler());
+    ASSERT_TRUE(listener);
+    TcpClient client(*loop, listener->port());
+    client.send_query(1);  // unencrypted: not a TLS handshake
+    ASSERT_TRUE(run());
+    EXPECT_TRUE(client.closed);
+    EXPECT_TRUE(client.replies.empty());
+    EXPECT_TRUE(clients.empty());
+    EXPECT_EQ(listener->stats().tls_failed, 1u);
+}
+
+TEST_F(DotListenerTest, HandshakeThatNeverHappensTimesOut) {
+    auto listener = listen_dot(answering_handler(), {.idle_timeout_ms = 50});
+    ASSERT_TRUE(listener);
+    TcpClient client(*loop, listener->port());  // connects, then says nothing
+    ASSERT_TRUE(run());
+    EXPECT_TRUE(client.closed);
+    EXPECT_EQ(listener->stats().idle_closed, 1u);
 }

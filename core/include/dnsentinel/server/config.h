@@ -15,15 +15,24 @@
 #include "dnsentinel/resolver/recursive_resolver.h"
 
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace dnsentinel::server {
 
+/// An encrypted listener (listen.dot, listen.doh).
+struct TlsListenConfig {
+    net::TcpListenerConfig tcp;   // address and port; limits as for plain TCP
+    std::string            cert;  // PEM certificate (chain)
+    std::string            key;   // its PEM private key, unencrypted
+};
+
 struct Config {
-    net::UdpListenerConfig   udp;
-    net::TcpListenerConfig   tcp;  // listen.tcp, else wherever UDP listens
+    net::UdpListenerConfig         udp;
+    net::TcpListenerConfig         tcp;  // listen.tcp, else wherever UDP listens
+    std::optional<TlsListenConfig> dot;  // listen.dot: DNS over TLS (plan §6.2); none: off
     resolver::ResolverConfig resolver;
     cache::CacheConfig       cache;
     policy::AccessConfig     access;  // default: localhost only
