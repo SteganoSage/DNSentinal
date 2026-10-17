@@ -1,5 +1,6 @@
 # ─── Build outputs ────────────────────────────────────────────────────────────
 build/
+build-weak/
 cmake-build-*/
 compile_commands.json
 
