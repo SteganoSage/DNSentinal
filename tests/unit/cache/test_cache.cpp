@@ -216,3 +216,63 @@ TEST(CacheConcurrency, ParallelInsertAndLookup) {
     EXPECT_EQ(cache.hits() + cache.misses(), lookups.load());
     EXPECT_LE(cache.memory_used(), 64u * 1024);
 }
+
+// ─── Serve-stale and prefetch (plan §7.1, §7.2) ─────────────────────────────
+
+TEST_F(CacheTest, ExpiredEntryIsServedOnlyWhenStaleIsAllowed) {
+    Cache cache = make_cache();
+    cache.insert(key("example.com"), a_records("example.com"), TrustRank::Answer, 60);
+    now += 61s;
+    EXPECT_FALSE(cache.lookup(key("example.com")).entry.has_value());  // a miss for normal use
+
+    auto stale = cache.lookup(key("example.com"), /*allow_stale=*/true);
+    ASSERT_TRUE(stale.entry.has_value());
+    EXPECT_TRUE(stale.is_stale);
+    EXPECT_EQ(stale.entry->records.at(0).ttl, 30u);  // RFC 8767's stale TTL
+    EXPECT_EQ(first_addr(stale), 1u);
+    EXPECT_EQ(cache.stale_hits(), 1u);
+    EXPECT_EQ(cache.hits(), 0u);
+
+    // Fresh data still comes back as fresh, allow_stale or not.
+    cache.insert(key("fresh.com"), a_records("fresh.com"), TrustRank::Answer, 60);
+    auto fresh = cache.lookup(key("fresh.com"), true);
+    ASSERT_TRUE(fresh.entry.has_value());
+    EXPECT_FALSE(fresh.is_stale);
+}
+
+TEST_F(CacheTest, StaleEntriesAreForgottenAfterMaxStaleAge) {
+    Cache cache = make_cache({.max_stale_age = 3600});
+    cache.insert(key("example.com"), a_records("example.com"), TrustRank::Answer, 60);
+    now += 60s + 3599s;
+    EXPECT_TRUE(cache.lookup(key("example.com"), true).entry.has_value());
+    now += 1s;
+    EXPECT_FALSE(cache.lookup(key("example.com"), true).entry.has_value());
+    EXPECT_EQ(cache.size(), 0u);  // gone for good, not just hidden
+}
+
+TEST_F(CacheTest, WithoutServeStaleExpiredEntriesAreDropped) {
+    Cache cache = make_cache({.serve_stale = false});
+    cache.insert(key("example.com"), a_records("example.com"), TrustRank::Answer, 60);
+    now += 61s;
+    EXPECT_FALSE(cache.lookup(key("example.com"), true).entry.has_value());
+    EXPECT_EQ(cache.size(), 0u);
+}
+
+TEST_F(CacheTest, PopularEntriesNearExpiryAskForAPrefetch) {
+    Cache cache = make_cache();  // prefetch in the last 10% of the TTL
+    cache.insert(key("popular.com"), a_records("popular.com"), TrustRank::Answer, 100);
+    cache.insert(key("rare.com"), a_records("rare.com"), TrustRank::Answer, 100);
+
+    EXPECT_FALSE(cache.lookup(key("popular.com")).needs_prefetch);  // 100 s left, first ask
+    now += 85s;
+    EXPECT_FALSE(cache.lookup(key("popular.com")).needs_prefetch);  // asked twice, but 15% left
+    now += 6s;
+    EXPECT_TRUE(cache.lookup(key("popular.com")).needs_prefetch);   // 9% left, popular
+    EXPECT_FALSE(cache.lookup(key("rare.com")).needs_prefetch);     // 9% left, but asked only once
+
+    Cache off = make_cache({.prefetch = false});
+    off.insert(key("popular.com"), a_records("popular.com"), TrustRank::Answer, 100);
+    (void)off.lookup(key("popular.com"));
+    now += 95s;  // popular and 5% left, but prefetch is off
+    EXPECT_FALSE(off.lookup(key("popular.com")).needs_prefetch);
+}

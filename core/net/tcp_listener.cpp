@@ -196,7 +196,7 @@ TcpListener::TcpListener(EventLoop& loop, int fd, uint16_t port, const TcpListen
       config_(config),
       handler_(std::move(handler)),
       options_(std::move(options)),
-      transport_(options_.tls ? Transport::Dot : Transport::Tcp),
+      transport_(options_.doh_path ? Transport::Doh : options_.tls ? Transport::Dot : Transport::Tcp),
       read_buffer_(kReadChunk) {}
 
 TcpListener::~TcpListener() {
@@ -251,12 +251,14 @@ void TcpListener::on_acceptable() {
         c->peer   = peer;
         c->client = std::move(client);
         if (options_.tls) c->tls = std::make_unique<TlsSession>(*options_.tls, fd);
-        Connection* raw = c.get();  // the framing lives inside the connection
-        c->framing      = detail::make_dns_framing({
+        Connection*         raw = c.get();  // the framing lives inside the connection
+        detail::FramingHost host{
             .send  = [raw](std::vector<uint8_t> bytes) { raw->out.insert(raw->out.end(), bytes.begin(), bytes.end()); },
             .query = [this, raw](Message query, uint64_t tag) { dispatch(*raw, std::move(query), tag); },
             .stats = &stats_,
-        });
+        };
+        c->framing = options_.doh_path ? detail::make_http_framing(std::move(host), *options_.doh_path)
+                                       : detail::make_dns_framing(std::move(host));
 
         const uint64_t id = c->id;
         if (loop_.add_fd(fd, kReadable, [this, id](uint32_t events) { on_event(id, events); })) {

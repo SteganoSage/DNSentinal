@@ -139,8 +139,9 @@ void read_listen_address(Section& section, const std::string& key, std::string& 
     port    = static_cast<uint16_t>(*number);
 }
 
-/// An encrypted listener: { addr: "0.0.0.0:853", cert: ..., key: ... }, all three required.
-std::optional<TlsListenConfig> read_tls_listener(Section& listen, const std::string& key) {
+/// An encrypted listener: { addr: "0.0.0.0:853", cert: ..., key: ... }, all three
+/// required; DoH also takes `path` (default /dns-query).
+std::optional<TlsListenConfig> read_tls_listener(Section& listen, const std::string& key, bool http) {
     auto node = listen.take(key);
     if (!node || node->IsNull()) return std::nullopt;
     Section         section(node, listen.name(key));
@@ -149,6 +150,15 @@ std::optional<TlsListenConfig> read_tls_listener(Section& listen, const std::str
     read_listen_address(section, "addr", out.tcp.address, out.tcp.port);
     section.read_string("cert", out.cert);
     section.read_string("key", out.key);
+    if (http) {
+        if (auto path = section.take("path")) {
+            const std::string text = scalar_or_empty(*path);
+            if (!text.starts_with('/') || text.find_first_of("?# \t") != std::string::npos) {
+                fail(*path, section.name("path") + " must be a URL path such as /dns-query");
+            }
+            out.path = text;
+        }
+    }
     section.finish();
     if (out.tcp.address.empty() || out.cert.empty() || out.key.empty()) {
         fail(*node, listen.name(key) + " needs addr, cert and key");
@@ -340,8 +350,8 @@ Config parse(const YAML::Node& document) {
     c.tcp.address = c.udp.address;  // unless listen.tcp says otherwise
     c.tcp.port    = c.udp.port;
     read_listen_address(listen, "tcp", c.tcp.address, c.tcp.port);
-    c.dot = read_tls_listener(listen, "dot");
-    if (listen.take("doh")) c.not_implemented.push_back(listen.name("doh"));
+    c.dot = read_tls_listener(listen, "dot", false);
+    c.doh = read_tls_listener(listen, "doh", true);
     listen.finish();
 
     Section                   res(top.take("resolver"), "resolver");
@@ -394,6 +404,7 @@ Config parse(const YAML::Node& document) {
     stale.read_bool("enabled", k.serve_stale);
     stale.read_uint("stale_ttl", k.stale_ttl);
     stale.read_uint("max_stale_age", k.max_stale_age);
+    stale.read_uint("answer_after_ms", k.stale_answer_after_ms, 0, 60000);
     stale.finish();
     Section prefetch(cache.take("prefetch"), "cache.prefetch");
     prefetch.read_bool("enabled", k.prefetch);
@@ -404,8 +415,6 @@ Config parse(const YAML::Node& document) {
         throw ConfigError{"cache.min_ttl (" + std::to_string(k.min_ttl) + ") is above cache.max_ttl (" +
                           std::to_string(k.max_ttl) + ")"};
     }
-    if (k.serve_stale) c.not_implemented.push_back("cache.serve_stale");
-    if (k.prefetch) c.not_implemented.push_back("cache.prefetch");
 
     read_access(top, c.access);
     read_rate_limit(top, c);

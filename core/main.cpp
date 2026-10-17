@@ -1,6 +1,6 @@
 /// @file main.cpp
 /// The dnsentinel daemon: load the config, root hints, certificates and
-/// block lists, start the resolver and the UDP, TCP and DoT listeners, and
+/// block lists, start the resolver and the UDP, TCP, DoT and DoH listeners, and
 /// run the event loop until SIGINT or SIGTERM. SIGHUP reloads the block lists.
 
 #include "dnsentinel/cache/cache.h"
@@ -195,6 +195,16 @@ int main(int argc, char** argv) {
         }
         dot_tls = std::move(*tls);
     }
+    std::shared_ptr<net::TlsContext> doh_tls;
+    if (config->doh) {
+        auto tls = net::TlsContext::create_server(config->doh->cert, config->doh->key, {"http/1.1"});
+        if (!tls) {
+            log("listen.doh: " + tls.error());
+            log("for a lab certificate run certs/make_certs.sh, and trust certs/ca.crt in the browser (plan §6.3)");
+            return 1;
+        }
+        doh_tls = std::move(*tls);
+    }
     {
         std::vector<std::string> allowed;
         for (const auto& subnet : config->access.allow) allowed.push_back(subnet.to_string());
@@ -218,6 +228,12 @@ int main(int argc, char** argv) {
     }
 #endif
     log(describe_limits(*config));
+    if (config->cache.serve_stale) {
+        const auto& k = config->cache;
+        log("serve-stale on: expired answers are kept " + std::to_string(k.max_stale_age / 3600) +
+            " h and served (TTL " + std::to_string(k.stale_ttl) + " s) when resolving fails" +
+            (k.stale_answer_after_ms > 0 ? " or takes over " + std::to_string(k.stale_answer_after_ms) + " ms" : ""));
+    }
     if (config->rebinding.enabled) {
         std::vector<std::string> exempt;
         for (const auto& zone : config->rebinding.exempt) exempt.push_back(zone.to_string());
@@ -296,6 +312,18 @@ int main(int argc, char** argv) {
         dot = std::move(*listener);
         listening.push_back("dot " + at);
     }
+    std::unique_ptr<net::TcpListener> doh;
+    if (config->doh) {
+        const std::string at       = endpoint(config->doh->tcp.address, config->doh->tcp.port);
+        auto              listener = net::TcpListener::create(**loop, config->doh->tcp, handler,
+                                                              {.tls = doh_tls, .doh_path = config->doh->path});
+        if (!listener) {
+            cannot_listen("doh", at, config->doh->tcp.port, listener.error(), argv[0]);
+            return 1;
+        }
+        doh = std::move(*listener);
+        listening.push_back("doh https://" + at + config->doh->path);
+    }
 
     // ─── Reloading the lists: on SIGHUP, and when a list file changes ───────
     // The files are read on a worker thread; the loop checks for the new
@@ -373,6 +401,9 @@ int main(int argc, char** argv) {
     if (const LimitCounts total = LimitCounts::of(processor.checks()); total != LimitCounts{}) {
         log("rate limiting since startup: " + total.describe());
     }
+    log("cache since startup: " + std::to_string(cache.hits()) + " hits, " + std::to_string(cache.misses()) +
+        " misses, " + std::to_string(resolver.stats().stale_answers) + " stale answers, " +
+        std::to_string(resolver.stats().prefetches) + " prefetches");
     log("shutting down");
     action.sa_handler = SIG_DFL;  // a second Ctrl-C now just exits
     sigaction(SIGINT, &action, nullptr);

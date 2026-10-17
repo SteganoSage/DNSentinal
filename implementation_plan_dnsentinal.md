@@ -874,6 +874,13 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 
 **For Phase 5, start with HTTP/1.1 over TLS.** Upgrade to HTTP/2 with nghttp2 if time permits.
 
+**As built, HTTP/1.1 (`net/doh.cpp`; no separate `doh_listener.cpp`):**
+- DoH is the TCP listener (§6.2) with HTTP framing instead of DNS's length prefix, so it shares TLS, the connection limits, the idle timeout and back-pressure. Without a TLS context it serves plain HTTP (behind a reverse proxy, and for tests).
+- `GET <path>?dns=<base64url>` (padding tolerated) and `POST <path>` with `Content-Type: application/dns-message`; `listen.doh.path` defaults to `/dns-query`. Responses carry `Cache-Control: max-age` from the shortest answer TTL, or the SOA's negative TTL for NXDOMAIN/NODATA, and 0 for failures (RFC 8484 §5.1).
+- Keep-alive and pipelining: responses go back in request order (HTTP/1.1 can't match them up otherwise), so a fast answer waits for a slow one before it. `Connection: close` and HTTP/1.0 close after the response.
+- Errors: 404 (wrong path), 405 (other methods, with `Allow`), 415 (wrong content type), 400 (no or bad `dns` parameter, not a DNS query) keep the connection; 400 (bad request line or header), 505 (other HTTP versions), 501 (chunked bodies), 413 (body over 65 535 bytes) and 431 (headers over 8 KB) close it, since nothing after such a request can be trusted to be framed. Counted in `http_errors`.
+- TLS offers ALPN `http/1.1`; HTTP/2 follows as its own module (curl, browsers and `dig +https` prefer it).
+
 **How to test:** Firefox and Chrome can be configured with a custom DoH URL (`https://your-resolver-ip/dns-query`). This is the demo for DoH. The browser must trust the certificate: either reuse the Let's Encrypt certificate from §6.2, or, for a laptop-only setup, create a local CA with `mkcert` (which can issue certificates for IP addresses) and install it in the browser.
 
 ### 6.4 Module: DGA Classifier — Fast Path (`core/ml/dga_classifier.cpp`)
@@ -1035,6 +1042,11 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 - Stale entries are kept for `max_stale_age` (e.g. 1 day) beyond their original TTL, then truly evicted.
 - When a stale entry is served, launch a **background refresh** — the next query for this name should get fresh data if upstream has recovered.
 
+**As built (`cache/cache.cpp`, `resolver/recursive_resolver.cpp`; no separate `serve_stale.cpp`):**
+- The cache keeps expired entries until `max_stale_age` has passed (then drops them on sight) and hands them out only when asked for stale data, with TTL `stale_ttl` (30 s). Counted in `Cache::stale_hits()`.
+- The resolver answers stale, from the same CNAME/NXDOMAIN/NODATA walk as a cache answer, in three cases (RFC 8767): resolution failed; it is still under way after `cache.serve_stale.answer_after_ms` (1.8 s, the RFC's client-response timer, so a stub's own timeout doesn't fire first; 0 = only on failure), in which case resolution carries on and refreshes the cache; and for 30 s after such a failure, at once and without asking the upstream again (the RFC's failure-recheck timer, instead of hammering a dead server). Each client's callback still runs exactly once. Counted in `ResolverStats::stale_answers`; the daemon prints the totals at exit.
+- "Background refresh" needs no extra machinery: the next query for an expired name starts a resolution anyway (or, during the 30 s recheck window, after it).
+
 ### 7.2 Module: Prefetch
 
 **What it is:** When a popular cache entry is requested and it's near expiry (last 10% of TTL), answer from cache AND start a background refresh.
@@ -1044,6 +1056,7 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 - If `remaining_pct < 10` (configurable threshold) AND the entry has been hit multiple times (it's popular), set `needs_prefetch = true` in the lookup result.
 - The caller triggers a background resolution for this name. The result updates the cache entry with a new TTL.
 - From the user's perspective, popular names never expire — they always get a fast cache answer, and the cache is silently kept fresh.
+- **As built:** the cache flags `needs_prefetch` for an entry asked for at least twice that is in its last `threshold_pct` (10%) of TTL; the resolver, answering a client from the cache, then starts a background resolution that skips the cached answer and leaves the new one in the cache. One per name, at most 32 at once, counted in `ResolverStats::prefetches`. Wasted prefetches aren't counted yet.
 - **Optional O3 (§10)** builds on this background-refresh path: a learned model predicts each device's next names and requests them in advance, within a budget of extra upstream queries. Count prefetches (and later, wasted ones) from the start so the budget has something to measure.
 
 ### 7.3 Module: Query Log (`telemetry/query_log.cpp`)
@@ -1136,6 +1149,8 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 | Optional experiments | E15–E17 | Only for whichever of O1–O3 were built (§10) |
 
 **Targets are frozen in week 6:** hypotheses and success criteria are reviewed and committed before the final runs (EVALUATION.md §9).
+
+**First step taken (simulation):** `sim/ns3/link_profiles.cc` is a pure ns-3 simulation of S1's question: DNS-sized lookups over the §3.4 link profiles, as plain UDP and as DoT/DoH on a new or a reused connection, with a stand-in server (`sim/ns3/run.sh` builds, runs and plots it; `sim/ns3/README.md` has the results). It shows the link effect only; the full S1 with the real resolver in ns-3 emulation mode still needs the lab.
 
 **Hooks the code must provide:**
 - **Weak mode for E5:** a lab-only compile-time option that shrinks the transaction-ID space, fixes the source port, and can switch off 0x20, bailiwick checks and spoof detection (the defence ladder L0–L5). Release builds can never be weakened by configuration.

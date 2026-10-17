@@ -65,6 +65,14 @@ constexpr uint8_t kMaxRetryRounds = 2;
 constexpr uint32_t kMaxMinimiseCount = 10;
 constexpr uint32_t kMinimiseOneLabel = 4;
 
+/// After a name fails and is answered stale, it keeps being answered stale
+/// at once for this long rather than waiting on the same dead upstream again
+/// (RFC 8767 §4's "failure recheck").
+constexpr auto kFailureRecheck = std::chrono::seconds(30);
+
+/// Background refreshes in flight at once (plan §7.2).
+constexpr size_t kMaxPrefetches = 32;
+
 /// The ancestor of `name` (or `name` itself) with `labels` labels.
 Name ancestor(const Name& name, size_t labels) {
     const size_t skip = name.label_count() - labels;
@@ -162,6 +170,17 @@ struct RecursiveResolver::Impl {
         uint32_t queries = 0;
     };
 
+    /// One client's answer, delivered exactly once: the resolution's outcome,
+    /// or stale data from the cache if that comes first (RFC 8767).
+    struct Delivery {
+        uint64_t                id = 0;
+        Question                question;  // as the client asked it
+        Clock::time_point       asked;
+        ResolveCallback         done;
+        net::EventLoop::TimerId stale_timer = 0;
+        bool                    delivered   = false;
+    };
+
     /// A client that asked a question already being resolved (plan §4.4).
     struct Waiter {
         Question          question;  // as this client asked it, case included
@@ -203,7 +222,8 @@ struct RecursiveResolver::Impl {
         net::EventLoop::TimerId start_timer = 0;
         net::EventLoop::TimerId deadline    = 0;  // client queries only
         ResolveCallback         done;
-        bool                    client = false;  // a client's query, not a sub-query
+        bool                    client  = false;  // a client's query, not a sub-query
+        bool                    refresh = false;  // a prefetch: skip the cached answer, the first time
         std::vector<Waiter>     joiners;         // identical client queries that came later
     };
 
@@ -226,6 +246,10 @@ struct RecursiveResolver::Impl {
             if (t->start_timer) loop.cancel_timer(t->start_timer);
             if (t->deadline) loop.cancel_timer(t->deadline);
         }
+        for (auto& [id, d] : deliveries) {
+            if (d->stale_timer) loop.cancel_timer(d->stale_timer);
+        }
+        *alive = false;
     }
 
     ResolverConfig                                     config;
@@ -241,6 +265,13 @@ struct RecursiveResolver::Impl {
     std::unordered_set<in_addr_t>                        no_0x20;    // servers that don't echo letter case
     SpoofAlertFn                                         spoof_alert;
     ResolverStats                                        stats;
+    uint64_t                                                    next_delivery_id = 1;
+    std::unordered_map<uint64_t, std::shared_ptr<Delivery>>     deliveries;  // pending, for their stale timers
+    std::unordered_map<Question, Clock::time_point, QuestionHash> failed_recently;  // answer stale until then
+    std::unordered_set<Question, QuestionHash>                  prefetching;
+    // Cleared when the resolver goes. A client callback may destroy it, and
+    // the joiners called after that must not touch it (see finish()).
+    std::shared_ptr<bool>                                       alive = std::make_shared<bool>(true);
 
     // ─── Task lifecycle ─────────────────────────────────────────────────────
 
@@ -272,6 +303,41 @@ struct RecursiveResolver::Impl {
     }
 
     void resolve_client(const Question& q, ResolveCallback done) {
+        if (cache.config().serve_stale) {
+            auto d      = std::make_shared<Delivery>();
+            d->id       = next_delivery_id++;
+            d->question = q;
+            d->asked    = Clock::now();
+            d->done     = std::move(done);
+            deliveries.emplace(d->id, d);
+            // It failed moments ago: answer stale now instead of making the
+            // client wait for the same failure (on the next loop turn, as always).
+            if (recently_failed(q)) {
+                if (auto stale = stale_answer(q)) {
+                    d->stale_timer = loop.add_timer(milliseconds(0), [this, id = d->id, s = std::move(*stale)] {
+                        if (auto it = deliveries.find(id); it != deliveries.end()) {
+                            const std::shared_ptr<Delivery> keep = it->second;
+                            keep->stale_timer                    = 0;
+                            deliver(*keep, s);
+                        }
+                    });
+                    return;
+                }
+            }
+            if (const uint32_t after = cache.config().stale_answer_after_ms; after > 0) {
+                d->stale_timer = loop.add_timer(milliseconds(after), [this, id = d->id] { on_stale_timer(id); });
+            }
+            done = [this, d, alive = alive](Outcome o) {
+                if (*alive) {
+                    on_outcome(d, std::move(o));
+                } else if (!d->delivered) {  // the resolver is gone: just the outcome, no stale data
+                    d->delivered         = true;
+                    ResolveCallback done = std::move(d->done);
+                    done(std::move(o));
+                }
+            };
+        }
+
         if (auto it = in_flight.find(q); it != in_flight.end()) {
             if (Task* t = find(it->second)) {
                 t->joiners.push_back(Waiter{q, Clock::now(), std::move(done)});
@@ -378,7 +444,10 @@ struct RecursiveResolver::Impl {
 
         // Only authoritative answer data is served from the cache. Glue and
         // referral data (lower trust ranks) find servers; they never answer.
-        while (true) {
+        // A prefetch is here to replace the cached answer, so it skips it.
+        const bool use_cache = !t->refresh;
+        t->refresh           = false;
+        while (use_cache) {
             if (auto nx = cache.lookup({t->qname, kNxdomainType, kClassIN}); nx.entry) {
                 finish(id, outcome(*t, RCode::NXDomain, {}, nx.entry->records));
                 return;
@@ -389,6 +458,7 @@ struct RecursiveResolver::Impl {
                 return;
             }
             if (hit.entry && hit.entry->trust == TrustRank::Answer) {
+                if (hit.needs_prefetch && t->client) prefetch(Question{t->qname, qtype, kClassIN});
                 finish(id, outcome(*t, RCode::NoError, hit.entry->records, {}));
                 return;
             }
@@ -847,6 +917,112 @@ struct RecursiveResolver::Impl {
             return;
         }
         next_server(id);  // a lame server, or a referral leading elsewhere
+    }
+
+    // ─── Serve-stale and prefetch (plan §7.1, §7.2) ─────────────────────────
+
+    /// What the cache still holds for `q`, fresh or expired: NXDOMAIN, NODATA
+    /// or records, after any CNAMEs; nothing if the chain can't be completed.
+    std::optional<ResolveResult> stale_answer(const Question& q) {
+        if (q.qclass != kClassIN) return std::nullopt;
+        ResolveResult r;
+        r.stale                 = true;
+        r.response.header.qr    = true;
+        r.response.questions    = {q};
+        Name name               = q.qname;
+        for (int hops = 0; hops <= config.max_cname_chain; ++hops) {
+            if (auto nx = cache.lookup({name, kNxdomainType, kClassIN}, true); nx.entry) {
+                r.response.header.rcode = static_cast<uint8_t>(RCode::NXDomain);
+                r.response.authority    = nx.entry->records;
+                return r;
+            }
+            auto hit = cache.lookup({name, q.qtype, kClassIN}, true);
+            if (hit.entry && hit.entry->is_negative) {
+                r.response.authority = hit.entry->records;
+                return r;
+            }
+            if (hit.entry && hit.entry->trust == TrustRank::Answer) {
+                r.response.answers.insert(r.response.answers.end(), hit.entry->records.begin(),
+                                          hit.entry->records.end());
+                return r;
+            }
+            if (q.qtype == kTypeCNAME) return std::nullopt;
+            auto cname = cache.lookup({name, kTypeCNAME, kClassIN}, true);
+            if (!cname.entry || cname.entry->is_negative || cname.entry->trust != TrustRank::Answer ||
+                cname.entry->records.empty()) {
+                return std::nullopt;
+            }
+            const auto* alias = std::get_if<RDataCNAME>(&cname.entry->records.front().rdata);
+            if (!alias) return std::nullopt;
+            r.response.answers.push_back(cname.entry->records.front());
+            name = alias->target;
+        }
+        return std::nullopt;
+    }
+
+    bool recently_failed(const Question& q) {
+        auto it = failed_recently.find(q);
+        if (it == failed_recently.end()) return false;
+        if (Clock::now() < it->second) return true;
+        failed_recently.erase(it);
+        return false;
+    }
+
+    /// The resolution is over: its outcome, unless stale data beats a failure.
+    void on_outcome(const std::shared_ptr<Delivery>& d, Outcome o) {
+        if (d->delivered) return;  // answered stale already; the cache has the fresh data now
+        if (!o) {
+            if (auto stale = stale_answer(d->question)) {
+                failed_recently[d->question] = Clock::now() + kFailureRecheck;
+                deliver(*d, std::move(*stale));
+                return;
+            }
+        }
+        deliver(*d, std::move(o));
+    }
+
+    /// Still resolving after stale_answer_after_ms: answer stale if we can,
+    /// and let the resolution carry on to refresh the cache.
+    void on_stale_timer(uint64_t id) {
+        auto it = deliveries.find(id);
+        if (it == deliveries.end()) return;
+        const std::shared_ptr<Delivery> d = it->second;
+        d->stale_timer                    = 0;
+        if (d->delivered) return;
+        if (auto stale = stale_answer(d->question)) deliver(*d, std::move(*stale));
+    }
+
+    void deliver(Delivery& d, Outcome o) {
+        d.delivered = true;
+        if (d.stale_timer) loop.cancel_timer(d.stale_timer);
+        d.stale_timer = 0;
+        if (o && o->stale) {
+            ++stats.stale_answers;
+            o->latency_us = elapsed_us(d.asked, Clock::now());
+        }
+        ResolveCallback done = std::move(d.done);
+        const uint64_t  id   = d.id;
+        deliveries.erase(id);
+        done(std::move(o));  // last: it may start new work or destroy the resolver
+    }
+
+    /// Refresh `q` in the background: a resolution that skips the cached
+    /// answer and leaves its result in the cache. One per question, at most
+    /// kMaxPrefetches at once. (Called by a client query being answered from
+    /// the cache, which is itself still in flight, so in_flight can't veto it.)
+    void prefetch(const Question& q) {
+        if (prefetching.contains(q) || prefetching.size() >= kMaxPrefetches) return;
+        prefetching.insert(q);
+        ++stats.prefetches;
+        const uint64_t id = spawn(q, std::make_shared<Budget>(), {}, [this, q](Outcome) { prefetching.erase(q); });
+        Task& t    = *tasks.at(id);
+        t.refresh  = true;
+        t.deadline = loop.add_timer(milliseconds(config.overall_deadline_ms), [this, id] {
+            if (Task* task = find(id)) {
+                task->deadline = 0;
+                finish(id, std::unexpected(ResolveError::Timeout));
+            }
+        });
     }
 
     void prime(PrimeCallback done) {

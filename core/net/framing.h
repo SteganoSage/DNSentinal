@@ -50,4 +50,8 @@ public:
 /// DNS over TCP and TLS: 2-byte big-endian length, then the message (RFC 7766).
 std::unique_ptr<Framing> make_dns_framing(FramingHost host);
 
+/// DNS over HTTPS (RFC 8484), HTTP/1.1: GET ?dns=<base64url> or POST with
+/// an application/dns-message body, at `path`.
+std::unique_ptr<Framing> make_http_framing(FramingHost host, std::string path);
+
 }  // namespace dnsentinel::net::detail

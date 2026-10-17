@@ -75,6 +75,7 @@ add_library(dnsentinel_core STATIC
     core/net/udp_listener.cpp
     core/net/tcp_listener.cpp
     core/net/tls.cpp
+    core/net/doh.cpp
 
     # Resolver
     core/resolver/recursive_resolver.cpp
@@ -132,7 +133,7 @@ endif()
 
 # ─── DoH listener ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_DOH)
-    # target_sources(dnsentinel_core PRIVATE core/net/doh_listener.cpp)
+    # DoH is the TCP listener with HTTP framing; always built, like DoT.
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_DOH=1)
 endif()
 
@@ -166,6 +167,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/net/test_udp_listener.cpp
         tests/unit/net/test_tcp_listener.cpp
         tests/unit/net/test_tls.cpp
+        tests/unit/net/test_doh.cpp
         tests/unit/cache/test_cache.cpp
         tests/unit/resolver/test_root_hints.cpp
         tests/unit/resolver/test_upstream.cpp

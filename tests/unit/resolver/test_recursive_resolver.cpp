@@ -126,10 +126,20 @@ protected:
 
     /// Built on first use, so tests can adjust `config` first.
     RecursiveResolver& resolver() {
-        if (!resolver_) resolver_ = std::make_unique<RecursiveResolver>(config, hints(), *loop, cache);
+        if (!resolver_) resolver_ = std::make_unique<RecursiveResolver>(config, hints(), *loop, cache());
         return *resolver_;
     }
     void destroy_resolver() { resolver_.reset(); }
+
+    /// Built on first use too, so tests can adjust `cache_config` first. Its
+    /// clock runs `cache_age` ahead of the real one: raising it ages every
+    /// cached entry at once.
+    cache::Cache& cache() {
+        if (!cache_) {
+            cache_ = std::make_unique<cache::Cache>(cache_config, [this] { return cache::Clock::now() + cache_age; });
+        }
+        return *cache_;
+    }
 
     void run_for(std::chrono::milliseconds limit) {
         auto guard = loop->add_timer(limit, [this] { loop->stop(); });
@@ -158,8 +168,9 @@ protected:
     }
 
     std::unique_ptr<net::EventLoop> loop = net::EventLoop::create().value();
-    cache::Cache   cache{cache::CacheConfig{}};
-    ResolverConfig config;
+    cache::CacheConfig   cache_config;
+    std::chrono::seconds cache_age{0};
+    ResolverConfig       config;
     FakeAuth *root = nullptr, *tld = nullptr, *ex1 = nullptr, *ex2 = nullptr, *net = nullptr,
              *dns_host = nullptr, *glueless = nullptr, *victim = nullptr;
 
@@ -167,6 +178,7 @@ private:
     std::string                            base_;
     uint16_t                               port_ = 0;
     std::vector<std::unique_ptr<FakeAuth>> servers_;
+    std::unique_ptr<cache::Cache>          cache_;  // before the resolver, which uses it
     std::unique_ptr<RecursiveResolver>     resolver_;
 };
 
@@ -408,8 +420,8 @@ TEST_F(ResolverTest, OutOfBailiwickRecordsAreNeverCached) {
     auto r = resolve("www.example.test", RRType::A);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
-    EXPECT_FALSE(cache.lookup({name("www.bank.net"), 1, 1}).entry.has_value());
-    EXPECT_FALSE(cache.lookup({name("ns.bank.net"), 1, 1}).entry.has_value());
+    EXPECT_FALSE(cache().lookup({name("www.bank.net"), 1, 1}).entry.has_value());
+    EXPECT_FALSE(cache().lookup({name("ns.bank.net"), 1, 1}).entry.has_value());
 }
 
 #ifdef DNSENTINEL_WEAK_MODE
@@ -457,8 +469,8 @@ TEST_F(ResolverTest, UpwardAndUnrelatedReferralsAreIgnored) {
 
     ex1->tamper = ex2->tamper = refer_to("evil.lab");  // an unrelated zone
     EXPECT_FALSE(resolve("mail.example.test", RRType::A).has_value());
-    EXPECT_FALSE(cache.lookup({name("evil.lab"), 2, 1}).entry.has_value());
-    EXPECT_FALSE(cache.lookup({name("ns.evil.lab"), 1, 1}).entry.has_value());
+    EXPECT_FALSE(cache().lookup({name("evil.lab"), 2, 1}).entry.has_value());
+    EXPECT_FALSE(cache().lookup({name("ns.evil.lab"), 1, 1}).entry.has_value());
 }
 
 TEST_F(ResolverTest, ReferralsMustLeadTowardsTheName) {
@@ -511,7 +523,7 @@ TEST_F(ResolverTest, OutOfBailiwickGlueIsNeverUsed) {
     if (r.has_value()) {
         EXPECT_NE(a_records(r), (std::vector<std::string>{"6.6.6.6"}));
     }
-    EXPECT_FALSE(cache.lookup({name("ns.bank.net"), 1, 1}).entry.has_value());
+    EXPECT_FALSE(cache().lookup({name("ns.bank.net"), 1, 1}).entry.has_value());
 }
 
 TEST_F(ResolverTest, GlueIsNeverServedAsAnAnswer) {
@@ -660,7 +672,7 @@ TEST_F(ResolverTest, MinimisationFindsACutInAnAuthoritativeNsAnswer) {
     auto r = resolve("www.sub.example.test", RRType::A);
     ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
     EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.77"}));
-    auto cut = cache.lookup({name("sub.example.test"), 2, 1});
+    auto cut = cache().lookup({name("sub.example.test"), 2, 1});
     ASSERT_TRUE(cut.entry.has_value());
     EXPECT_EQ(cut.entry->trust, TrustRank::Answer);
 }
@@ -686,6 +698,101 @@ TEST_F(ResolverTest, MinimisationCapsQueriesForLongNames) {
     EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.99"}));
     EXPECT_LE(resolver().stats().minimised_queries, 10u);  // RFC 9156 MAX_MINIMISE_COUNT
     EXPECT_LT(ex1->queries + ex2->queries, 18);            // not one per label
+}
+
+// ─── Serve-stale and prefetch (plan §7.1, §7.2) ─────────────────────────────
+
+TEST_F(ResolverTest, ExpiredAnswerIsServedStaleWhenTheUpstreamFails) {
+    cache_config.stale_answer_after_ms = 0;  // only on failure, here
+    config.query_timeout_ms            = 50;
+    config.overall_deadline_ms         = 500;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());
+    cache_age += 301s;  // the answer's TTL (300 s) is up
+    ex1->tamper = ex2->tamper = drop_everything;
+
+    auto r = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value()) << resolve_error_to_string(r.error());
+    EXPECT_TRUE(r->stale);
+    EXPECT_EQ(a_records(r), (std::vector<std::string>{"192.0.2.1"}));
+    EXPECT_EQ(r->response.answers.at(0).ttl, 30u);  // RFC 8767's stale TTL
+    EXPECT_EQ(resolver().stats().stale_answers, 1u);
+}
+
+TEST_F(ResolverTest, SlowUpstreamGetsAStaleAnswerFirstThenTheCacheIsRefreshed) {
+    cache_config.stale_answer_after_ms = 100;
+    config.query_timeout_ms            = 1000;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());
+    cache_age += 301s;
+    ex1->delay = ex2->delay = 400ms;  // slow, but it does answer
+
+    int                    calls = 0;
+    std::optional<Outcome> out;
+    Clock::duration        took{};
+    const auto             start = Clock::now();
+    resolver().resolve({name("www.example.test"), 1, 1}, [&](Outcome o) {
+        ++calls;
+        took = Clock::now() - start;
+        out  = std::move(o);
+    });
+    run_for(1s);  // long enough for the real answer to arrive as well
+
+    EXPECT_EQ(calls, 1);  // once: the stale answer; the fresh one only refreshes the cache
+    ASSERT_TRUE(out.has_value() && out->has_value());
+    EXPECT_TRUE((*out)->stale);
+    EXPECT_LT(took, 350ms);
+    auto refreshed = cache().lookup({name("www.example.test"), 1, 1});
+    ASSERT_TRUE(refreshed.entry.has_value());
+    EXPECT_FALSE(refreshed.is_stale);
+    EXPECT_GT(refreshed.entry->records.at(0).ttl, 250u);
+}
+
+TEST_F(ResolverTest, AFailedNameIsAnsweredStaleAtOnceForAWhile) {
+    cache_config.stale_answer_after_ms = 0;
+    config.query_timeout_ms            = 50;
+    config.overall_deadline_ms         = 500;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());
+    cache_age += 301s;
+    ex1->tamper = ex2->tamper = drop_everything;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());  // fails, so stale
+
+    const int  before = ex1->queries + ex2->queries;
+    const auto start  = Clock::now();
+    auto       r      = resolve("www.example.test", RRType::A);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->stale);
+    EXPECT_LT(Clock::now() - start, 50ms);             // no waiting on the dead servers again
+    EXPECT_EQ(ex1->queries + ex2->queries, before);  // not asked at all (RFC 8767 failure recheck)
+}
+
+TEST_F(ResolverTest, WithoutServeStaleAFailureIsAFailure) {
+    cache_config.serve_stale   = false;
+    config.query_timeout_ms    = 50;
+    config.overall_deadline_ms = 500;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());
+    cache_age += 301s;
+    ex1->tamper = ex2->tamper = drop_everything;
+    auto r = resolve("www.example.test", RRType::A);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(resolver().stats().stale_answers, 0u);
+}
+
+TEST_F(ResolverTest, PopularNamesAreRefreshedBeforeTheyExpire) {
+    config.explore_one_in = 0;
+    ASSERT_TRUE(resolve("www.example.test", RRType::A).has_value());  // cached for 300 s
+    cache_age += 275s;  // 25 s left: under 10%
+    const int before = ex1->queries + ex2->queries;
+
+    for (int i = 0; i < 3; ++i) {  // the 2nd ask makes it popular; the 3rd mustn't add a 2nd refresh
+        auto r = resolve("www.example.test", RRType::A);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->upstream_queries_used, 0u) << i;  // answered from the cache, at once
+    }
+    run_for(300ms);  // let the background refresh finish
+    EXPECT_EQ(resolver().stats().prefetches, 1u);
+    EXPECT_EQ(ex1->queries + ex2->queries, before + 1);
+    auto refreshed = cache().lookup({name("www.example.test"), 1, 1});
+    ASSERT_TRUE(refreshed.entry.has_value());
+    EXPECT_GT(refreshed.entry->records.at(0).ttl, 250u);  // a fresh 300 s again
 }
 
 // ─── Stub zones ─────────────────────────────────────────────────────────────
@@ -718,9 +825,9 @@ TEST_F(ResolverTest, DelegationsBelowAStubZoneAreFollowed) {
 TEST_F(ResolverTest, StubZoneBeatsACachedDelegationForTheSameZone) {
     FakeAuth* other = add_server(9, "example.test");
     other->add("www.example.test", RRType::A, ipv4("6.6.6.6"));
-    cache.insert({name("example.test"), 2, 1}, {make_rr("example.test", RRType::NS, RDataNS{name("ns.other.lab")})},
+    cache().insert({name("example.test"), 2, 1}, {make_rr("example.test", RRType::NS, RDataNS{name("ns.other.lab")})},
                  TrustRank::Answer, 3600);
-    cache.insert({name("ns.other.lab"), 1, 1}, {make_rr("ns.other.lab", RRType::A, ipv4(ip(9).c_str()))},
+    cache().insert({name("ns.other.lab"), 1, 1}, {make_rr("ns.other.lab", RRType::A, ipv4(ip(9).c_str()))},
                  TrustRank::Answer, 3600);
 
     config.stub_zones = {{name("example.test"), {ipv4(ip(3).c_str()).addr}}};
@@ -964,10 +1071,10 @@ TEST_F(ResolverTest, PrimingCachesTheRootNameServers) {
     ASSERT_TRUE(primed.has_value());
     ASSERT_TRUE(primed->has_value());
 
-    auto ns = cache.lookup({Name{}, 2, 1});
+    auto ns = cache().lookup({Name{}, 2, 1});
     ASSERT_TRUE(ns.entry.has_value());
     EXPECT_EQ(ns.entry->trust, TrustRank::Answer);
-    EXPECT_TRUE(cache.lookup({name("a.root-servers.lab"), 1, 1}).entry.has_value());  // glue
+    EXPECT_TRUE(cache().lookup({name("a.root-servers.lab"), 1, 1}).entry.has_value());  // glue
     EXPECT_TRUE(resolve("www.example.test", RRType::A).has_value());
 }
 

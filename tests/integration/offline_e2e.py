@@ -18,6 +18,8 @@ on stock Ubuntu 24.04). ctest runs it as `offline_e2e` and reports 77 as
 skipped.
 """
 
+import base64
+import http.client
 import os
 import queue
 import selectors
@@ -43,6 +45,7 @@ ROOT_IP, LAB_IP = "127.0.0.2", "127.0.0.3"
 DEAD_IP = "127.0.0.9"  # delegated to, but nothing listens there
 DAEMON = ("127.0.0.1", 5353)
 DOT = ("127.0.0.1", 8853)
+DOH = ("127.0.0.1", 8443)
 
 # The hierarchy. Names are lower-case, without the trailing dot; "" is the root.
 ZONES = {
@@ -55,6 +58,7 @@ ZONES = {
         "origin": "lab",
         "records": {
             ("www.example.lab", A): ["192.0.2.1"],
+            ("short.example.lab", A): ["192.0.2.50"],  # TTL 1 s (SHORT_TTLS): for serve-stale
             ("big.example.lab", A): [f"192.0.2.{i}" for i in range(1, 101)],  # ~1.6 KB: needs TCP
             ("slow.example.lab", A): ["192.0.2.7"],  # answered late: see SLOW_NAMES
             ("spoofed.example.lab", A): ["192.0.2.8"],  # raced by forged replies: see SPOOFED_NAMES
@@ -77,6 +81,10 @@ SLOW_NAMES, SLOW_DELAY = {"slow.example.lab"}, 0.05
 SPOOFED_NAMES, FORGED_REPLIES = {"spoofed.example.lab"}, 5
 
 # ─── Wire format ─────────────────────────────────────────────────────────────
+
+
+# Records served with a TTL other than the usual 300 s.
+SHORT_TTLS = {"short.example.lab": 1}
 
 
 def encode_name(name):
@@ -128,10 +136,11 @@ class Response:
             self.questions.append(name)
             off += 4
         self.answers, self.authority = [], []  # (lower-case name, type, address / target name)
+        self.answer_ttls = []
         for section, count in ((self.answers, ancount), (self.authority, nscount)):
             for _ in range(count):
                 name, off = read_name(buf, off)
-                rtype, _, _, rdlength = struct.unpack(">HHIH", buf[off : off + 10])
+                rtype, _, ttl, rdlength = struct.unpack(">HHIH", buf[off : off + 10])
                 off += 10
                 if rtype == A:
                     data = socket.inet_ntoa(buf[off : off + rdlength])
@@ -142,6 +151,8 @@ class Response:
                 else:
                     data = None
                 section.append((name.lower(), rtype, data))
+                if section is self.answers:
+                    self.answer_ttls.append(ttl)
                 off += rdlength
 
     def types(self, section):
@@ -194,6 +205,30 @@ def ask_dot(qname, cafile):
         response.alpn = sock.selected_alpn_protocol()
     response.id_matches = response.id == qid
     return response
+
+
+def ask_doh(qname, cafile, method="POST", path="/dns-query"):
+    """One DNS over HTTPS request, trusting only `cafile`:
+    (HTTP status, content type, Response or None, ALPN protocol agreed)."""
+    qid, query = make_query(qname)
+    context = ssl.create_default_context(cafile=cafile)
+    context.set_alpn_protocols(["http/1.1"])
+    conn = http.client.HTTPSConnection(DOH[0], DOH[1], context=context, timeout=5)
+    try:
+        if method == "POST":
+            conn.request("POST", path, body=query, headers={"Content-Type": "application/dns-message"})
+        else:
+            encoded = base64.urlsafe_b64encode(query).rstrip(b"=").decode()
+            conn.request("GET", f"{path}?dns={encoded}")
+        reply = conn.getresponse()
+        payload = reply.read()
+        alpn = conn.sock.selected_alpn_protocol()
+        response = Response(payload) if reply.status == 200 else None
+        if response:
+            response.id_matches = response.id == qid
+        return reply.status, reply.getheader("Content-Type"), response, alpn
+    finally:
+        conn.close()
 
 
 def make_cert(tmp):
@@ -261,7 +296,7 @@ def authoritative_answer(zone, qname, qtype):
     for _ in range(8):
         if (name, qtype) in records:
             values = records[(name, qtype)]
-            answer += [encode_rr(name, qtype, rdata_for(qtype, v)) for v in values]
+            answer += [encode_rr(name, qtype, rdata_for(qtype, v), SHORT_TTLS.get(name, 300)) for v in values]
             glue = [encode_rr(v, A, rdata_for(A, ip)) for v in values if qtype == NS for ip in records.get((v, A), [])]
             return NOERROR, True, answer, [], glue
         if name not in cnames or qtype == CNAME:
@@ -280,6 +315,7 @@ class FakeServers:
     def __init__(self):
         self.seen = []      # (server address, lower-case qname, qtype)
         self.seen_tcp = []  # the ones that came over TCP
+        self.silent = False  # an outage: queries arrive, nothing answers
         self.selector = selectors.DefaultSelector()
         for ip in ZONES:
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -299,6 +335,12 @@ class FakeServers:
             for key, _ in self.selector.select():
                 server, transport = key.data
                 try:
+                    if self.silent:  # take whatever arrives and answer nothing
+                        if transport == "udp":
+                            key.fileobj.recvfrom(4096)
+                        else:
+                            key.fileobj.accept()[0].close()
+                        continue
                     if transport == "udp":
                         data, peer = key.fileobj.recvfrom(4096)
                         reply = self._reply(server, data, tcp=False)
@@ -388,20 +430,22 @@ class Daemon:
         return status
 
 
-def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None, dot=None):
+def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None, dot=None, doh=None, cache=None):
     """access: (allowed subnets, deny action), or None for the default (localhost).
     policy, rate_limit: those sections' settings (indented YAML), or None for none.
-    dot: (cert, key) for a DoT listener on DOT, or None for none."""
+    dot, doh: (cert, key) for a DoT listener on DOT or a DoH one on DOH, or None for none."""
     hints = os.path.join(tmp, "lab.root")
     with open(hints, "w") as f:
         f.write(f".  NS  a.root-servers.test.\na.root-servers.test.  A  {ROOT_IP}\n")
     name = ("stub" if stub_zone else f"access-{access[1]}" if access else "policy" if policy
-            else f"rate-{abs(hash(rate_limit))}" if rate_limit else "dot" if dot else "root")
+            else f"rate-{abs(hash(rate_limit))}" if rate_limit else "dot" if dot else "doh" if doh else "cache" if cache else "root")
     path = os.path.join(tmp, name + ".yaml")
     with open(path, "w") as f:
         f.write(f'listen:\n  udp: "{DAEMON[0]}:{DAEMON[1]}"\n')
         if dot:
             f.write(f'  dot:\n    addr: "{DOT[0]}:{DOT[1]}"\n    cert: {dot[0]}\n    key: {dot[1]}\n')
+        if doh:
+            f.write(f'  doh:\n    addr: "{DOH[0]}:{DOH[1]}"\n    cert: {doh[0]}\n    key: {doh[1]}\n')
         f.write(f"resolver:\n  root_hints: {hints}\n  overall_deadline_ms: 2000\n")
         if stub_zone:
             f.write(f'  stub_zones:\n    lab.: ["{LAB_IP}"]\n')
@@ -412,6 +456,8 @@ def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None
             f.write("policy:\n" + policy)
         if rate_limit:
             f.write("rate_limit:\n" + rate_limit)
+        if cache:
+            f.write("cache:\n" + cache)
     return path
 
 
@@ -542,11 +588,36 @@ def rejecting_a_bad_config(binary, servers, tmp):
     r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
     check(r.returncode == 1 and "listen.dot: cannot open" in r.stderr and "certs/make_certs.sh" in r.stderr,
           "a DoT certificate that can't be read stops startup, and says how to make one")
+    path = write_config(tmp, doh=(os.path.join(tmp, "nope.crt"), os.path.join(tmp, "nope.key")))
+    r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
+    check(r.returncode == 1 and "listen.doh: cannot open" in r.stderr and "certs/make_certs.sh" in r.stderr,
+          "...and so does a DoH one")
 
     missing = os.path.join(tmp, "missing.txt")
     path = write_config(tmp, policy=f"  blocklists: [{missing}]\n")
     r = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=5)
     check(r.returncode == 1 and f"cannot open {missing}" in r.stderr, "a block list that can't be read stops startup")
+
+
+def serving_stale_during_an_outage(binary, servers, tmp):
+    def body(daemon):
+        check(any("serve-stale on" in line for line in daemon.log), "startup log says serve-stale is on")
+        r = ask("short.example.lab")
+        check(r.answers == [("short.example.lab.", A, "192.0.2.50")], "a short-lived answer (TTL 1 s) is cached")
+        time.sleep(1.5)  # ...and has expired
+        servers.silent = True
+        try:
+            start = time.monotonic()
+            r = ask("short.example.lab")
+            took = time.monotonic() - start
+        finally:
+            servers.silent = False
+        check(r.rcode == NOERROR and r.answers == [("short.example.lab.", A, "192.0.2.50")] and r.answer_ttls == [30],
+              "with the upstream down, the expired answer is served stale, with TTL 30")
+        check(took < 1.0, f"...after the 300 ms client-response timer, not the 2 s deadline ({took * 1000:.0f} ms)")
+
+    log = run_daemon(binary, write_config(tmp, cache="  serve_stale:\n    answer_after_ms: 300\n"), body)
+    check(any("1 stale answers" in line for line in log), "...and the exit summary counts it")
 
 
 def answering_over_tls(binary, servers, tmp):
@@ -579,6 +650,30 @@ def answering_over_tls(binary, servers, tmp):
               "plain DNS on the DoT port gets no answer, and the connection is closed")
 
     run_daemon(binary, write_config(tmp, dot=(cert, key)), body)
+
+
+def answering_over_https(binary, servers, tmp):
+    made = make_cert(tmp)
+    if not made:
+        print("  skip  no openssl command to make a certificate with")
+        return
+    cert, key = made
+
+    def body(daemon):
+        check(any(f"doh https://{DOH[0]}:{DOH[1]}/dns-query" in line for line in daemon.log if "listening on" in line),
+              "startup log lists the DoH listener")
+        status, content_type, r, alpn = ask_doh("www.example.lab", cert)
+        check(status == 200 and content_type == "application/dns-message" and r is not None and r.id_matches
+              and r.answers == [("www.example.lab.", A, "192.0.2.1")],
+              "answers a POST over DNS over HTTPS, to a client that verified the certificate")
+        check(alpn == "http/1.1", "...over HTTP/1.1, agreed by ALPN")
+        status, _, r, _ = ask_doh("www.example.lab", cert, method="GET")
+        check(status == 200 and r is not None and r.answers == [("www.example.lab.", A, "192.0.2.1")],
+              "...and a GET with the query in base64url")
+        status, content_type, _, _ = ask_doh("www.example.lab", cert, path="/elsewhere")
+        check(status == 404 and content_type.startswith("text/plain"), "a request for another path gets 404")
+
+    run_daemon(binary, write_config(tmp, doh=(cert, key)), body)
 
 
 def rate_limiting_a_flood(binary, servers, tmp):
@@ -716,7 +811,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         for scenario in (resolving_from_the_root, resolving_a_stub_zone,
                          refusing_clients_outside_the_allowed_subnets, rate_limiting_a_flood, blocking_listed_names,
-                         answering_over_tls, rejecting_a_bad_config):
+                         serving_stale_during_an_outage, answering_over_tls, answering_over_https,
+                         rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
                 scenario(binary, servers, tmp)

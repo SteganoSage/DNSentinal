@@ -85,6 +85,7 @@ struct ResolveResult {
     uint32_t upstream_queries_used = 0;      // caused by this query: 0 when coalesced
     uint32_t latency_us            = 0;      // from this query's resolve() call
     bool     coalesced             = false;  // joined an identical resolution in flight (plan §4.4)
+    bool     stale                 = false;  // expired cache data: resolving failed or was slow (RFC 8767)
 };
 
 /// Counters for metrics and experiments (plan §7.4; E6 counts minimisation).
@@ -92,6 +93,8 @@ struct ResolverStats {
     uint64_t upstream_queries       = 0;  // every query sent upstream, retries included
     uint64_t minimised_queries      = 0;  // of those, QNAME-minimised ones (plan §6.1)
     uint64_t minimisation_fallbacks = 0;  // a server mishandled one, so its zone got the full name
+    uint64_t stale_answers          = 0;  // clients answered with expired data (plan §7.1)
+    uint64_t prefetches             = 0;  // background refreshes of popular entries (plan §7.2)
 };
 
 using ResolveCallback = std::function<void(std::expected<ResolveResult, ResolveError>)>;
@@ -139,6 +142,14 @@ public:
     /// Besides saving upstream traffic, this keeps at most one upstream query
     /// outstanding per question, which blunts birthday-style spoofing: with
     /// n identical queries in flight, a forged answer has n chances to match.
+    ///
+    /// With serve-stale on in the cache's config (plan §7.1, RFC 8767), the
+    /// answer may instead be expired data from the cache, marked `stale`,
+    /// with short TTLs: when resolving fails; when it is still under way
+    /// after stale_answer_after_ms (it carries on and refreshes the cache);
+    /// and, for 30 s after such a failure, at once, without asking the
+    /// upstream again. A popular cached answer near expiry is refreshed in
+    /// the background (prefetch, plan §7.2).
     void resolve(const Question& question, ResolveCallback done);
 
     /// Prime the cache with the root NS set (done once at startup). Same

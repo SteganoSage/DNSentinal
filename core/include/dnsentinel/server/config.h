@@ -27,12 +27,14 @@ struct TlsListenConfig {
     net::TcpListenerConfig tcp;   // address and port; limits as for plain TCP
     std::string            cert;  // PEM certificate (chain)
     std::string            key;   // its PEM private key, unencrypted
+    std::string            path = "/dns-query";  // DoH only: where queries go
 };
 
 struct Config {
     net::UdpListenerConfig         udp;
     net::TcpListenerConfig         tcp;  // listen.tcp, else wherever UDP listens
     std::optional<TlsListenConfig> dot;  // listen.dot: DNS over TLS (plan §6.2); none: off
+    std::optional<TlsListenConfig> doh;  // listen.doh: DNS over HTTPS (plan §6.3); none: off
     resolver::ResolverConfig resolver;
     cache::CacheConfig       cache;
     policy::AccessConfig     access;  // default: localhost only

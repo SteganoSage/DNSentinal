@@ -40,10 +40,15 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->dot->tcp.port, 853);
     EXPECT_EQ(c->dot->cert, "certs/server.crt");
     EXPECT_EQ(c->dot->key, "certs/server.key");
-    for (const char* feature : {"listen.doh", "cache.serve_stale",
-                                "telemetry"}) {
-        EXPECT_TRUE(lists(*c, feature)) << feature;
-    }
+    EXPECT_FALSE(lists(*c, "listen.doh"));
+    ASSERT_TRUE(c->doh.has_value());
+    EXPECT_EQ(c->doh->tcp.port, 443);
+    EXPECT_EQ(c->doh->path, "/dns-query");
+    EXPECT_FALSE(lists(*c, "cache.serve_stale"));
+    EXPECT_FALSE(lists(*c, "cache.prefetch"));
+    EXPECT_TRUE(c->cache.serve_stale);
+    EXPECT_EQ(c->cache.stale_answer_after_ms, 1800u);
+    EXPECT_TRUE(lists(*c, "telemetry"));
     EXPECT_TRUE(c->resolver.use_0x20);
     EXPECT_FALSE(lists(*c, "resolver.use_0x20"));  // implemented (plan §5.2)
     EXPECT_FALSE(lists(*c, "access"));             // implemented (plan §5.5)
@@ -210,6 +215,24 @@ TEST(Config, OnlyFeaturesThatAreOnAreReportedMissing) {
     EXPECT_FALSE(c->resolver.use_0x20);
 }
 
+TEST(Config, ServeStaleAndPrefetchSettings) {
+    auto c = parse_config(
+        "cache:\n"
+        "  serve_stale: { enabled: true, stale_ttl: 10, max_stale_age: 3600, answer_after_ms: 0 }\n"
+        "  prefetch: { enabled: false, threshold_pct: 20 }\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_EQ(c->cache.stale_ttl, 10u);
+    EXPECT_EQ(c->cache.max_stale_age, 3600u);
+    EXPECT_EQ(c->cache.stale_answer_after_ms, 0u);  // stale only when resolving fails
+    EXPECT_FALSE(c->cache.prefetch);
+    EXPECT_EQ(c->cache.prefetch_threshold, 20);
+
+    auto bad = parse_config("cache:\n  serve_stale: { answer_after_ms: 90000 }\n");
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_NE(bad.error().find("cache.serve_stale.answer_after_ms must be between 0 and 60000"), std::string::npos)
+        << bad.error();
+}
+
 TEST(Config, SpoofDetectionCanBeTurnedOff) {
     auto c = parse_config("resolver:\n  spoof_tcp_threshold: 0\n");
     ASSERT_TRUE(c.has_value()) << c.error();
@@ -263,6 +286,33 @@ TEST(Config, DotIsOffUnlessConfigured) {
     EXPECT_EQ(on->dot->key, "/tmp/lab.key");
 }
 
+TEST(Config, DohIsOffUnlessConfiguredAndTakesAPath) {
+    auto off = parse_config("listen:\n  udp: \"127.0.0.1:5353\"\n");
+    ASSERT_TRUE(off.has_value()) << off.error();
+    EXPECT_FALSE(off->doh.has_value());
+
+    auto on = parse_config(
+        "listen:\n"
+        "  doh:\n"
+        "    addr: \"127.0.0.1:8443\"\n"
+        "    cert: /tmp/lab.crt\n"
+        "    key: /tmp/lab.key\n");
+    ASSERT_TRUE(on.has_value()) << on.error();
+    ASSERT_TRUE(on->doh.has_value());
+    EXPECT_EQ(on->doh->tcp.port, 8443);
+    EXPECT_EQ(on->doh->path, "/dns-query");  // the default
+
+    auto custom = parse_config(
+        "listen:\n"
+        "  doh:\n"
+        "    addr: \"127.0.0.1:8443\"\n"
+        "    path: /resolve\n"
+        "    cert: /tmp/lab.crt\n"
+        "    key: /tmp/lab.key\n");
+    ASSERT_TRUE(custom.has_value()) << custom.error();
+    EXPECT_EQ(custom->doh->path, "/resolve");
+}
+
 TEST(Config, ParsesIpv6ListenAddress) {
     auto c = parse_config("listen:\n  udp: \"[::1]:5353\"\n");
     ASSERT_TRUE(c.has_value()) << c.error();
@@ -297,6 +347,10 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"listen:\n  dot:\n    addr: \"127.0.0.1:853\"\n    cert: a.crt\n", "line 3: listen.dot needs addr, cert and key"},
         {"listen:\n  dot:\n    addr: \"127.0.0.1\"\n", "listen.dot.addr must be \"address:port\""},
         {"listen:\n  dot:\n    port: 853\n", "unknown setting 'listen.dot.port'"},
+        {"listen:\n  dot:\n    path: /dns-query\n", "unknown setting 'listen.dot.path'"},
+        {"listen:\n  doh:\n    addr: \"127.0.0.1:443\"\n    path: dns-query\n", "listen.doh.path must be a URL path"},
+        {"listen:\n  doh:\n    addr: \"127.0.0.1:443\"\n    path: /a?b\n", "listen.doh.path must be a URL path"},
+        {"listen:\n  doh:\n    addr: \"127.0.0.1:443\"\n", "listen.doh needs addr, cert and key"},
         {"resolver: { edns_buffer: 1232\n", "invalid YAML"},
         {"resolver:\n  stub_zones:\n    lab.: [\"fd00::2\"]\n", "line 3: resolver.stub_zones: IPv6 server fd00::2"},
         {"resolver:\n  stub_zones:\n    lab.: [\"lab-root\"]\n", "invalid server address 'lab-root'"},

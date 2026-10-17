@@ -5,6 +5,10 @@
 /// queries on one connection; each response goes back as soon as it is
 /// ready, possibly out of order (clients match them by ID). Clients retry
 /// here when a UDP response came back truncated (TC).
+///
+/// The same listener serves DNS over HTTPS (DoH, RFC 8484) when given a
+/// path: HTTP/1.1 requests instead of length-prefixed messages, with the
+/// same connection limits, timeouts and back-pressure.
 
 #include "dnsentinel/net/event_loop.h"
 #include "dnsentinel/net/query_handler.h"
@@ -14,6 +18,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -35,7 +40,8 @@ struct TcpListenerConfig {
 
 /// What runs on top of TCP. Nothing: plain DNS over TCP.
 struct StreamOptions {
-    std::shared_ptr<const TlsContext> tls;  // set: TLS first (DoT)
+    std::shared_ptr<const TlsContext> tls      = nullptr;       // set: TLS first (DoT, or DoH with doh_path)
+    std::optional<std::string>        doh_path = std::nullopt;  // set: DNS over HTTP at this path (DoH); plain HTTP without tls
 };
 
 struct TcpListenerStats {
@@ -46,13 +52,15 @@ struct TcpListenerStats {
     uint64_t responses_sent    = 0;
     uint64_t idle_closed       = 0;
     uint64_t tls_failed        = 0;  // TLS handshake or record errors: connection closed
+    uint64_t http_errors       = 0;  // DoH requests answered with an HTTP error status
 };
 
 class TcpListener {
 public:
     /// Bind, listen and start accepting on `loop`. The listener must be
     /// destroyed before the loop. With `options.tls`, every connection
-    /// starts with a TLS handshake, and handlers see Transport::Dot.
+    /// starts with a TLS handshake, and handlers see Transport::Dot; with
+    /// `options.doh_path` they see Transport::Doh.
     ///
     /// TLS writes go through write(2), so a client that resets its
     /// connection can raise SIGPIPE: a process using TLS must ignore it.
