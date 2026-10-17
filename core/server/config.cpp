@@ -139,6 +139,33 @@ void read_listen_address(Section& section, const std::string& key, std::string& 
     port    = static_cast<uint16_t>(*number);
 }
 
+/// An encrypted listener: { addr: "0.0.0.0:853", cert: ..., key: ... }, all three
+/// required; DoH also takes `path` (default /dns-query).
+std::optional<TlsListenConfig> read_tls_listener(Section& listen, const std::string& key, bool http) {
+    auto node = listen.take(key);
+    if (!node || node->IsNull()) return std::nullopt;
+    Section         section(node, listen.name(key));
+    TlsListenConfig out;
+    out.tcp.address.clear();
+    read_listen_address(section, "addr", out.tcp.address, out.tcp.port);
+    section.read_string("cert", out.cert);
+    section.read_string("key", out.key);
+    if (http) {
+        if (auto path = section.take("path")) {
+            const std::string text = scalar_or_empty(*path);
+            if (!text.starts_with('/') || text.find_first_of("?# \t") != std::string::npos) {
+                fail(*path, section.name("path") + " must be a URL path such as /dns-query");
+            }
+            out.path = text;
+        }
+    }
+    section.finish();
+    if (out.tcp.address.empty() || out.cert.empty() || out.key.empty()) {
+        fail(*node, listen.name(key) + " needs addr, cert and key");
+    }
+    return out;
+}
+
 /// stub_zones: { "lab.": ["10.10.0.2", ...], ... }
 void read_stub_zones(Section& section, std::vector<resolver::StubZone>& out) {
     auto node = section.take("stub_zones");
@@ -323,9 +350,8 @@ Config parse(const YAML::Node& document) {
     c.tcp.address = c.udp.address;  // unless listen.tcp says otherwise
     c.tcp.port    = c.udp.port;
     read_listen_address(listen, "tcp", c.tcp.address, c.tcp.port);
-    for (const char* key : {"dot", "doh"}) {
-        if (listen.take(key)) c.not_implemented.push_back(listen.name(key));
-    }
+    c.dot = read_tls_listener(listen, "dot", false);
+    c.doh = read_tls_listener(listen, "doh", true);
     listen.finish();
 
     Section                   res(top.take("resolver"), "resolver");
@@ -348,13 +374,23 @@ Config parse(const YAML::Node& document) {
     res.read_uint("overall_deadline_ms", r.overall_deadline_ms, 1);
     res.read_uint("spoof_tcp_threshold", r.spoof_tcp_threshold);
     read_stub_zones(res, r.stub_zones);
+#ifdef DNSENTINEL_WEAK_MODE
+    if (auto node = res.take("weak_mode"); node && !node->IsNull()) {
+        Section weak(node, "resolver.weak_mode");  // lab-only (plan §5.10)
+        r.weak.weaken = true;
+        weak.read_uint("txid_bits", r.weak.txid_bits, 1, 16);
+        weak.read_bool("sequential_txid", r.weak.sequential_txid);
+        weak.read_uint("fixed_source_port", r.weak.fixed_source_port, 0, 65535);
+        weak.read_bool("accept_out_of_bailiwick", r.weak.accept_out_of_bailiwick);
+        weak.finish();
+    }
+#endif
     res.finish();
     if (r.query_timeout_ms > r.max_query_timeout_ms) {
         throw ConfigError{"resolver.query_timeout_ms (" + std::to_string(r.query_timeout_ms) +
                           ") is above resolver.max_query_timeout_ms (" + std::to_string(r.max_query_timeout_ms) + ")"};
     }
     c.udp.max_response_size = r.edns_buffer;  // one EDNS buffer size, upstream and to clients
-    if (r.qname_minimisation) c.not_implemented.push_back("resolver.qname_minimisation");
 
     Section             cache(top.take("cache"), "cache");
     cache::CacheConfig& k  = c.cache;
@@ -368,6 +404,7 @@ Config parse(const YAML::Node& document) {
     stale.read_bool("enabled", k.serve_stale);
     stale.read_uint("stale_ttl", k.stale_ttl);
     stale.read_uint("max_stale_age", k.max_stale_age);
+    stale.read_uint("answer_after_ms", k.stale_answer_after_ms, 0, 60000);
     stale.finish();
     Section prefetch(cache.take("prefetch"), "cache.prefetch");
     prefetch.read_bool("enabled", k.prefetch);
@@ -378,8 +415,6 @@ Config parse(const YAML::Node& document) {
         throw ConfigError{"cache.min_ttl (" + std::to_string(k.min_ttl) + ") is above cache.max_ttl (" +
                           std::to_string(k.max_ttl) + ")"};
     }
-    if (k.serve_stale) c.not_implemented.push_back("cache.serve_stale");
-    if (k.prefetch) c.not_implemented.push_back("cache.prefetch");
 
     read_access(top, c.access);
     read_rate_limit(top, c);

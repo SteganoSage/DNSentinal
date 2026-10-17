@@ -1,11 +1,12 @@
 /// @file main.cpp
-/// The dnsentinel daemon: load the config, root hints and block lists,
-/// start the resolver and the UDP and TCP listeners, and run the event loop
-/// until SIGINT or SIGTERM. SIGHUP reloads the block lists.
+/// The dnsentinel daemon: load the config, root hints, certificates and
+/// block lists, start the resolver and the UDP, TCP, DoT and DoH listeners, and
+/// run the event loop until SIGINT or SIGTERM. SIGHUP reloads the block lists.
 
 #include "dnsentinel/cache/cache.h"
 #include "dnsentinel/net/event_loop.h"
 #include "dnsentinel/net/tcp_listener.h"
+#include "dnsentinel/net/tls.h"
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/policy/blocklists.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
@@ -85,6 +86,12 @@ std::string join(const std::vector<std::string>& items) {
     std::string out;
     for (const auto& item : items) out += (out.empty() ? "" : ", ") + item;
     return out;
+}
+
+/// "a", "a and b", "a, b and c".
+std::string join_and(const std::vector<std::string>& items) {
+    if (items.size() < 2) return join(items);
+    return join(std::vector<std::string>(items.begin(), items.end() - 1)) + " and " + items.back();
 }
 
 std::string describe_limits(const server::Config& c) {
@@ -178,6 +185,26 @@ int main(int argc, char** argv) {
     }
     const std::string udp_at = endpoint(config->udp.address, config->udp.port);
     const std::string tcp_at = endpoint(config->tcp.address, config->tcp.port);
+    std::shared_ptr<net::TlsContext> dot_tls;
+    if (config->dot) {
+        auto tls = net::TlsContext::create_server(config->dot->cert, config->dot->key, {"dot"});
+        if (!tls) {
+            log("listen.dot: " + tls.error());
+            log("for a lab certificate run certs/make_certs.sh (a phone's Private DNS needs a public one, plan §6.2)");
+            return 1;
+        }
+        dot_tls = std::move(*tls);
+    }
+    std::shared_ptr<net::TlsContext> doh_tls;
+    if (config->doh) {
+        auto tls = net::TlsContext::create_server(config->doh->cert, config->doh->key, {"http/1.1"});
+        if (!tls) {
+            log("listen.doh: " + tls.error());
+            log("for a lab certificate run certs/make_certs.sh, and trust certs/ca.crt in the browser (plan §6.3)");
+            return 1;
+        }
+        doh_tls = std::move(*tls);
+    }
     {
         std::vector<std::string> allowed;
         for (const auto& subnet : config->access.allow) allowed.push_back(subnet.to_string());
@@ -189,7 +216,24 @@ int main(int argc, char** argv) {
         for (uint32_t a : stub.servers) servers.push_back(ipv4_text(a));
         log("stub zone " + stub.zone.to_string() + " -> " + join(servers));
     }
+#ifdef DNSENTINEL_WEAK_MODE
+    if (config->resolver.weak.weaken) {
+        warn("WEAK MODE: anti-spoofing is deliberately weakened (txid_bits=" +
+             std::to_string(config->resolver.weak.txid_bits) +
+             (config->resolver.weak.sequential_txid ? ", sequential IDs" : "") +
+             (config->resolver.weak.fixed_source_port ? ", fixed source port " +
+                  std::to_string(config->resolver.weak.fixed_source_port) : "") +
+             (config->resolver.weak.accept_out_of_bailiwick ? ", bailiwick off" : "") +
+             "). FOR THE ATTACK LAB ONLY (plan §5.10).");
+    }
+#endif
     log(describe_limits(*config));
+    if (config->cache.serve_stale) {
+        const auto& k = config->cache;
+        log("serve-stale on: expired answers are kept " + std::to_string(k.max_stale_age / 3600) +
+            " h and served (TTL " + std::to_string(k.stale_ttl) + " s) when resolving fails" +
+            (k.stale_answer_after_ms > 0 ? " or takes over " + std::to_string(k.stale_answer_after_ms) + " ms" : ""));
+    }
     if (config->rebinding.enabled) {
         std::vector<std::string> exempt;
         for (const auto& zone : config->rebinding.exempt) exempt.push_back(zone.to_string());
@@ -256,6 +300,30 @@ int main(int argc, char** argv) {
         cannot_listen("tcp", tcp_at, config->tcp.port, tcp.error(), argv[0]);
         return 1;
     }
+    std::vector<std::string>          listening = {"udp " + udp_at, "tcp " + tcp_at};
+    std::unique_ptr<net::TcpListener> dot;
+    if (config->dot) {
+        const std::string at       = endpoint(config->dot->tcp.address, config->dot->tcp.port);
+        auto              listener = net::TcpListener::create(**loop, config->dot->tcp, handler, {.tls = dot_tls});
+        if (!listener) {
+            cannot_listen("dot", at, config->dot->tcp.port, listener.error(), argv[0]);
+            return 1;
+        }
+        dot = std::move(*listener);
+        listening.push_back("dot " + at);
+    }
+    std::unique_ptr<net::TcpListener> doh;
+    if (config->doh) {
+        const std::string at       = endpoint(config->doh->tcp.address, config->doh->tcp.port);
+        auto              listener = net::TcpListener::create(**loop, config->doh->tcp, handler,
+                                                              {.tls = doh_tls, .doh_path = config->doh->path});
+        if (!listener) {
+            cannot_listen("doh", at, config->doh->tcp.port, listener.error(), argv[0]);
+            return 1;
+        }
+        doh = std::move(*listener);
+        listening.push_back("doh https://" + at + config->doh->path);
+    }
 
     // ─── Reloading the lists: on SIGHUP, and when a list file changes ───────
     // The files are read on a worker thread; the loop checks for the new
@@ -316,6 +384,8 @@ int main(int argc, char** argv) {
     sigaction(SIGTERM, &action, nullptr);
     action.sa_handler = on_reload_signal;
     sigaction(SIGHUP, &action, nullptr);
+    action.sa_handler = SIG_IGN;  // TLS writes to a client that reset the connection raise it
+    sigaction(SIGPIPE, &action, nullptr);
 
     resolver.prime_root([](std::expected<void, resolver::ResolveError> primed) {
         if (primed) {
@@ -326,11 +396,14 @@ int main(int argc, char** argv) {
         }
     });
 
-    log("listening on udp " + udp_at + " and tcp " + tcp_at);
+    log("listening on " + join_and(listening));
     (*loop)->run();
     if (const LimitCounts total = LimitCounts::of(processor.checks()); total != LimitCounts{}) {
         log("rate limiting since startup: " + total.describe());
     }
+    log("cache since startup: " + std::to_string(cache.hits()) + " hits, " + std::to_string(cache.misses()) +
+        " misses, " + std::to_string(resolver.stats().stale_answers) + " stale answers, " +
+        std::to_string(resolver.stats().prefetches) + " prefetches");
     log("shutting down");
     action.sa_handler = SIG_DFL;  // a second Ctrl-C now just exits
     sigaction(SIGINT, &action, nullptr);

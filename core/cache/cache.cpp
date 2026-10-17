@@ -1,6 +1,7 @@
 /// @file cache/cache.cpp
 /// Sharded LRU cache: per-shard hash index + recency list, TTL expiry,
-/// trust ranking, and approximate memory accounting.
+/// trust ranking, approximate memory accounting, expired entries kept for
+/// serve-stale, and prefetch hints.
 
 #include "dnsentinel/cache/cache.h"
 
@@ -28,6 +29,9 @@ struct KeyHash {
 // Close enough for eviction decisions; not byte-exact.
 
 constexpr size_t kNodeOverhead = 64;  // list node links + hash node + bucket slot
+
+/// "Popular" for prefetch: asked for at least this many times.
+constexpr uint64_t kPrefetchMinHits = 2;
 
 size_t name_bytes(const Name& n) {
     // Two vectors of labels (canonical + original case).
@@ -106,7 +110,7 @@ size_t Cache::shard_for(const CacheKey& key) const {
     return (KeyHash{}(key) >> 32) % shards_.size();
 }
 
-LookupResult Cache::lookup(const CacheKey& key) {
+LookupResult Cache::lookup(const CacheKey& key, bool allow_stale) {
     Shard&          shard = *shards_[shard_for(key)];
     const TimePoint now   = clock_();
 
@@ -114,21 +118,43 @@ LookupResult Cache::lookup(const CacheKey& key) {
     {
         std::lock_guard lock(shard.mutex);
         auto it = shard.index.find(key);
-        // Expired entries stay until evicted: serve-stale will want them.
-        if (it == shard.index.end() || it->second->entry.expires_at <= now) {
+        if (it == shard.index.end()) {
             misses_.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
         Shard::NodeIter node = it->second;
+        if (node->entry.expires_at <= now) {
+            // Expired entries stay for serve-stale until max_stale_age is up.
+            const TimePoint stale_until = node->entry.expires_at + std::chrono::seconds(config_.max_stale_age);
+            if (!config_.serve_stale || now >= stale_until) {
+                shard.erase(node);
+                misses_.fetch_add(1, std::memory_order_relaxed);
+                return result;
+            }
+            if (!allow_stale) {
+                misses_.fetch_add(1, std::memory_order_relaxed);
+                return result;
+            }
+            result.is_stale = true;
+        }
         shard.lru.splice(shard.lru.begin(), shard.lru, node);
         ++node->entry.hit_count;
         result.entry = node->entry;
     }
-    hits_.fetch_add(1, std::memory_order_relaxed);
 
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::seconds>(result.entry->expires_at - now).count();
+    if (result.is_stale) {
+        stale_hits_.fetch_add(1, std::memory_order_relaxed);
+        for (auto& rr : result.entry->records) rr.ttl = config_.stale_ttl;
+        return result;
+    }
+    hits_.fetch_add(1, std::memory_order_relaxed);
+    const auto left      = result.entry->expires_at - now;
+    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(left).count();
     for (auto& rr : result.entry->records) rr.ttl = static_cast<uint32_t>(remaining);
+    if (config_.prefetch && result.entry->hit_count >= kPrefetchMinHits) {
+        const auto lifetime   = result.entry->expires_at - result.entry->inserted_at;
+        result.needs_prefetch = left * 100 < lifetime * config_.prefetch_threshold;
+    }
     return result;
 }
 
@@ -193,6 +219,8 @@ void Cache::flush() {
 uint64_t Cache::hits() const { return hits_.load(std::memory_order_relaxed); }
 
 uint64_t Cache::misses() const { return misses_.load(std::memory_order_relaxed); }
+
+uint64_t Cache::stale_hits() const { return stale_hits_.load(std::memory_order_relaxed); }
 
 size_t Cache::size() const {
     size_t total = 0;

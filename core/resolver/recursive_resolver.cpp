@@ -6,8 +6,9 @@
 ///   step()             answer from the cache, or find the closest zone cut
 ///   next_server()      pick the fastest untried server (SRTT); if none, resolve a glueless
 ///                      NS; if none, retry the servers that timed out, waiting longer
-///   send_query()       ask it and return to the loop
+///   send_query()       ask it (QNAME-minimised until the last zone) and return to the loop
 ///   handle_response()  answer / CNAME / NXDOMAIN / referral / NODATA
+///   handle_minimised() is a zone cut at the name asked? descend, or reveal another label
 /// and never blocks: every wait is a return to the event loop.
 ///
 /// Convention: finish() runs the task's callback, which may start new work
@@ -57,6 +58,33 @@ constexpr size_t kMaxSubqueryDepth = 4;
 /// Extra rounds for a zone's servers that timed out, each with a doubled wait
 /// (plan §3.3). The query budget and the overall deadline still apply.
 constexpr uint8_t kMaxRetryRounds = 2;
+
+/// QNAME minimisation limits (RFC 9156 §2.3): the first minimised queries
+/// reveal one label each; after that, labels come in bigger steps, so even
+/// a long name (say under ip6.arpa) costs at most kMaxMinimiseCount of them.
+constexpr uint32_t kMaxMinimiseCount = 10;
+constexpr uint32_t kMinimiseOneLabel = 4;
+
+/// After a name fails and is answered stale, it keeps being answered stale
+/// at once for this long rather than waiting on the same dead upstream again
+/// (RFC 8767 §4's "failure recheck").
+constexpr auto kFailureRecheck = std::chrono::seconds(30);
+
+/// Background refreshes in flight at once (plan §7.2).
+constexpr size_t kMaxPrefetches = 32;
+
+/// The ancestor of `name` (or `name` itself) with `labels` labels.
+Name ancestor(const Name& name, size_t labels) {
+    const size_t skip = name.label_count() - labels;
+    Name         out;
+    out.labels.assign(name.labels.begin() + static_cast<ptrdiff_t>(skip), name.labels.end());
+    if (name.original_case.size() == name.labels.size()) {
+        out.original_case.assign(name.original_case.begin() + static_cast<ptrdiff_t>(skip), name.original_case.end());
+    } else {
+        out.original_case = out.labels;
+    }
+    return out;
+}
 
 std::vector<RR> collect(const std::vector<RR>& section, const Name& name, uint16_t type) {
     std::vector<RR> out;
@@ -142,6 +170,17 @@ struct RecursiveResolver::Impl {
         uint32_t queries = 0;
     };
 
+    /// One client's answer, delivered exactly once: the resolution's outcome,
+    /// or stale data from the cache if that comes first (RFC 8767).
+    struct Delivery {
+        uint64_t                id = 0;
+        Question                question;  // as the client asked it
+        Clock::time_point       asked;
+        ResolveCallback         done;
+        net::EventLoop::TimerId stale_timer = 0;
+        bool                    delivered   = false;
+    };
+
     /// A client that asked a question already being resolved (plan §4.4).
     struct Waiter {
         Question          question;  // as this client asked it, case included
@@ -165,6 +204,12 @@ struct RecursiveResolver::Impl {
         in_addr_t              asked    = 0;      // the server asked last
         bool                   over_tcp = false;  // ... and whether over TCP
         bool                   sent_0x20 = false; // ... and whether with random letter case
+        Name                   sent_name;         // ... and the question sent: t.qname, or an ancestor
+        uint16_t               sent_type = 0;
+        bool                   minimised = false; // ... which was then a minimised one: sent_name NS?
+        bool                   minimise  = true;  // this zone still gets minimised queries (plan §6.1)
+        size_t                 known_labels   = 0;  // labels of qname known not to hide a deeper cut
+        uint32_t               minimise_count = 0;  // minimised steps taken for this target
         uint8_t                glueless_lookups = 0;
         uint16_t               referrals        = 0;
         uint32_t               timeouts         = 0;  // in this zone: each doubles the next wait
@@ -177,7 +222,8 @@ struct RecursiveResolver::Impl {
         net::EventLoop::TimerId start_timer = 0;
         net::EventLoop::TimerId deadline    = 0;  // client queries only
         ResolveCallback         done;
-        bool                    client = false;  // a client's query, not a sub-query
+        bool                    client  = false;  // a client's query, not a sub-query
+        bool                    refresh = false;  // a prefetch: skip the cached answer, the first time
         std::vector<Waiter>     joiners;         // identical client queries that came later
     };
 
@@ -189,6 +235,9 @@ struct RecursiveResolver::Impl {
             auto& servers = stubs[stub.zone];
             servers.insert(servers.end(), stub.servers.begin(), stub.servers.end());
         }
+#ifdef DNSENTINEL_WEAK_MODE
+        upstream.set_weak_mode(config.weak);
+#endif
     }
 
     ~Impl() {
@@ -197,6 +246,10 @@ struct RecursiveResolver::Impl {
             if (t->start_timer) loop.cancel_timer(t->start_timer);
             if (t->deadline) loop.cancel_timer(t->deadline);
         }
+        for (auto& [id, d] : deliveries) {
+            if (d->stale_timer) loop.cancel_timer(d->stale_timer);
+        }
+        *alive = false;
     }
 
     ResolverConfig                                     config;
@@ -211,6 +264,14 @@ struct RecursiveResolver::Impl {
     std::unordered_map<Question, uint64_t, QuestionHash> in_flight;  // client question → its task
     std::unordered_set<in_addr_t>                        no_0x20;    // servers that don't echo letter case
     SpoofAlertFn                                         spoof_alert;
+    ResolverStats                                        stats;
+    uint64_t                                                    next_delivery_id = 1;
+    std::unordered_map<uint64_t, std::shared_ptr<Delivery>>     deliveries;  // pending, for their stale timers
+    std::unordered_map<Question, Clock::time_point, QuestionHash> failed_recently;  // answer stale until then
+    std::unordered_set<Question, QuestionHash>                  prefetching;
+    // Cleared when the resolver goes. A client callback may destroy it, and
+    // the joiners called after that must not touch it (see finish()).
+    std::shared_ptr<bool>                                       alive = std::make_shared<bool>(true);
 
     // ─── Task lifecycle ─────────────────────────────────────────────────────
 
@@ -242,6 +303,41 @@ struct RecursiveResolver::Impl {
     }
 
     void resolve_client(const Question& q, ResolveCallback done) {
+        if (cache.config().serve_stale) {
+            auto d      = std::make_shared<Delivery>();
+            d->id       = next_delivery_id++;
+            d->question = q;
+            d->asked    = Clock::now();
+            d->done     = std::move(done);
+            deliveries.emplace(d->id, d);
+            // It failed moments ago: answer stale now instead of making the
+            // client wait for the same failure (on the next loop turn, as always).
+            if (recently_failed(q)) {
+                if (auto stale = stale_answer(q)) {
+                    d->stale_timer = loop.add_timer(milliseconds(0), [this, id = d->id, s = std::move(*stale)] {
+                        if (auto it = deliveries.find(id); it != deliveries.end()) {
+                            const std::shared_ptr<Delivery> keep = it->second;
+                            keep->stale_timer                    = 0;
+                            deliver(*keep, s);
+                        }
+                    });
+                    return;
+                }
+            }
+            if (const uint32_t after = cache.config().stale_answer_after_ms; after > 0) {
+                d->stale_timer = loop.add_timer(milliseconds(after), [this, id = d->id] { on_stale_timer(id); });
+            }
+            done = [this, d, alive = alive](Outcome o) {
+                if (*alive) {
+                    on_outcome(d, std::move(o));
+                } else if (!d->delivered) {  // the resolver is gone: just the outcome, no stale data
+                    d->delivered         = true;
+                    ResolveCallback done = std::move(d->done);
+                    done(std::move(o));
+                }
+            };
+        }
+
         if (auto it = in_flight.find(q); it != in_flight.end()) {
             if (Task* t = find(it->second)) {
                 t->joiners.push_back(Waiter{q, Clock::now(), std::move(done)});
@@ -344,10 +440,14 @@ struct RecursiveResolver::Impl {
             return;
         }
         const uint16_t qtype = t->question.qtype;
+        t->minimise_count    = 0;  // a new target (the question, or a CNAME's target)
 
         // Only authoritative answer data is served from the cache. Glue and
         // referral data (lower trust ranks) find servers; they never answer.
-        while (true) {
+        // A prefetch is here to replace the cached answer, so it skips it.
+        const bool use_cache = !t->refresh;
+        t->refresh           = false;
+        while (use_cache) {
             if (auto nx = cache.lookup({t->qname, kNxdomainType, kClassIN}); nx.entry) {
                 finish(id, outcome(*t, RCode::NXDomain, {}, nx.entry->records));
                 return;
@@ -358,6 +458,7 @@ struct RecursiveResolver::Impl {
                 return;
             }
             if (hit.entry && hit.entry->trust == TrustRank::Answer) {
+                if (hit.needs_prefetch && t->client) prefetch(Question{t->qname, qtype, kClassIN});
                 finish(id, outcome(*t, RCode::NoError, hit.entry->records, {}));
                 return;
             }
@@ -406,7 +507,9 @@ struct RecursiveResolver::Impl {
 
     /// Make `zone` the current zone cut, with no servers known yet.
     void reset_zone(Task& t, Name zone) {
-        t.zone = std::move(zone);
+        t.zone         = std::move(zone);
+        t.known_labels = t.zone.label_count();
+        t.minimise     = config.qname_minimisation;
         t.servers.clear();
         t.unresolved.clear();
         t.tried.clear();
@@ -436,6 +539,35 @@ struct RecursiveResolver::Impl {
         if (t.zone.label_count() == 0) {
             for (in_addr_t a : ipv4_addresses(hints.addresses)) add_server(t, a);
         }
+    }
+
+    /// How many of t.qname's labels the next query reveals (RFC 9156 §2.3):
+    /// the zone cut plus one, more once the first steps are spent, all of
+    /// them for the zone that holds the name or when minimisation is off.
+    /// Names the cache already knows are no zone cut are skipped.
+    size_t labels_to_ask(Task& t) {
+        const size_t full = t.qname.label_count();
+        while (t.minimise && t.known_labels < full && t.minimise_count < kMaxMinimiseCount) {
+            size_t next = t.known_labels + 1;
+            if (t.minimise_count >= kMinimiseOneLabel) {
+                const size_t left  = full - t.known_labels;
+                const size_t steps = kMaxMinimiseCount - t.minimise_count;
+                next               = t.known_labels + (left + steps - 1) / steps;
+            }
+            if (next >= full) break;
+            auto nodata = cache.lookup({ancestor(t.qname, next), kTypeNS, kClassIN});
+            if (!nodata.entry || !nodata.entry->is_negative) return next;
+            t.known_labels = next;
+        }
+        return full;
+    }
+
+    /// Only records inside the zone we asked about are believed.
+    void believe_only_bailiwick(Message& response, const Name& zone) const {
+#ifdef DNSENTINEL_WEAK_MODE
+        if (config.weak.accept_out_of_bailiwick) return;
+#endif
+        security::filter_to_bailiwick(response, zone);
     }
 
     bool would_cycle(const Task& t, const Question& q) const {
@@ -508,11 +640,19 @@ struct RecursiveResolver::Impl {
         // 0x20 (plan §5.2): over UDP, ask in random letter case and accept only
         // replies that echo it. TCP can't be spoofed off-path, so it needn't.
         t.sent_0x20 = config.use_0x20 && !t.over_tcp && !no_0x20.contains(address);
+        // QNAME minimisation (plan §6.1): above the zone that holds the name,
+        // ask only whether the next label down is a zone cut.
+        const size_t labels = labels_to_ask(t);
+        t.minimised         = labels < t.qname.label_count();
+        t.sent_name         = t.minimised ? ancestor(t.qname, labels) : t.qname;
+        t.sent_type         = t.minimised ? kTypeNS : t.question.qtype;
+        ++stats.upstream_queries;
+        if (t.minimised) ++stats.minimised_queries;
 
         Message query;
         query.header.rd = false;  // iterative: we do the recursion ourselves
         query.questions.push_back(
-            Question{t.sent_0x20 ? security::randomize_case(t.qname) : t.qname, t.question.qtype, kClassIN});
+            Question{t.sent_0x20 ? security::randomize_case(t.sent_name) : t.sent_name, t.sent_type, kClassIN});
         query.edns = EdnsInfo{.udp_payload_size = config.edns_buffer};
 
         // As long as this server usually takes, doubled for each timeout in this zone.
@@ -542,7 +682,7 @@ struct RecursiveResolver::Impl {
             // it again over TCP, where an off-path attacker can't inject.
             // Neither a failed try nor an SRTT penalty: it's not the server's fault.
             if (spoof_alert) {
-                spoof_alert(SpoofAlert{Question{t->qname, t->question.qtype, kClassIN}, t->asked,
+                spoof_alert(SpoofAlert{Question{t->sent_name, t->sent_type, kClassIN}, t->asked,
                                        config.spoof_tcp_threshold});
             }
             send_query(id, t->asked, UpstreamTransport::Tcp);
@@ -606,7 +746,7 @@ struct RecursiveResolver::Impl {
     void handle_response(uint64_t id, Message& response, microseconds rtt) {
         Task& t = *find(id);
         const auto rcode = static_cast<RCode>(response.header.rcode);
-        if (t.sent_0x20) restore_case(response, t.qname);
+        if (t.sent_0x20) restore_case(response, t.sent_name);
 
         // TC: the answer didn't fit in UDP. Ask the same server again over
         // TCP (plan §4.1); if even that comes back truncated, give up on it.
@@ -619,6 +759,10 @@ struct RecursiveResolver::Impl {
             }
             return;
         }
+        if (t.minimised) {
+            handle_minimised(id, response, rtt);
+            return;
+        }
         // Any error rcode: this server can't help.
         if (rcode != RCode::NoError && rcode != RCode::NXDomain) {
             rate(t, false, rtt);
@@ -626,8 +770,7 @@ struct RecursiveResolver::Impl {
             return;
         }
 
-        // Only records inside the zone we asked about are believed.
-        security::filter_to_bailiwick(response, t.zone);
+        believe_only_bailiwick(response, t.zone);
         const uint16_t  qtype       = t.question.qtype;
         const TrustRank answer_rank = response.header.aa ? TrustRank::Answer : TrustRank::Authority;
 
@@ -684,19 +827,11 @@ struct RecursiveResolver::Impl {
         }
 
         if (!ns.empty()) {
-            if (!downward) {
+            if (downward) {
+                descend(id, ns, response.additional, TrustRank::Authority);
+            } else {
                 next_server(id);
-                return;
             }
-            if (++t.referrals > config.max_referral_depth) {
-                finish(id, std::unexpected(ResolveError::MaxDepthExceeded));
-                return;
-            }
-            const Name child = ns.front().name;
-            cache.insert({child, kTypeNS, kClassIN}, ns, TrustRank::Authority, min_ttl(ns));
-            cache_glue(response.additional, ns);
-            enter_zone(t, child, ns, response.additional);
-            next_server(id);
             return;
         }
 
@@ -710,6 +845,184 @@ struct RecursiveResolver::Impl {
             return;
         }
         next_server(id);  // nothing usable: a lame server
+    }
+
+    /// Follow a delegation to the zone `ns` names, already checked to lead
+    /// toward the name.
+    void descend(uint64_t id, const std::vector<RR>& ns, const std::vector<RR>& additional, TrustRank rank) {
+        Task& t = *find(id);
+        if (++t.referrals > config.max_referral_depth) {
+            finish(id, std::unexpected(ResolveError::MaxDepthExceeded));
+            return;
+        }
+        const Name child = ns.front().name;
+        cache.insert({child, kTypeNS, kClassIN}, ns, rank, min_ttl(ns));
+        cache_glue(additional, ns);
+        enter_zone(t, child, ns, additional);
+        next_server(id);
+    }
+
+    /// The answer to a minimised query, `t.sent_name NS?` (RFC 9156): is a
+    /// zone cut there? A delegation means yes, so descend; NODATA (or a
+    /// CNAME) means no, so the next query reveals more of the name.
+    void handle_minimised(uint64_t id, Message& response, microseconds rtt) {
+        Task& t = *find(id);
+        if (response.header.rcode != static_cast<uint8_t>(RCode::NoError)) {
+            // The name asked is an ancestor of the one being resolved, so
+            // NXDOMAIN (or an error) for it means the server mishandles
+            // minimised queries, typically at an empty non-terminal. Ask
+            // this zone the full name instead (RFC 9156 §2.3), starting with
+            // the same server: the full answer settles it.
+            ++stats.minimisation_fallbacks;
+            t.minimise = false;
+            std::erase(t.tried, t.asked);
+            send_query(id, t.asked);
+            return;
+        }
+
+        believe_only_bailiwick(response, t.zone);
+        // A delegation: a referral, or the NS set itself from a server
+        // authoritative for both sides of the cut.
+        const std::vector<RR> answer_ns = collect(response.answers, t.sent_name, kTypeNS);
+        const std::vector<RR> referral  = response.header.aa ? std::vector<RR>{} : referral_ns(response.authority);
+        const bool downward = !referral.empty() && referral.front().name.label_count() > t.zone.label_count() &&
+                              t.qname.is_subdomain_of(referral.front().name);
+        const bool alias    = !collect(response.answers, t.sent_name, kTypeCNAME).empty();
+        const RR*  soa      = find_soa(response.authority, t.sent_name);
+        const bool no_cut   = answer_ns.empty() && referral.empty() && (response.header.aa || soa || alias);
+        rate(t, !answer_ns.empty() || downward || no_cut, rtt);
+
+        if (!answer_ns.empty() || downward) {
+            ++t.minimise_count;
+            if (answer_ns.empty()) {
+                descend(id, referral, response.additional, TrustRank::Authority);
+            } else {
+                descend(id, answer_ns, response.additional,
+                        response.header.aa ? TrustRank::Answer : TrustRank::Authority);
+            }
+            return;
+        }
+        if (no_cut) {
+            ++t.minimise_count;
+            if (soa && !alias) {  // remembered, so later names under it skip this step
+                cache.insert({t.sent_name, kTypeNS, kClassIN}, {*soa}, TrustRank::Authority, negative_ttl(*soa),
+                             /*negative=*/true);
+            }
+            // Same zone, new question: every server may be asked again.
+            t.known_labels = t.sent_name.label_count();
+            t.tried.clear();
+            t.timed_out.clear();
+            t.retry_rounds = 0;
+            next_server(id);
+            return;
+        }
+        next_server(id);  // a lame server, or a referral leading elsewhere
+    }
+
+    // ─── Serve-stale and prefetch (plan §7.1, §7.2) ─────────────────────────
+
+    /// What the cache still holds for `q`, fresh or expired: NXDOMAIN, NODATA
+    /// or records, after any CNAMEs; nothing if the chain can't be completed.
+    std::optional<ResolveResult> stale_answer(const Question& q) {
+        if (q.qclass != kClassIN) return std::nullopt;
+        ResolveResult r;
+        r.stale                 = true;
+        r.response.header.qr    = true;
+        r.response.questions    = {q};
+        Name name               = q.qname;
+        for (int hops = 0; hops <= config.max_cname_chain; ++hops) {
+            if (auto nx = cache.lookup({name, kNxdomainType, kClassIN}, true); nx.entry) {
+                r.response.header.rcode = static_cast<uint8_t>(RCode::NXDomain);
+                r.response.authority    = nx.entry->records;
+                return r;
+            }
+            auto hit = cache.lookup({name, q.qtype, kClassIN}, true);
+            if (hit.entry && hit.entry->is_negative) {
+                r.response.authority = hit.entry->records;
+                return r;
+            }
+            if (hit.entry && hit.entry->trust == TrustRank::Answer) {
+                r.response.answers.insert(r.response.answers.end(), hit.entry->records.begin(),
+                                          hit.entry->records.end());
+                return r;
+            }
+            if (q.qtype == kTypeCNAME) return std::nullopt;
+            auto cname = cache.lookup({name, kTypeCNAME, kClassIN}, true);
+            if (!cname.entry || cname.entry->is_negative || cname.entry->trust != TrustRank::Answer ||
+                cname.entry->records.empty()) {
+                return std::nullopt;
+            }
+            const auto* alias = std::get_if<RDataCNAME>(&cname.entry->records.front().rdata);
+            if (!alias) return std::nullopt;
+            r.response.answers.push_back(cname.entry->records.front());
+            name = alias->target;
+        }
+        return std::nullopt;
+    }
+
+    bool recently_failed(const Question& q) {
+        auto it = failed_recently.find(q);
+        if (it == failed_recently.end()) return false;
+        if (Clock::now() < it->second) return true;
+        failed_recently.erase(it);
+        return false;
+    }
+
+    /// The resolution is over: its outcome, unless stale data beats a failure.
+    void on_outcome(const std::shared_ptr<Delivery>& d, Outcome o) {
+        if (d->delivered) return;  // answered stale already; the cache has the fresh data now
+        if (!o) {
+            if (auto stale = stale_answer(d->question)) {
+                failed_recently[d->question] = Clock::now() + kFailureRecheck;
+                deliver(*d, std::move(*stale));
+                return;
+            }
+        }
+        deliver(*d, std::move(o));
+    }
+
+    /// Still resolving after stale_answer_after_ms: answer stale if we can,
+    /// and let the resolution carry on to refresh the cache.
+    void on_stale_timer(uint64_t id) {
+        auto it = deliveries.find(id);
+        if (it == deliveries.end()) return;
+        const std::shared_ptr<Delivery> d = it->second;
+        d->stale_timer                    = 0;
+        if (d->delivered) return;
+        if (auto stale = stale_answer(d->question)) deliver(*d, std::move(*stale));
+    }
+
+    void deliver(Delivery& d, Outcome o) {
+        d.delivered = true;
+        if (d.stale_timer) loop.cancel_timer(d.stale_timer);
+        d.stale_timer = 0;
+        if (o && o->stale) {
+            ++stats.stale_answers;
+            o->latency_us = elapsed_us(d.asked, Clock::now());
+        }
+        ResolveCallback done = std::move(d.done);
+        const uint64_t  id   = d.id;
+        deliveries.erase(id);
+        done(std::move(o));  // last: it may start new work or destroy the resolver
+    }
+
+    /// Refresh `q` in the background: a resolution that skips the cached
+    /// answer and leaves its result in the cache. One per question, at most
+    /// kMaxPrefetches at once. (Called by a client query being answered from
+    /// the cache, which is itself still in flight, so in_flight can't veto it.)
+    void prefetch(const Question& q) {
+        if (prefetching.contains(q) || prefetching.size() >= kMaxPrefetches) return;
+        prefetching.insert(q);
+        ++stats.prefetches;
+        const uint64_t id = spawn(q, std::make_shared<Budget>(), {}, [this, q](Outcome) { prefetching.erase(q); });
+        Task& t    = *tasks.at(id);
+        t.refresh  = true;
+        t.deadline = loop.add_timer(milliseconds(config.overall_deadline_ms), [this, id] {
+            if (Task* task = find(id)) {
+                task->deadline = 0;
+                finish(id, std::unexpected(ResolveError::Timeout));
+            }
+        });
     }
 
     void prime(PrimeCallback done) {
@@ -740,5 +1053,7 @@ void RecursiveResolver::resolve(const Question& question, ResolveCallback done) 
 void RecursiveResolver::prime_root(PrimeCallback done) { impl_->prime(std::move(done)); }
 
 void RecursiveResolver::on_spoof_alert(SpoofAlertFn alert) { impl_->spoof_alert = std::move(alert); }
+
+const ResolverStats& RecursiveResolver::stats() const { return impl_->stats; }
 
 }  // namespace dnsentinel::resolver

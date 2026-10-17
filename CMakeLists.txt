@@ -12,6 +12,7 @@ option(DNSENTINEL_ENABLE_ML     "Enable ML fast-path inference"   ON)
 option(DNSENTINEL_ENABLE_TESTS  "Build unit and integration tests" ON)
 option(DNSENTINEL_ENABLE_FUZZ   "Build fuzz targets"              OFF)
 option(DNSENTINEL_SANITIZERS    "Enable ASan + UBSan"             OFF)
+option(DNSENTINEL_WEAK_MODE     "Lab-only: allow deliberately weakened anti-spoofing (plan §5.10)" OFF)
 
 # ─── Dependencies ────────────────────────────────────────────────────────────
 find_package(OpenSSL REQUIRED)
@@ -73,6 +74,8 @@ add_library(dnsentinel_core STATIC
     core/net/event_loop.cpp
     core/net/udp_listener.cpp
     core/net/tcp_listener.cpp
+    core/net/tls.cpp
+    core/net/doh.cpp
 
     # Resolver
     core/resolver/recursive_resolver.cpp
@@ -123,13 +126,14 @@ target_link_libraries(dnsentinel_core PRIVATE yaml-cpp::yaml-cpp)
 
 # ─── DoT listener ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_DOT)
-    # target_sources(dnsentinel_core PRIVATE core/net/dot_listener.cpp)
+    # DoT is the TCP listener with TLS (core/net/tcp_listener.cpp, core/net/tls.cpp),
+    # always built: OpenSSL is required anyway. This only defines the macro.
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_DOT=1)
 endif()
 
 # ─── DoH listener ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_DOH)
-    # target_sources(dnsentinel_core PRIVATE core/net/doh_listener.cpp)
+    # DoH is the TCP listener with HTTP framing; always built, like DoT.
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_DOH=1)
 endif()
 
@@ -137,6 +141,14 @@ endif()
 if(DNSENTINEL_ENABLE_ML)
     # target_sources(dnsentinel_core PRIVATE core/ml/dga_classifier.cpp)
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_ML=1)
+endif()
+
+# ─── Weak mode (lab-only, plan §5.10) ───────────────────────────────────────
+# OFF by default: a release build literally cannot compile the weakening code,
+# so no configuration can turn the resolver's anti-spoofing off.
+if(DNSENTINEL_WEAK_MODE)
+    target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_WEAK_MODE=1)
+    message(WARNING "DNSENTINEL_WEAK_MODE is ON: this build is for the attack lab only, never for real use.")
 endif()
 
 # ─── Main executable ────────────────────────────────────────────────────────
@@ -154,11 +166,14 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/net/test_event_loop.cpp
         tests/unit/net/test_udp_listener.cpp
         tests/unit/net/test_tcp_listener.cpp
+        tests/unit/net/test_tls.cpp
+        tests/unit/net/test_doh.cpp
         tests/unit/cache/test_cache.cpp
         tests/unit/resolver/test_root_hints.cpp
         tests/unit/resolver/test_upstream.cpp
         tests/unit/resolver/test_recursive_resolver.cpp
         tests/unit/resolver/test_server_selection.cpp
+        tests/unit/resolver/test_weak_mode.cpp  # compiles to nothing unless DNSENTINEL_WEAK_MODE=ON
         # negative caching is tested in tests/unit/resolver/test_recursive_resolver.cpp
         tests/unit/security/test_bailiwick.cpp
         tests/unit/server/test_config.cpp

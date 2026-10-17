@@ -55,6 +55,13 @@ UpstreamClient::QueryId UpstreamClient::send(const sockaddr_in& server, Message 
     // arc4random is a CSPRNG (glibc >= 2.36 seeds it from getrandom()), so
     // the ID can't be predicted from earlier ones.
     p.txid = static_cast<uint16_t>(arc4random());
+#ifdef DNSENTINEL_WEAK_MODE
+    if (weak_.weaken) {  // lab-only: a predictable or low-entropy ID (plan §5.10)
+        const uint16_t mask = weak_.txid_bits >= 16 ? 0xFFFF
+                                                    : static_cast<uint16_t>((1u << weak_.txid_bits) - 1);
+        p.txid = static_cast<uint16_t>(weak_.sequential_txid ? weak_seq_++ : arc4random()) & mask;
+    }
+#endif
     if (!query.questions.empty()) p.question = query.questions.front();
     query.header.id = p.txid;
 
@@ -69,6 +76,17 @@ UpstreamClient::QueryId UpstreamClient::send(const sockaddr_in& server, Message 
 
     p.fd = socket(AF_INET, (tcp ? SOCK_STREAM : SOCK_DGRAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (p.fd < 0) return fail_soon();
+#ifdef DNSENTINEL_WEAK_MODE
+    if (weak_.weaken && weak_.fixed_source_port != 0 && !tcp) {  // lab-only: a known source port
+        const int reuse = 1;
+        setsockopt(p.fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+        sockaddr_in local{};
+        local.sin_family      = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_ANY);
+        local.sin_port        = htons(weak_.fixed_source_port);
+        if (bind(p.fd, reinterpret_cast<const sockaddr*>(&local), sizeof local) < 0) return fail_soon();
+    }
+#endif
     // connect() picks a random ephemeral source port and makes the kernel
     // drop datagrams from any other address or port. For TCP it starts the
     // handshake; the socket turns writable when that completes.

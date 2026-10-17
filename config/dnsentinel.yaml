@@ -43,6 +43,7 @@ cache:
     enabled: true
     stale_ttl: 30
     max_stale_age: 86400
+    answer_after_ms: 1800  # still resolving after this? answer stale meanwhile (RFC 8767); 0: only on failure
   prefetch:
     enabled: true
     threshold_pct: 10    # trigger when <10% TTL remaining

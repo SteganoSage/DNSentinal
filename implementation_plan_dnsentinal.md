@@ -791,6 +791,11 @@ A Scapy-based attack script (`lab/attacks/kaminsky.py`) that demonstrates the Ka
 > [!WARNING]
 > All poisoning attacks are run ONLY inside isolated network namespaces against our own resolver and our own fake authoritative server. Never against real resolvers or domains.
 
+**As built:**
+- **Weak mode is a compile-time flag, OFF by default** (`-DDNSENTINEL_WEAK_MODE=ON`, `core/include/dnsentinel/resolver/weak_mode.h`). A release build doesn't compile the weakening code at all, so no configuration can switch it on — a config with a `resolver.weak_mode:` section is simply rejected as an unknown setting. When on, the daemon prints a loud startup warning. The knobs: `txid_bits` (shrink the ID space, E5 part A), `sequential_txid` (predictable IDs, L0), `fixed_source_port` (L0–L1), `accept_out_of_bailiwick` (L0–L3, E5 part C). 0x20 and spoof detection use the ordinary `use_0x20` and `spoof_tcp_threshold` knobs, so the whole ladder L0–L5 is reachable.
+- **The attack** (`lab/attacks/kaminsky.py`, Python standard library, no Scapy dependency) builds its own isolated lab in a user+network namespace (`unshare -rn`): a root, a deliberately slow `lab` TLD, the real `target.lab` server, and the attacker's server. It fires a query for a random name under `target.lab`, then floods referrals spoofed from the TLD that re-delegate `target.lab` to its own name server, racing the slow real referral. If one forged packet matches the resolver's query, `www.target.lab` then resolves to the attacker's `6.6.6.6`.
+- **Measured here:** against a weak resolver (8-bit IDs, known fixed port, no 0x20) the first pass of 256 forged packets poisons it; a hardened resolver (16-bit random ID, random port) resists a 5,000-packet flood. The script runs the full E5 ladder and measurement later; this module delivers the hooks and the attack, verified end to end.
+
 ---
 
 ## 6. Phase 5 — Privacy & ML Integration (Weeks 9–10)
@@ -822,6 +827,13 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 - **Empty non-terminals:** A name like `example.in` might exist only as a delegation point, not as a name with records. Some broken servers return NXDOMAIN for such intermediate queries. If we get NXDOMAIN for a minimised query, try the next longer name. If that also fails, fall back to the full name for this zone.
 - **Extra round trips:** Minimisation adds one query per delegation step on a cold cache. But once zone cuts are cached (the normal case), the cost disappears because we already know where to go. We measure this cost in experiment E6.
 
+**As built (`resolver/recursive_resolver.cpp`; there is no separate `qname_minimisation.cpp`, it is part of the resolver's state machine):**
+- Minimised queries are `<zone cut + one label> NS?`. A referral, or the NS set in an authoritative answer (one server serving both sides of the cut), means a zone cut: descend. NODATA, or a CNAME, means none: the next query reveals more of the name. Only the zone that holds the name gets the full question, so when every step is a real zone cut there is no extra round trip at all.
+- NODATA for an intermediate name is cached as a negative `NS` entry, so later names under it skip that step.
+- **Fallback, simplified from the edge case above:** NXDOMAIN or an error rcode for a minimised query sends that zone the full name at once (starting with the same server), rather than first trying the next longer name. It costs at most one extra query per broken zone, and the full answer settles it. Each one is counted (`ResolverStats::minimisation_fallbacks`, for E6), as are minimised queries.
+- RFC 9156 §2.3 limits: the first 4 minimised steps reveal one label each, then labels come in larger steps, at most 10 minimised queries per name (long names such as under `ip6.arpa`).
+- The Kaminsky lab turns minimisation off: the E5 ladder measures ID, port and 0x20 entropy, so the raced question stays the full name.
+
 ### 6.2 Module: DoT Listener (`net/dot_listener.cpp`)
 
 **What it is:** DNS-over-TLS on port 853 (RFC 7858). Wraps the TCP DNS framing inside a TLS connection.
@@ -840,6 +852,12 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
   - **Plan:** buy one cheap domain, point a hostname (e.g. `dns.<domain>`) at the resolver's LAN IP, and get a Let's Encrypt certificate with the **DNS-01 challenge**, which works even though the resolver is not reachable from the internet.
   - The same domain can also host the optional real-internet tunnel endpoint (§6.7).
 
+**As built (`net/tls.cpp`, `net/tcp_listener.cpp`; no separate `dot_listener.cpp`):**
+- DoT is the TCP listener with TLS underneath, so DoT connections get exactly the TCP limits: 200 connections, 10 per client IP, the idle timeout (which also ends a handshake that never completes), and back-pressure (at most 32 queries in flight per connection). The listener delegates message framing to a small internal interface (`net/framing.h`), so DoH (§6.3) reuses the same socket, TLS, limits and timeouts with HTTP framing.
+- TLS 1.2 or newer, ALPN `dot` agreed when offered, no renegotiation; a client that disconnects without `close_notify` is just gone. Plain DNS on the DoT port is a failed handshake: the connection closes, counted in `tls_failed`.
+- Configuration: `listen.dot: { addr, cert, key }`, all three required; the certificate is loaded at startup and a bad one stops the daemon with a message naming the file (an encrypted key is refused rather than prompting for a password). TLS writes can raise SIGPIPE, which the daemon ignores.
+- `certs/make_certs.sh` makes the lab certificates: a local CA (made once, kept) and a server certificate it signs for localhost, 127.0.0.1, ::1 and any names or addresses given. The repo config points DoT at `certs/server.crt`, so run it before using that config.
+
 ### 6.3 Module: DoH Listener (`net/doh_listener.cpp`)
 
 **What it is:** DNS-over-HTTPS on port 443 (RFC 8484). DNS messages are carried inside HTTP requests.
@@ -855,6 +873,13 @@ To auth:  "www.private-clinic.example.in A?"     ← auth gets the full name (it
 - **Proper (HTTP/2):** Use the `nghttp2` library for HTTP/2 framing. More complex but protocol-correct. HTTP/2 multiplexes multiple queries over one connection, which is important for performance.
 
 **For Phase 5, start with HTTP/1.1 over TLS.** Upgrade to HTTP/2 with nghttp2 if time permits.
+
+**As built, HTTP/1.1 (`net/doh.cpp`; no separate `doh_listener.cpp`):**
+- DoH is the TCP listener (§6.2) with HTTP framing instead of DNS's length prefix, so it shares TLS, the connection limits, the idle timeout and back-pressure. Without a TLS context it serves plain HTTP (behind a reverse proxy, and for tests).
+- `GET <path>?dns=<base64url>` (padding tolerated) and `POST <path>` with `Content-Type: application/dns-message`; `listen.doh.path` defaults to `/dns-query`. Responses carry `Cache-Control: max-age` from the shortest answer TTL, or the SOA's negative TTL for NXDOMAIN/NODATA, and 0 for failures (RFC 8484 §5.1).
+- Keep-alive and pipelining: responses go back in request order (HTTP/1.1 can't match them up otherwise), so a fast answer waits for a slow one before it. `Connection: close` and HTTP/1.0 close after the response.
+- Errors: 404 (wrong path), 405 (other methods, with `Allow`), 415 (wrong content type), 400 (no or bad `dns` parameter, not a DNS query) keep the connection; 400 (bad request line or header), 505 (other HTTP versions), 501 (chunked bodies), 413 (body over 65 535 bytes) and 431 (headers over 8 KB) close it, since nothing after such a request can be trusted to be framed. Counted in `http_errors`.
+- TLS offers ALPN `http/1.1`; HTTP/2 follows as its own module (curl, browsers and `dig +https` prefer it).
 
 **How to test:** Firefox and Chrome can be configured with a custom DoH URL (`https://your-resolver-ip/dns-query`). This is the demo for DoH. The browser must trust the certificate: either reuse the Let's Encrypt certificate from §6.2, or, for a laptop-only setup, create a local CA with `mkcert` (which can issue certificates for IP addresses) and install it in the browser.
 
@@ -1017,6 +1042,11 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 - Stale entries are kept for `max_stale_age` (e.g. 1 day) beyond their original TTL, then truly evicted.
 - When a stale entry is served, launch a **background refresh** — the next query for this name should get fresh data if upstream has recovered.
 
+**As built (`cache/cache.cpp`, `resolver/recursive_resolver.cpp`; no separate `serve_stale.cpp`):**
+- The cache keeps expired entries until `max_stale_age` has passed (then drops them on sight) and hands them out only when asked for stale data, with TTL `stale_ttl` (30 s). Counted in `Cache::stale_hits()`.
+- The resolver answers stale, from the same CNAME/NXDOMAIN/NODATA walk as a cache answer, in three cases (RFC 8767): resolution failed; it is still under way after `cache.serve_stale.answer_after_ms` (1.8 s, the RFC's client-response timer, so a stub's own timeout doesn't fire first; 0 = only on failure), in which case resolution carries on and refreshes the cache; and for 30 s after such a failure, at once and without asking the upstream again (the RFC's failure-recheck timer, instead of hammering a dead server). Each client's callback still runs exactly once. Counted in `ResolverStats::stale_answers`; the daemon prints the totals at exit.
+- "Background refresh" needs no extra machinery: the next query for an expired name starts a resolution anyway (or, during the 30 s recheck window, after it).
+
 ### 7.2 Module: Prefetch
 
 **What it is:** When a popular cache entry is requested and it's near expiry (last 10% of TTL), answer from cache AND start a background refresh.
@@ -1026,6 +1056,7 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 - If `remaining_pct < 10` (configurable threshold) AND the entry has been hit multiple times (it's popular), set `needs_prefetch = true` in the lookup result.
 - The caller triggers a background resolution for this name. The result updates the cache entry with a new TTL.
 - From the user's perspective, popular names never expire — they always get a fast cache answer, and the cache is silently kept fresh.
+- **As built:** the cache flags `needs_prefetch` for an entry asked for at least twice that is in its last `threshold_pct` (10%) of TTL; the resolver, answering a client from the cache, then starts a background resolution that skips the cached answer and leaves the new one in the cache. One per name, at most 32 at once, counted in `ResolverStats::prefetches`. Wasted prefetches aren't counted yet.
 - **Optional O3 (§10)** builds on this background-refresh path: a learned model predicts each device's next names and requests them in advance, within a budget of extra upstream queries. Count prefetches (and later, wasted ones) from the start so the budget has something to measure.
 
 ### 7.3 Module: Query Log (`telemetry/query_log.cpp`)
@@ -1118,6 +1149,8 @@ Start with hand-tuned weights and thresholds. Optionally train a logistic regres
 | Optional experiments | E15–E17 | Only for whichever of O1–O3 were built (§10) |
 
 **Targets are frozen in week 6:** hypotheses and success criteria are reviewed and committed before the final runs (EVALUATION.md §9).
+
+**First step taken (simulation):** `sim/ns3/link_profiles.cc` is a pure ns-3 simulation of S1's question: DNS-sized lookups over the §3.4 link profiles, as plain UDP and as DoT/DoH on a new or a reused connection, with a stand-in server (`sim/ns3/run.sh` builds, runs and plots it; `sim/ns3/README.md` has the results). It shows the link effect only; the full S1 with the real resolver in ns-3 emulation mode still needs the lab.
 
 **Hooks the code must provide:**
 - **Weak mode for E5:** a lab-only compile-time option that shrinks the transaction-ID space, fixes the source port, and can switch off 0x20, bailiwick checks and spoof detection (the defence ladder L0–L5). Release builds can never be weakened by configuration.
