@@ -1,48 +1,98 @@
 # DGA classifier
 
-This directory contains the first DNSentinel ML component: an explainable
-Random Forest baseline over lexical features. It is offline-only for now; it
-does not change resolver behaviour.
+The resolver's fast-path detector (README §7.8.2) and its evaluation, EVALUATION.md E7.
+It scores the **registrable label** of a name (the part left of the public suffix:
+`example` in `x7kq2.example.co.uk`, `cvyh1po636` in `cvyh1po636.ddns.net`). The resolver
+will run the exported model (`final/`); everything here is offline.
 
-## Dataset format
+| File | |
+|---|---|
+| `psl.py` | Public Suffix List (`config/public_suffix_list.dat`, pinned), the same file the resolver reads |
+| `features.py` | The features (six groups), the n-gram models, TLD prior and word list; the reference for the C++ port |
+| `grams.py` | The same n-gram models fitted and scored on a whole dataset at once (the pipeline's fast path) |
+| `data.py` | Builds the dataset from pinned sources (`ml/DATA.md`) |
+| `pipeline.py` | Trains and evaluates every E7 split; writes metrics, figures and the final model |
+| `models.py`, `charcnn.py` | The candidate models and E7's baselines |
+| `metrics.py`, `plots.py`, `leaderboard.py` | Bootstrap CIs, McNemar's test, F8/F9, every run side by side |
+| `../notebooks/dga_pipeline.ipynb` | Runs all of it on Kaggle or Colab |
 
-Use a CSV with this header:
+## Run it
 
-```csv
-domain,label,family
-example.com,0,benign
-generated-dga.example,1,banjori
-```
+On Kaggle or Colab: open `ml/notebooks/dga_pipeline.ipynb`; its first cell lists the setup.
 
-The loader also accepts the headerless format used by the bundled
-`dga_domains_full.csv` dataset:
-
-```csv
-dga,gozi,mortiscontrastatim.com
-legit,alexa,plasticbags.sa.com
-```
-
-Here the columns are `label,family,domain`; labels may be `dga`/`legit`.
-
-`label=0` is benign and `label=1` is DGA. Keep the DGA family name so later
-evaluation can hold out an entire family rather than relying only on a random
-split.
-
-## Train
-
-From the repository root:
+Locally (`ml/requirements.txt`; about 10 GB of RAM for the full data):
 
 ```bash
-python -m ml.dga.train ml/data/dga.csv --output models/dga_rf.joblib
+python3 -m venv ~/dga-venv && ~/dga-venv/bin/pip install -r ml/requirements.txt
+~/dga-venv/bin/python -m ml.dga.data --out ml/data          # about 10 min: downloads + generation
+~/dga-venv/bin/python -m ml.dga.pipeline --mode cv          # or lofo, dictionary, future, external, final, all
+~/dga-venv/bin/python -m ml.dga.pipeline --mode lofo --models lgbm --features A A,B A,B,C   # an ablation
+~/dga-venv/bin/python -m ml.dga.leaderboard ml/runs         # every run so far, side by side
 ```
 
-Training requires `scikit-learn` and `joblib`. Generated model files are
-ignored by git. Do not train on random strings alone: include CDN-like benign
-domains and multiple real DGA families.
+`--fraction 0.05` runs on 5% of every family, for a quick look. `python -m ml.dga.data --out
+/tmp/smoke --smoke` makes a tiny made-up dataset with the same files, for trying the pipeline
+without the network.
 
-## Current limitation
+## What each mode answers
 
-The fallback public-suffix handling includes only common multi-label suffixes.
-Before production training, add a pinned Public Suffix List and pass it to the
-feature extractor, or integrate a PSL library. C++ export and resolver
-integration are the next milestones after dataset/evaluation work.
+| Mode | Train | Test | Output |
+|---|---|---|---|
+| `cv` | stratified 5-fold over benign + DGA | the held-out fold | F8, T4, McNemar |
+| `lofo` | every DGA family but one | the one left out | F9: recall per unseen family |
+| `dictionary` | all non-dictionary families | gozi, matsnu, nymaim2, suppobox | reported separately (E7) |
+| `future` | DGA names dated before `--cutoff` | names dated after it | drift over time |
+| `external` | all our data | Netlab 360's real names of families we generate | does it hold on real names |
+| `final` | everything | — | `dga_lgbm.txt`, `features.json`, `model.json` |
+
+Benign names are Tranco ranks beyond 100k (the top 100k are allowlisted and never scored),
+and by default only the **stable** ones: also in the Tranco lists of 6 and 12 months earlier.
+Throwaway and malicious names don't last a year, and in the tail they were most of the false
+alarms. `--benign all` uses the whole tail instead, to report alongside. Outside `cv`, the same
+20% of benign names is the test set in every mode.
+
+Every split is run the same way: 10% of the benign training names are held back; the fitted
+features are fitted on the rest (training names are scored leave-one-out, so they don't look
+more familiar than new ones); each model's threshold is set so that at most 0.1% (`--fpr`) of
+the held-back names are flagged; then the test names are judged.
+
+Each run writes `ml/runs/<tag>/f-<groups>/<mode>/`: `metrics.json` (every metric, overall and per
+family, with bootstrap 95% CIs), `run_info_<mode>.json` (settings, library versions, git
+commit, timings, headline numbers), `scores.npz` (every test score, for re-plotting with
+`python -m ml.dga.plots ml/runs`) and the figures.
+
+## Features
+
+| Group | Features | Fitted per split? |
+|---|---|---|
+| A, character statistics | `label_length`, `entropy`, `digit_ratio`, `vowel_ratio`, `consonant_ratio`, `longest_consonant_run`, `hex_ratio`, `distinct_ratio` | no |
+| B, benign language | `ngram_log_likelihood` (3-gram of benign labels), `tld_log_share` (how common the TLD is among benign names) | yes, on benign training names |
+| C, structure | `is_idn` (xn--), `letter_digit_switches`, `hyphens`, `longest_digit_run` | no |
+| D, words | `word_coverage` (share of the label covered by English words), `longest_word` | no (`config/english_words.txt`) |
+| E, more n-grams | `bigram_log_likelihood` (benign 2-gram), `dga_likelihood_ratio` (benign minus DGA 3-gram) | yes, on training names |
+| F, popularity | `label_in_allowlist` (the label is an allowlisted site's under another suffix: google.de) | no (the allowlist) |
+
+`--features A,B,C` picks groups; several sets (`--features A A,B A,B,C`) give one run each.
+
+## Models, and how we choose
+
+Candidates: **random forest**, three gradient-boosting libraries (**LightGBM**, **XGBoost**,
+scikit-learn's **HistGradientBoosting**, from comparable settings) and a **character CNN**
+(`--add-models cnn`, on a GPU). E7's baselines run alongside: an entropy threshold and the
+blocklist alone.
+
+Decided before the results:
+1. **Primary:** mean recall at 0.1% FPR on unseen families (`lofo`).
+2. It must hold on real names (`external`).
+3. A difference counts only if the bootstrap CIs and McNemar's test (p < 0.05) agree; otherwise
+   the smaller, faster model wins.
+4. It must fit E9 (≤ 50 µs per new name in C++). A CNN too slow for that would run only on the
+   names the boosted trees are unsure of (a cascade).
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests/ml -t .   # also run by ctest as ml_python
+```
+
+Tests that need scikit-learn or LightGBM skip where they aren't installed.

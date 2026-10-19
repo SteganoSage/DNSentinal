@@ -206,6 +206,12 @@ if(DNSENTINEL_ENABLE_TESTS)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/offline_e2e.py
                          $<TARGET_FILE:dnsentinel>)
         set_tests_properties(offline_e2e PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        # The DGA pipeline's Python tests; the ones that need scikit-learn or
+        # LightGBM skip themselves where those aren't installed.
+        add_test(NAME ml_python
+                 COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests/ml -t .
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(ml_python PROPERTIES TIMEOUT 300)
     endif()
 endif()
 

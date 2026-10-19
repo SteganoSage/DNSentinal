@@ -1,0 +1,11 @@
+# The ML pipeline (ml/dga), at the versions it was tested with.
+#   python3 -m venv .venv && .venv/bin/pip install -r ml/requirements.txt
+# Kaggle and Colab already have all of these; the notebook installs only
+# what is missing, and every run records the versions it used (run_info_*.json).
+numpy==2.5.4
+scikit-learn==1.9.1
+lightgbm==4.7.0
+xgboost==3.4.1
+matplotlib==3.11.2
+# Optional: the character-level CNN (--add-models cnn). Use a GPU build on a GPU machine.
+# torch==2.14.1
