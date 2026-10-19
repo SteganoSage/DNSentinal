@@ -7,5 +7,6 @@ scikit-learn==1.9.1
 lightgbm==4.7.0
 xgboost==3.4.1
 matplotlib==3.11.2
+optuna==5.0.0      # tune mode only
 # Optional: the character-level CNN (--add-models cnn). Use a GPU build on a GPU machine.
 # torch==2.14.1

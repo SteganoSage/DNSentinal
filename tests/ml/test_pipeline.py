@@ -49,5 +49,45 @@ class Pipeline(unittest.TestCase):
             self.assertIn("| main | ABCDEF | stable | lgbm |", (root / "runs" / "leaderboard.md").read_text())
 
 
+@unittest.skipIf(lightgbm is None, "needs lightgbm, scikit-learn and matplotlib (ml/requirements.txt)")
+class Tuning(unittest.TestCase):
+    def test_family_weights_even_out_families(self):
+        import numpy as np
+
+        from ml.dga import pipeline
+
+        family = np.array(["benign"] * 4 + ["big"] * 6 + ["small"] * 2, dtype=object)
+        y = np.array([0] * 4 + [1] * 8, dtype=np.int8)
+        data = type("D", (), {"family": family, "y": y})()
+        rows = np.arange(12)
+        self.assertIsNone(pipeline.family_weights(data, rows, 0.0))
+        w = pipeline.family_weights(data, rows, 1.0)
+        self.assertTrue(np.all(w[:4] == 1))
+        self.assertAlmostEqual(w[4:10].sum(), w[10:].sum())  # equal total weight per family
+        self.assertAlmostEqual(w[4:].sum(), 8)               # DGA total unchanged
+
+    def test_tune_then_use_the_settings(self):
+        try:
+            import optuna  # noqa: F401
+        except ImportError:
+            self.skipTest("needs optuna (ml/requirements.txt)")
+        from ml.dga import pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data.build_smoke(root / "data", per_family=60, benign=600)
+            with contextlib.redirect_stdout(io.StringIO()):
+                pipeline.main(["--mode", "tune", "--data", str(root / "data"), "--out", str(root / "runs"),
+                               "--models", "lgbm", "--trials", "3", "--threads", "2"])
+                best = root / "runs" / "main" / "f-ABCDE" / "tune" / "best_params.json"
+                self.assertIn("lgbm", json.loads(best.read_text()))
+                pipeline.main(["--mode", "dictionary", "--data", str(root / "data"), "--out", str(root / "runs"),
+                               "--models", "lgbm", "--params", str(best), "--bootstrap", "20",
+                               "--bootstrap-curve", "5", "--threads", "2"])
+            info = json.loads((root / "runs" / "main" / "f-ABCDE" / "dictionary" / "run_info_dictionary.json")
+                              .read_text())
+            self.assertEqual(info["params"]["lgbm"], json.loads(best.read_text())["lgbm"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ will run the exported model (`final/`); everything here is offline.
 | `pipeline.py` | Trains and evaluates every E7 split; writes metrics, figures and the final model |
 | `models.py`, `charcnn.py` | The candidate models and E7's baselines |
 | `metrics.py`, `plots.py`, `leaderboard.py` | Bootstrap CIs, McNemar's test, F8/F9, every run side by side |
+| `tune.py` | Phase 3: tunes LightGBM/XGBoost settings on training data only (`--mode tune`) |
 | `../notebooks/dga_pipeline.ipynb` | Runs all of it on Kaggle or Colab |
 
 ## Run it
@@ -88,6 +89,25 @@ Decided before the results:
    the smaller, faster model wins.
 4. It must fit E9 (≤ 50 µs per new name in C++). A CNN too slow for that would run only on the
    names the boosted trees are unsure of (a cascade).
+
+Phase 2 (2026-10-19, full data, features A-E): the three boosting libraries tied on unseen
+families (0.570-0.573 mean recall at 0.1% FPR; 0.81 at 1%); LightGBM was best on cross-validation
+and real names, and the smallest and fastest, so it is the model to tune and ship. Random forest
+was behind (0.553) and 80 times bigger.
+
+## Tuning (phase 3)
+
+```bash
+python -m ml.dga.pipeline --mode tune --models lgbm --trials 40 --timeout-hours 9
+python -m ml.dga.pipeline --mode all --params ml/runs/main/f-ABCDE/tune/best_params.json
+```
+
+The families are dealt into 5 groups and each trial trains 5 times, each time without one group:
+the leave-family-out question on training data only. The benign test names and the real
+(external) names are never used, so the runs made afterwards with the settings found stay
+honest. Besides the library's settings it searches `family_balance`, a training weight that
+evens out the families; settings that would make the model too big for the C++ fast path are
+skipped. The first trial is the current defaults, so the gain is measured on the same question.
 
 ## Tests
 

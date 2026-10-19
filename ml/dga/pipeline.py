@@ -10,6 +10,8 @@
     python -m ml.dga.pipeline --mode all
     python -m ml.dga.pipeline --mode lofo --features A A,B A,B,C,D,E,F   # one run per feature set
     python -m ml.dga.leaderboard ml/runs           # every run so far, side by side
+    python -m ml.dga.pipeline --mode tune --models lgbm --trials 40   # tune.py: phase 3
+    python -m ml.dga.pipeline --mode lofo --params best_params.json   # ...then use what it found
 
 Each run writes ml/runs/<tag>/f-<groups>/<mode>/: metrics.json (every
 metric, with bootstrap 95% intervals), scores.npz (every test score, for
@@ -51,6 +53,7 @@ from .data import read_csv
 from .features import (FEATURE_GROUPS, WORDS_PATH, DomainFeatures, FeatureContext, TldPrior, default_words,
                        label_features, split_name)
 from .grams import FittedGrams, GramIndex
+from .progress import log
 from .psl import default_list
 
 REPO = Path(__file__).resolve().parents[2]
@@ -59,14 +62,9 @@ COLUMN = {name: i for i, name in enumerate(NAMES)}
 MODES = ["cv", "lofo", "dictionary", "future", "external", "final"]
 # The candidates (models.py) and E7's baselines; --add-models cnn adds the
 # character CNN (on a GPU). final trains the chosen model only.
-DEFAULT_MODELS = {"final": "lgbm"}  # every other mode: below
+DEFAULT_MODELS = {"final": "lgbm"}  # final ignores --models; every other mode: below
 OTHER_MODELS = "lgbm,xgboost,histgb,rf,entropy,blocklist"
 
-_START = time.monotonic()  # not time.time(): the wall clock can jump (WSL resyncs it)
-
-
-def log(message: str) -> None:
-    print(f"[{time.monotonic() - _START:7.1f}s] {message}", flush=True)
 
 
 # ─── Data ───────────────────────────────────────────────────────────────────
@@ -218,13 +216,22 @@ def splits_for(mode: str, data: Dataset, args) -> list[Split]:
 class Features:
     """Feature matrices with the fitted columns filled in for a split's training names."""
 
-    def __init__(self, data: Dataset, context: FeatureContext, bigrams: bool) -> None:
+    def __init__(self, data: Dataset, context: FeatureContext, bigrams: bool, keep: int = 1) -> None:
         log("indexing n-grams")
         self.data, self.context = data, context
         self.trigrams = GramIndex(data.label, 3)
         self.bigrams = GramIndex(data.label, 2) if bigrams else None
+        self.keep, self._cache = keep, {}  # tuning revisits the same splits: keep their matrices
 
     def matrix(self, fit: np.ndarray) -> tuple[np.ndarray, dict]:
+        key = hashlib.sha1(np.ascontiguousarray(fit).tobytes()).hexdigest()
+        if key not in self._cache:
+            while len(self._cache) >= self.keep:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = self._compute(fit)
+        return self._cache[key]
+
+    def _compute(self, fit: np.ndarray) -> tuple[np.ndarray, dict]:
         data = self.data
         benign, dga = fit[data.y[fit] == 0], fit[data.y[fit] == 1]
         X = data.base.copy()
@@ -247,9 +254,26 @@ class Features:
                               allow_labels=self.context.allow_labels)
 
 
-def batch(data: Dataset, X: np.ndarray, columns: list[int], rows: np.ndarray) -> models.Batch:
+def batch(data: Dataset, X: np.ndarray, columns: list[int], rows: np.ndarray,
+          weight: np.ndarray | None = None) -> models.Batch:
     return models.Batch(X[np.ix_(rows, columns)], data.name[rows], data.blocked[rows], data.y[rows],
-                        X[rows, COLUMN["entropy"]])
+                        X[rows, COLUMN["entropy"]], weight)
+
+
+def family_weights(data: Dataset, rows: np.ndarray, balance: float) -> np.ndarray | None:
+    """Training weights that even out the DGA families: (median size / family size) ** balance.
+
+    0 leaves every name at weight 1; 1 gives every family the same total
+    weight. DGA weights are scaled to keep their sum, benign names stay at 1.
+    """
+    if not balance:
+        return None
+    weights = np.ones(len(rows))
+    dga = data.y[rows] == 1
+    _, where, counts = np.unique(data.family[rows][dga].astype(str), return_inverse=True, return_counts=True)
+    raw = (np.median(counts) / counts[where]) ** balance
+    weights[dga] = raw * (dga.sum() / raw.sum())
+    return weights
 
 
 def run_split(data: Dataset, split: Split, names: list[str], features: Features, columns: list[int], args) -> SplitResult:
@@ -259,10 +283,11 @@ def run_split(data: Dataset, split: Split, names: list[str], features: Features,
         benign, max(1, int(len(benign) * args.calibration)), replace=False))
     fit = np.setdiff1d(split.train, calibration)
     X, result.fitted_features = features.matrix(fit)
+    weight = family_weights(data, fit, args.params.get("family_balance", 0.0))
     for name in names:
-        model = models.make(name, args.seed, args.threads)
+        model = models.make(name, args.seed, args.threads, args.params.get(name))
         started = time.monotonic()
-        model.fit(batch(data, X, columns, fit))
+        model.fit(batch(data, X, columns, fit, weight))
         result.fit_seconds[name] = time.monotonic() - started
         if model.fixed_threshold is not None:
             result.thresholds[name] = model.fixed_threshold
@@ -496,9 +521,11 @@ def run_mode(mode: str, data: Dataset, features: Features, groups: list[str], ar
     started, clock = dt.datetime.now(dt.timezone.utc), time.monotonic()
     out = args.out / args.tag / f"f-{''.join(groups)}" / mode
     out.mkdir(parents=True, exist_ok=True)
-    wanted = (args.models or DEFAULT_MODELS.get(mode, OTHER_MODELS)).split(",")
-    if args.add_models and mode != "final":
-        wanted += [n for n in args.add_models.split(",") if n not in wanted]
+    if mode == "final":  # the deployable model, whatever --models compares
+        wanted = DEFAULT_MODELS["final"].split(",")
+    else:
+        wanted = (args.models or OTHER_MODELS).split(",")
+        wanted += [n for n in args.add_models.split(",") if n and n not in wanted]
     names = [n for n in wanted if models.available(n)]
     for missing in sorted(set(wanted) - set(names)):
         log(f"skipping {missing}: its library is not installed")
@@ -554,7 +581,7 @@ def run_mode(mode: str, data: Dataset, features: Features, groups: list[str], ar
 
     dataset_info = args.data / "dataset_info.json"
     info = {
-        "mode": mode, "tag": args.tag, "features": groups, "benign": args.benign,
+        "mode": mode, "tag": args.tag, "features": groups, "benign": args.benign, "params": args.params,
         "started": started.isoformat(timespec="seconds"), "seconds": round(time.monotonic() - clock, 1),
         "models": names, "rows": len(data), "args": {k: str(v) for k, v in vars(args).items()},
         "dataset": json.loads(dataset_info.read_text()) if dataset_info.exists() else {},
@@ -568,7 +595,7 @@ def run_mode(mode: str, data: Dataset, features: Features, groups: list[str], ar
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", choices=MODES + ["all"], required=True)
+    parser.add_argument("--mode", choices=MODES + ["all", "tune"], required=True)
     parser.add_argument("--data", type=Path, default=REPO / "ml" / "data")
     parser.add_argument("--out", type=Path, default=REPO / "ml" / "runs")
     parser.add_argument("--tag", default="main", help="experiment name: results go to <out>/<tag>/")
@@ -589,7 +616,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--bootstrap-curve", type=int, default=200, help="resamples for ROC/PR metrics")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 1)
+    parser.add_argument("--params", type=Path, help="JSON settings per model, e.g. tune mode's best_params.json")
+    parser.add_argument("--trials", type=int, default=40, help="tune mode: settings to try")
+    parser.add_argument("--timeout-hours", type=float, default=None, help="tune mode: stop starting trials after this")
     args = parser.parse_args(argv)
+    args.params = json.loads(args.params.read_text()) if args.params else {}
 
     if not (args.data / "dga_dataset.csv").exists():
         raise SystemExit(f"no {args.data / 'dga_dataset.csv'}: run python -m ml.dga.data --out {args.data}")
@@ -610,8 +641,14 @@ def main(argv: list[str] | None = None) -> None:
     log(f"{len(data):,} names: {int((data.y == 0).sum()):,} benign, {int((data.kind == 'dga').sum()):,} DGA "
         f"({len(set(data.family[(data.kind == 'dga') & ~data.external]))} families), "
         f"{int((data.kind == 'dictionary').sum()):,} dictionary, {int(data.external.sum()):,} external")
-    features = Features(data, context, bigrams=any("E" in groups for groups in feature_sets))
+    features = Features(data, context, bigrams=any("E" in groups for groups in feature_sets),
+                        keep=5 if args.mode == "tune" else 1)
     for groups in feature_sets:
+        if args.mode == "tune":
+            from .tune import tune
+
+            tune(data, features, groups, args)
+            continue
         for mode in modes:
             run_mode(mode, data, features, groups, args)
 

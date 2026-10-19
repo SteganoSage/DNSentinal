@@ -36,6 +36,7 @@ class Batch:
     blocked: np.ndarray       # bool: is the name on the blocklist snapshot
     y: np.ndarray | None = None
     entropy: np.ndarray | None = None  # for the entropy baseline, whatever features are selected
+    weight: np.ndarray | None = None   # per-row training weight (family balancing); None: all equal
 
 
 class Model:
@@ -65,15 +66,15 @@ def _pickled_size(model) -> int:
 class RandomForest(Model):
     name, title = "rf", "Random forest"
 
-    def __init__(self, seed: int, threads: int) -> None:
+    def __init__(self, seed: int, threads: int, params: dict | None = None) -> None:
         self.params = dict(n_estimators=100, max_depth=20, min_samples_leaf=5, max_features="sqrt",
-                           random_state=seed, n_jobs=threads)
+                           random_state=seed, n_jobs=threads) | (params or {})
         self.model = None
 
     def fit(self, batch: Batch) -> "RandomForest":
         from sklearn.ensemble import RandomForestClassifier
 
-        self.model = RandomForestClassifier(**self.params).fit(batch.X, batch.y)
+        self.model = RandomForestClassifier(**self.params).fit(batch.X, batch.y, sample_weight=batch.weight)
         return self
 
     def score(self, batch: Batch) -> np.ndarray:
@@ -90,16 +91,16 @@ class RandomForest(Model):
 class LightGBM(Model):
     name, title = "lgbm", "LightGBM"
 
-    def __init__(self, seed: int, threads: int) -> None:
+    def __init__(self, seed: int, threads: int, params: dict | None = None) -> None:
         self.params = dict(n_estimators=300, learning_rate=0.05, num_leaves=31, min_child_samples=50,
                            subsample=0.8, subsample_freq=1, reg_lambda=1.0, random_state=seed, n_jobs=threads,
-                           verbose=-1)
+                           verbose=-1) | (params or {})
         self.model = None
 
     def fit(self, batch: Batch) -> "LightGBM":
         from lightgbm import LGBMClassifier
 
-        self.model = LGBMClassifier(**self.params).fit(batch.X, batch.y)
+        self.model = LGBMClassifier(**self.params).fit(batch.X, batch.y, sample_weight=batch.weight)
         return self
 
     def score(self, batch: Batch) -> np.ndarray:
@@ -118,16 +119,16 @@ class LightGBM(Model):
 class XGBoost(Model):
     name, title = "xgboost", "XGBoost"
 
-    def __init__(self, seed: int, threads: int) -> None:
+    def __init__(self, seed: int, threads: int, params: dict | None = None) -> None:
         self.params = dict(n_estimators=300, learning_rate=0.05, max_leaves=31, max_depth=0, grow_policy="lossguide",
                            min_child_weight=1.0, subsample=0.8, reg_lambda=1.0, tree_method="hist",
-                           random_state=seed, n_jobs=threads)
+                           random_state=seed, n_jobs=threads) | (params or {})
         self.model = None
 
     def fit(self, batch: Batch) -> "XGBoost":
         from xgboost import XGBClassifier
 
-        self.model = XGBClassifier(**self.params).fit(batch.X, batch.y)
+        self.model = XGBClassifier(**self.params).fit(batch.X, batch.y, sample_weight=batch.weight)
         return self
 
     def score(self, batch: Batch) -> np.ndarray:
@@ -146,15 +147,15 @@ class XGBoost(Model):
 class HistGradientBoosting(Model):
     name, title = "histgb", "HistGradientBoosting"
 
-    def __init__(self, seed: int, threads: int) -> None:
+    def __init__(self, seed: int, threads: int, params: dict | None = None) -> None:
         self.params = dict(max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=50,
-                           l2_regularization=1.0, early_stopping=False, random_state=seed)
+                           l2_regularization=1.0, early_stopping=False, random_state=seed) | (params or {})
         self.model = None
 
     def fit(self, batch: Batch) -> "HistGradientBoosting":
         from sklearn.ensemble import HistGradientBoostingClassifier
 
-        self.model = HistGradientBoostingClassifier(**self.params).fit(batch.X, batch.y)
+        self.model = HistGradientBoostingClassifier(**self.params).fit(batch.X, batch.y, sample_weight=batch.weight)
         return self
 
     def score(self, batch: Batch) -> np.ndarray:
@@ -187,9 +188,10 @@ NAMES = [*_TREES, "cnn", *_BASELINES]
 _LIBRARY = {"rf": "sklearn", "lgbm": "lightgbm", "xgboost": "xgboost", "histgb": "sklearn", "cnn": "torch"}
 
 
-def make(name: str, seed: int, threads: int) -> Model:
+def make(name: str, seed: int, threads: int, params: dict | None = None) -> Model:
+    """A fresh model; params override a tree model's default settings (e.g. tuned ones)."""
     if name in _TREES:
-        return _TREES[name](seed, threads)
+        return _TREES[name](seed, threads, params)
     if name in _BASELINES:
         return _BASELINES[name]()
     if name == "cnn":
