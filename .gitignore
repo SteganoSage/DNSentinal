@@ -45,6 +45,7 @@ ml/data/*.gz
 !ml/data/README.md
 ml/data/cache/
 ml/runs/
+dga_results*.zip
 
 # ─── Downloaded block lists (config/lists/download_feeds.sh) ─────────────────
 config/lists/feeds/

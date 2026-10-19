@@ -98,10 +98,15 @@ def _write_trials(study, path) -> None:
     names = sorted({p for t in study.trials for p in t.params})
     with open(path, "w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["trial", "state", "value", "seconds", *names, "mean_fpr", "families_below_90"])
+        # value: complete trials only; a pruned trial's last report covers only the groups it got through
+        writer.writerow(["trial", "state", "value", "partial_value", "seconds", *names, "mean_fpr",
+                         "families_below_90"])
         for t in study.trials:
             seconds = (t.datetime_complete - t.datetime_start).total_seconds() if t.datetime_complete else ""
-            writer.writerow([t.number, t.state.name, "" if t.value is None else round(t.value, 5),
+            complete = t.state.name == "COMPLETE"
+            partial = t.intermediate_values[max(t.intermediate_values)] if t.intermediate_values else None
+            writer.writerow([t.number, t.state.name, round(t.value, 5) if complete else "",
+                             "" if complete or partial is None else round(partial, 5),
                              round(seconds, 1) if seconds != "" else "", *[t.params.get(n, "") for n in names],
                              t.user_attrs.get("mean_fpr", ""), t.user_attrs.get("families_below_90", "")])
 
@@ -150,8 +155,13 @@ def tune(data, features, groups: list[str], args) -> dict:
 
         def progress(study, trial, name=name):
             _write_trials(study, out / f"trials_{name}.csv")
-            value = "pruned" if trial.value is None else f"{trial.value:.4f}"
-            done = [t.value for t in study.trials if t.value is not None]
+            if trial.state.name == "COMPLETE":
+                value = f"{trial.value:.4f}"
+            elif trial.intermediate_values:  # Optuna keeps a pruned trial's last report as its value
+                value = f"pruned after {len(trial.intermediate_values)} of {GROUPS} groups"
+            else:
+                value = "skipped (too big)"
+            done = [t.value for t in study.trials if t.state.name == "COMPLETE"]
             log(f"tune {name} trial {trial.number}: {value}  {json.dumps(trial.params)}"
                 + (f"  (best {max(done):.4f})" if done else ""))
 

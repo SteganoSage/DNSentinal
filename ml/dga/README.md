@@ -109,6 +109,13 @@ honest. Besides the library's settings it searches `family_balance`, a training 
 evens out the families; settings that would make the model too big for the C++ fast path are
 skipped. The first trial is the current defaults, so the gain is measured on the same question.
 
+Result (2026-10-19, 40 trials on Kaggle): unseen-family recall at 0.1% FPR on the tuning folds
+went from 0.560 (defaults) to **0.601**, with more, smaller steps (500 trees, learning rate 0.011),
+45 leaves, strong L2 (10.4), 74% of features per tree and full family balancing; the best dozen
+trials all scored 0.59-0.60, so more trials would gain little. The settings, with where they
+came from, are in `params/lgbm_tuned.json`; the notebook uses them by default (`PARAMS`), and
+locally `--params ml/dga/params/lgbm_tuned.json`.
+
 ## Tests
 
 ```bash
