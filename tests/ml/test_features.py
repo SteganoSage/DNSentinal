@@ -60,6 +60,17 @@ class Features(unittest.TestCase):
         self.assertGreater(len(words), 40000)
         self.assertEqual(words.cover("travelinsurance")[0], len("travelinsurance"))
 
+    def test_rhythm(self):
+        from ml.dga.features import shape
+
+        self.assertEqual(shape("a3k-vo"), "vdc-cv")
+        even, clustered = extract_features("nafojeivo.kz"), extract_features("strength.com")
+        self.assertGreater(even.cv_alternation, 0.8)  # syllable-built: too regular
+        self.assertLess(clustered.cv_alternation, 0.4)
+        context = FeatureContext(rhythm=NgramModel(4).fit(shape(w) for w in ["strength", "example", "google"]))
+        self.assertLess(extract_features("x7k9q2.com", context).rhythm_log_likelihood,
+                        extract_features("examples.com", context).rhythm_log_likelihood)
+
     def test_allowlisted_label(self):
         context = FeatureContext(allow_labels=frozenset({"google"}))
         self.assertEqual(extract_features("google.de", context).label_in_allowlist, 1)

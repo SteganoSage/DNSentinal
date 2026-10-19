@@ -30,13 +30,13 @@ class Pipeline(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 pipeline.main(["--mode", "all", "--data", str(root / "data"), "--out", str(root / "runs"),
                                "--folds", "3", "--bootstrap", "50", "--bootstrap-curve", "5",
-                               "--cutoff", "2022-01-01", "--threads", "2", "--features", "A", "A,B,C,D,E,F",
+                               "--cutoff", "2022-01-01", "--threads", "2", "--features", "A", "A,B,C,D,E,F,G",
                                "--models", "lgbm,rf,entropy,blocklist"])
-            for groups in ("f-A", "f-ABCDEF"):
+            for groups in ("f-A", "f-ABCDEFG"):
                 for mode in pipeline.MODES:
                     info = json.loads((root / "runs" / "main" / groups / mode / f"run_info_{mode}.json").read_text())
                     self.assertEqual(info["mode"], mode)
-            runs = root / "runs" / "main" / "f-ABCDEF"
+            runs = root / "runs" / "main" / "f-ABCDEFG"
             cv = json.loads((runs / "cv" / "metrics.json").read_text())
             self.assertGreater(cv["models"]["lgbm"]["roc_auc"]["value"], 0.95)  # smoke data is easy
             self.assertIn("lgbm vs rf", cv["mcnemar"])
@@ -46,7 +46,9 @@ class Pipeline(unittest.TestCase):
             leaderboard = subprocess.run([sys.executable, "-m", "ml.dga.leaderboard", str(root / "runs")],
                                          capture_output=True, text=True)
             self.assertEqual(leaderboard.returncode, 0, leaderboard.stderr)
-            self.assertIn("| main | ABCDEF | stable | lgbm |", (root / "runs" / "leaderboard.md").read_text())
+            self.assertIn("| main | ABCDEFG | stable | lgbm |", (root / "runs" / "leaderboard.md").read_text())
+            features = json.loads((runs / "final" / "features.json").read_text())
+            self.assertEqual(set(features), {"ngram", "tld_prior", "bigram", "dga_ngram", "rhythm"})
 
 
 @unittest.skipIf(lightgbm is None, "needs lightgbm, scikit-learn and matplotlib (ml/requirements.txt)")
@@ -90,6 +92,10 @@ class Tuning(unittest.TestCase):
                                "--models", "lgbm", "--trials", "3", "--threads", "2"])
                 best = root / "runs" / "main" / "f-ABCDE" / "tune" / "best_params.json"
                 self.assertIn("lgbm", json.loads(best.read_text()))
+                tuned = json.loads(best.read_text())["tuned"]["lgbm"]
+                self.assertTrue(0 <= tuned["unseen"] <= 1 and 0 <= tuned["known"] <= 1)
+                header = (best.parent / "trials_lgbm.csv").read_text().splitlines()[0]
+                self.assertIn("unseen,known", header)
                 pipeline.main(["--mode", "dictionary", "--data", str(root / "data"), "--out", str(root / "runs"),
                                "--models", "lgbm", "--params", str(best), "--bootstrap", "20",
                                "--bootstrap-curve", "5", "--threads", "2"])

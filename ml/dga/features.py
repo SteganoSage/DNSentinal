@@ -18,8 +18,10 @@ D  words                  word_coverage, longest_word
 E  more fitted models     bigram_log_likelihood (benign 2-gram),
                           dga_likelihood_ratio (benign minus DGA 3-gram)
 F  popularity             label_in_allowlist
+G  rhythm                 cv_alternation, rhythm_log_likelihood (4-gram of
+                          the label's consonant/vowel shape, benign names)
 
-Groups B and E are fitted on training names only, per split; D and F look
+Groups B, E and G are fitted on training names only, per split; D and F look
 words and labels up in fixed lists. Deliberately independent of
 scikit-learn, and simple enough to reimplement exactly in C++ for the
 resolver's fast path (plan §6.4).
@@ -94,6 +96,21 @@ def _longest_run(value: str, belongs) -> int:
     return best
 
 
+def shape(label: str) -> str:
+    """The label's consonant/vowel rhythm: c consonant, v vowel, d digit, - anything else.
+
+    Real names have irregular clusters (str, ght, tion); syllable-built DGAs
+    such as pushdo's nafojeivo alternate too evenly, random ones too unevenly.
+    """
+    return "".join("v" if ch in _VOWELS else "c" if ch.isalpha() else "d" if ch.isdigit() else "-" for ch in label)
+
+
+def _alternation(label: str) -> float:
+    """The share of neighbouring letters (digits and hyphens skipped) that switch consonant <-> vowel."""
+    letters = [ch in _VOWELS for ch in label if ch.isalpha()]
+    return sum(a != b for a, b in zip(letters, letters[1:])) / max(len(letters) - 1, 1)
+
+
 def _switches(value: str) -> int:
     """How often the label switches between letters and digits (hyphens don't count)."""
     kinds = [char.isdigit() for char in value if char.isalnum()]
@@ -129,6 +146,9 @@ class DomainFeatures:
     dga_likelihood_ratio: float
     # F: popularity
     label_in_allowlist: int
+    # G: rhythm
+    cv_alternation: float
+    rhythm_log_likelihood: float
 
     def as_dict(self) -> dict[str, float | int]:
         return asdict(self)
@@ -149,6 +169,7 @@ FEATURE_GROUPS = {
     "D": ["word_coverage", "longest_word"],
     "E": ["bigram_log_likelihood", "dga_likelihood_ratio"],
     "F": ["label_in_allowlist"],
+    "G": ["cv_alternation", "rhythm_log_likelihood"],
 }
 assert sum(FEATURE_GROUPS.values(), []) == DomainFeatures.names()
 
@@ -294,6 +315,7 @@ class FeatureContext:
     bigram: NgramModel | None = None      # benign 2-gram (E)
     dga_ngram: NgramModel | None = None   # 3-gram of DGA training labels (E)
     allow_labels: frozenset[str] | None = None  # registrable labels of the allowlist (F)
+    rhythm: NgramModel | None = None      # 4-gram of benign labels' shapes (G)
 
 
 def label_features(label: str, suffix: str, context: FeatureContext | None = None) -> DomainFeatures:
@@ -323,6 +345,8 @@ def label_features(label: str, suffix: str, context: FeatureContext | None = Non
         bigram_log_likelihood=c.bigram.score(label) if c.bigram else 0.0,
         dga_likelihood_ratio=ngram - c.dga_ngram.score(label) if c.ngram and c.dga_ngram else 0.0,
         label_in_allowlist=int(label in c.allow_labels) if c.allow_labels is not None else 0,
+        cv_alternation=_alternation(label),
+        rhythm_log_likelihood=c.rhythm.score(shape(label)) if c.rhythm else 0.0,
     )
 
 

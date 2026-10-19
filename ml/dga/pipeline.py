@@ -51,7 +51,7 @@ import numpy as np
 from . import metrics, models
 from .data import read_csv
 from .features import (FEATURE_GROUPS, WORDS_PATH, DomainFeatures, FeatureContext, TldPrior, default_words,
-                       label_features, split_name)
+                       label_features, shape, split_name)
 from .grams import FittedGrams, GramIndex
 from .progress import log
 from .psl import default_list
@@ -216,11 +216,13 @@ def splits_for(mode: str, data: Dataset, args) -> list[Split]:
 class Features:
     """Feature matrices with the fitted columns filled in for a split's training names."""
 
-    def __init__(self, data: Dataset, context: FeatureContext, bigrams: bool, keep: int = 1) -> None:
+    def __init__(self, data: Dataset, context: FeatureContext, bigrams: bool, keep: int = 1,
+                 rhythm: bool = False) -> None:
         log("indexing n-grams")
         self.data, self.context = data, context
         self.trigrams = GramIndex(data.label, 3)
         self.bigrams = GramIndex(data.label, 2) if bigrams else None
+        self.shapes = GramIndex([shape(label) for label in data.label], 4) if rhythm else None
         self.keep, self._cache = keep, {}  # tuning revisits the same splits: keep their matrices
 
     def matrix(self, fit: np.ndarray) -> tuple[np.ndarray, dict]:
@@ -244,6 +246,9 @@ class Features:
             fitted["dga_ngram"] = self.trigrams.fit(dga)
             X[:, COLUMN["bigram_log_likelihood"]] = fitted["bigram"].score()
             X[:, COLUMN["dga_likelihood_ratio"]] = X[:, COLUMN["ngram_log_likelihood"]] - fitted["dga_ngram"].score()
+        if self.shapes is not None:
+            fitted["rhythm"] = self.shapes.fit(benign)
+            X[:, COLUMN["rhythm_log_likelihood"]] = fitted["rhythm"].score()
         return X, fitted
 
     def context_for(self, fitted: dict) -> FeatureContext:
@@ -251,7 +256,7 @@ class Features:
         as_model = {k: (v.model() if isinstance(v, FittedGrams) else v) for k, v in fitted.items()}
         return FeatureContext(ngram=as_model["ngram"], tld_prior=as_model["tld_prior"], words=self.context.words,
                               bigram=as_model.get("bigram"), dga_ngram=as_model.get("dga_ngram"),
-                              allow_labels=self.context.allow_labels)
+                              allow_labels=self.context.allow_labels, rhythm=as_model.get("rhythm"))
 
 
 def batch(data: Dataset, X: np.ndarray, columns: list[int], rows: np.ndarray,
@@ -442,6 +447,8 @@ def save_final(result: SplitResult, data: Dataset, features: Features, groups: l
     tables = {"ngram": context.ngram.state(), "tld_prior": context.tld_prior.state()}
     if context.bigram:
         tables.update(bigram=context.bigram.state(), dga_ngram=context.dga_ngram.state())
+    if context.rhythm:
+        tables.update(rhythm=context.rhythm.state())
     (out / "features.json").write_text(json.dumps(tables) + "\n")
     rows = result.split.train
     card = {
@@ -618,7 +625,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--params", type=Path, help="JSON settings per model, e.g. tune mode's best_params.json")
     parser.add_argument("--trials", type=int, default=40, help="tune mode: settings to try")
-    parser.add_argument("--timeout-hours", type=float, default=None, help="tune mode: stop starting trials after this")
+    parser.add_argument("--timeout-hours", type=float, default=None,
+                        help="tune mode: start no trial after this, shared by every feature set")
+    parser.add_argument("--unseen-weight", type=float, default=0.5,
+                        help="tune mode: weight of unseen-family recall in the objective (the rest: known families)")
     args = parser.parse_args(argv)
     args.params = json.loads(args.params.read_text()) if args.params else {}
 
@@ -638,16 +648,17 @@ def main(argv: list[str] | None = None) -> None:
     if "external" in modes:
         data = data.concat(load(args.data / "external_netlab.csv", context, blocked, args.benign, args.fraction,
                                 args.seed, external=True))
-    log(f"{len(data):,} names: {int((data.y == 0).sum()):,} benign, {int((data.kind == 'dga').sum()):,} DGA "
-        f"({len(set(data.family[(data.kind == 'dga') & ~data.external]))} families), "
-        f"{int((data.kind == 'dictionary').sum()):,} dictionary, {int(data.external.sum()):,} external")
+    ours = ~data.external
+    log(f"{len(data):,} names: {int((data.y == 0).sum()):,} benign, {int(((data.kind == 'dga') & ours).sum()):,} DGA "
+        f"({len(set(data.family[(data.kind == 'dga') & ours]))} families), "
+        f"{int(((data.kind == 'dictionary') & ours).sum()):,} dictionary, {int(data.external.sum()):,} external")
     features = Features(data, context, bigrams=any("E" in groups for groups in feature_sets),
-                        keep=5 if args.mode == "tune" else 1)
+                        keep=5 if args.mode == "tune" else 1, rhythm=any("G" in groups for groups in feature_sets))
     for groups in feature_sets:
         if args.mode == "tune":
             from .tune import tune
 
-            tune(data, features, groups, args)
+            tune(data, features, groups, args, len(feature_sets))
             continue
         for mode in modes:
             run_mode(mode, data, features, groups, args)

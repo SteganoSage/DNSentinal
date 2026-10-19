@@ -72,8 +72,12 @@ commit, timings, headline numbers), `scores.npz` (every test score, for re-plott
 | D, words | `word_coverage` (share of the label covered by English words), `longest_word` | no (`config/english_words.txt`) |
 | E, more n-grams | `bigram_log_likelihood` (benign 2-gram), `dga_likelihood_ratio` (benign minus DGA 3-gram) | yes, on training names |
 | F, popularity | `label_in_allowlist` (the label is an allowlisted site's under another suffix: google.de) | no (the allowlist) |
+| G, rhythm | `cv_alternation` (how evenly consonants and vowels alternate), `rhythm_log_likelihood` (4-gram of the label's consonant/vowel shape) | the second, on benign training names |
 
 `--features A,B,C` picks groups; several sets (`--features A A,B A,B,C`) give one run each.
+The ablation (2026-10-18) kept A-E: F added nothing. G was added after phase 3 for the families
+everything misses: syllable-built DGAs (pushdo `nafojeivo`, vawtrak, simda) alternate consonants
+and vowels more evenly than real names do, and hex ones (orchard `40e5720e`) less.
 
 ## Models, and how we choose
 
@@ -109,12 +113,14 @@ honest. Besides the library's settings it searches `family_balance`, a training 
 evens out the families; settings that would make the model too big for the C++ fast path are
 skipped. The first trial is the current defaults, so the gain is measured on the same question.
 
-Result (2026-10-19, 40 trials on Kaggle): unseen-family recall at 0.1% FPR on the tuning folds
-went from 0.560 (defaults) to **0.601**, with more, smaller steps (500 trees, learning rate 0.011),
-45 leaves, strong L2 (10.4), 74% of features per tree and full family balancing; the best dozen
-trials all scored 0.59-0.60, so more trials would gain little. The settings, with where they
-came from, are in `params/lgbm_tuned.json`; the notebook uses them by default (`PARAMS`), and
-locally `--params ml/dga/params/lgbm_tuned.json`.
+First round (2026-10-19, 40 trials, objective: unseen families only): 0.560 -> 0.601 on the
+tuning folds, and 0.570 -> 0.595 in the full leave-family-out run, but the settings it chose (a
+slow learning rate, strong regularisation, full family balancing) fit known families loosely:
+real names fell 0.624 -> 0.562, cross-validation 0.864 -> 0.783, later dates 0.909 -> 0.850.
+Switching balancing off recovered only a third of that. So the objective now asks both
+questions: each fold also holds back a fifth of the names of the families it trains on, and a
+trial scores `--unseen-weight` (0.5) x unseen-family recall + the rest x known-family recall.
+`params/lgbm_tuned.json` holds the first round's settings until the second round replaces them.
 
 ## Tests
 
