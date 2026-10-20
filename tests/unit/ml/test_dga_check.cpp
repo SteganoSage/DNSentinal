@@ -85,8 +85,10 @@ TEST_F(DgaCheckTest, SkipsWhatNoDgaRegisters) {
 TEST_F(DgaCheckTest, PopularSitesAreNeverScored) {
     auto check = make({"mdexmtiwmjia.info"});  // pretend it is popular
     EXPECT_FALSE(check.check(name("mail.mdexmtiwmjia.info")));
-    EXPECT_EQ(check.stats().allowlisted, 1u);
+    EXPECT_FALSE(check.check(name("mail.mdexmtiwmjia.info")));  // asked again: recalled, not split again
+    EXPECT_EQ(check.stats().allowlisted, 2u);
     EXPECT_EQ(check.stats().scored, 0u);
+    EXPECT_EQ(check.cached(), 0u);  // no verdict: nothing was judged
 }
 
 TEST_F(DgaCheckTest, VerdictsAreKeptPerRegistrableDomain) {

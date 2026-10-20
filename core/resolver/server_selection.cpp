@@ -60,7 +60,7 @@ ServerSelection::Address ServerSelection::pick(std::span<const Address> candidat
     for (Address a : candidates) {
         const Rank r = rank(a);
         if (best.empty() || r < best_rank) {
-            best      = {a};
+            best.assign(1, a);  // not "= {a}": GCC 13 -O2 falsely warns (-Warray-bounds) on that
             best_rank = r;
         } else if (r == best_rank) {
             best.push_back(a);

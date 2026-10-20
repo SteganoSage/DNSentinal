@@ -44,6 +44,8 @@ public:
     /// classify() in two steps, for callers that look the split name up first.
     [[nodiscard]] std::optional<SplitName> split(std::string_view domain) const { return split_name(domain, psl_); }
     [[nodiscard]] DgaVerdict               classify(const SplitName& name) const;
+    /// The model's inputs for a name already split (timing the stages: bench/dga_latency.cpp).
+    [[nodiscard]] std::vector<double> inputs(const SplitName& name) const;
 
     [[nodiscard]] double                          threshold() const { return threshold_; }
     void                                          set_threshold(double threshold) { threshold_ = threshold; }

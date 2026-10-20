@@ -148,6 +148,10 @@ if(DNSENTINEL_ENABLE_ML)
         core/ml/dga_check.cpp
     )
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_ML=1)
+    # Experiment E9's inference timing (bench/dga_latency.cpp). Time it in a
+    # Release build: cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
+    add_executable(dga_latency bench/dga_latency.cpp)
+    target_link_libraries(dga_latency PRIVATE dnsentinel_core)
 endif()
 
 # ─── Weak mode (lab-only, plan §5.10) ───────────────────────────────────────

@@ -52,30 +52,33 @@ std::expected<StringSet, std::string> DgaCheck::read_allowlist(const std::string
 }
 
 DgaCheck::DgaCheck(DgaClassifier model, StringSet allowlist, const DgaConfig& config)
-    : model_(std::move(model)), allowlist_(std::move(allowlist)), mode_(config.mode), capacity_(config.cache_size) {
+    : model_(std::move(model)),
+      allowlist_(std::move(allowlist)),
+      mode_(config.mode),
+      verdicts_(config.cache_size),
+      names_(config.cache_size) {
     if (config.threshold > 0) model_.set_threshold(config.threshold);
 }
 
 std::expected<DgaCheck, std::string> DgaCheck::load(const DgaConfig& config) {
     auto model = DgaClassifier::load(config.model, config.words);
     if (!model) return std::unexpected(model.error());
-    StringSet allowlist;
-    if (!config.allowlist.empty()) {
-        auto read = read_allowlist(config.allowlist);
-        if (!read) return std::unexpected(read.error());
-        allowlist = std::move(*read);
-    }
-    return DgaCheck(std::move(*model), std::move(allowlist), config);
+    if (config.allowlist.empty()) return DgaCheck(std::move(*model), StringSet{}, config);
+    auto allowlist = read_allowlist(config.allowlist);
+    if (!allowlist) return std::unexpected(allowlist.error());
+    return DgaCheck(std::move(*model), std::move(*allowlist), config);
 }
 
-void DgaCheck::remember(const DgaVerdict& verdict) {
-    if (capacity_ == 0) return;
-    if (order_.size() >= capacity_) {  // forget the least recently used
-        index_.erase(order_.front().registrable);
-        order_.pop_front();
+std::optional<DgaResult> DgaCheck::recall(Outcome& outcome) {
+    switch (outcome.kind) {
+    case Outcome::Kind::Skipped: ++stats_.skipped; return std::nullopt;
+    case Outcome::Kind::Popular: ++stats_.allowlisted; return std::nullopt;
+    case Outcome::Kind::Judged: break;
     }
-    order_.push_back(verdict);
-    index_.emplace(order_.back().registrable, std::prev(order_.end()));
+    verdicts_.find(outcome.verdict.registrable);  // its domain is in use too: keep the two caches ageing together
+    ++stats_.cache_hits;
+    if (outcome.verdict.dga) ++stats_.flagged;
+    return DgaResult{outcome.verdict, true};
 }
 
 std::optional<DgaResult> DgaCheck::check(const Name& qname) {
@@ -93,31 +96,35 @@ std::optional<DgaResult> DgaCheck::check(const Name& qname) {
         if (!text.empty()) text.push_back('.');
         text += label;
     }
+    if (Outcome* seen = names_.find(text)) return recall(*seen);  // asked before: one lookup
+
     const auto name = model_.split(text);
     if (!name) {
         ++stats_.skipped;
+        names_.insert(std::move(text), Outcome{Outcome::Kind::Skipped, {}});
         return std::nullopt;
     }
-    const std::string registrable = name->registrable();
+    std::string registrable = name->registrable();
     if (allowlist_.contains(registrable)) {
         ++stats_.allowlisted;
+        names_.insert(std::move(text), Outcome{Outcome::Kind::Popular, {}});
         return std::nullopt;
     }
 
     DgaResult result;
-    if (const auto hit = index_.find(registrable); hit != index_.end()) {
-        order_.splice(order_.end(), order_, hit->second);  // now the most recently used
+    if (const DgaVerdict* known = verdicts_.find(registrable)) {  // another name of a domain judged already
         ++stats_.cache_hits;
-        result = {*hit->second, true};
+        result = {*known, true};
     } else {
         result = {model_.classify(*name), false};
         ++stats_.scored;
-        remember(result.verdict);
+        verdicts_.insert(std::move(registrable), result.verdict);
     }
     if (result.verdict.dga) {
         ++stats_.flagged;
         stats_.flagged_new += !result.cached;
     }
+    names_.insert(std::move(text), Outcome{Outcome::Kind::Judged, result.verdict});
     return result;
 }
 

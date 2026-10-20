@@ -180,6 +180,10 @@ training kept apart), and scores each registrable domain once. A flagged domain 
 first time it is seen; in enforce mode its names get the blocked answer (`policy.block_response`)
 without going upstream. The daemon sums up at exit: names checked, scored, cached, flagged.
 
+Cost (experiment E9, `bench/README.md`): scoring a first-seen name takes 40.8 µs median in the
+resolver (target: 50 µs), a name seen before 0.34 µs; with the verdict cache the daemon answers
+3.6% fewer queries per second than with ML off.
+
 ## Tests
 
 ```bash

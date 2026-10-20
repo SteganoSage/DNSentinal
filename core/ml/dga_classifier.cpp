@@ -183,6 +183,10 @@ std::optional<std::vector<double>> DgaClassifier::inputs(std::string_view domain
     return select(label_features(name->label, name->suffix, tables_));
 }
 
+std::vector<double> DgaClassifier::inputs(const SplitName& name) const {
+    return select(label_features(name.label, name.suffix, tables_));
+}
+
 std::optional<std::string> DgaClassifier::registrable(std::string_view domain) const {
     const auto name = split_name(domain, psl_);
     if (!name) return std::nullopt;
