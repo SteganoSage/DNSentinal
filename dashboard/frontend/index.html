@@ -1,0 +1,1465 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DNSentinel — Cybersecurity Dashboard</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            slate: {
+              850: '#151f33',
+              950: '#070d19',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- React 18, React-DOM, and Babel Standalone for turnkey execution without Node.js -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body {
+      background-color: #070d19;
+      color: #f1f5f9;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    /* Custom scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div id="root"></div>
+
+  <!-- React 18 Application Script -->
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    // --- 1. HEADER COMPONENT ---
+    function Header({ activeTab, setActiveTab, activeAlertsCount }) {
+      const navItems = [
+        { id: 'overview', label: 'Overview', icon: '📊' },
+        { id: 'queries', label: 'DNS Queries', icon: '📑' },
+        { id: 'clients', label: 'Clients', icon: '💻' },
+        { id: 'alerts', label: 'Security Alerts', icon: '🛡️', badge: activeAlertsCount },
+        { id: 'settings', label: 'Settings', icon: '⚙️' },
+      ];
+
+      return (
+        <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-50">
+          {/* Sample Data Disclaimer Bar */}
+          <div className="bg-amber-950/80 border-b border-amber-800/60 px-4 py-1.5 text-xs text-amber-300 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+              <span className="font-semibold tracking-wide uppercase text-[11px] bg-amber-900/90 px-2 py-0.5 rounded border border-amber-700">
+                DEMO / SAMPLE DATA
+              </span>
+              <span className="text-amber-200/90 hidden sm:inline">
+                This dashboard displays clearly labelled simulated DNS queries and threat alerts for demonstration. Core resolver config is isolated.
+              </span>
+            </div>
+            <span className="text-[11px] text-amber-400 font-mono">SQLite Mode • Live Demo Sandbox</span>
+          </div>
+
+          {/* Main Navbar */}
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div className="flex items-center justify-between h-16">
+              <div className="flex items-center gap-3 cursor-pointer" onClick={() => setActiveTab('overview')}>
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-600 to-emerald-500 flex items-center justify-center shadow-lg shadow-cyan-950/50">
+                  <span className="text-white font-black text-xl">🛡️</span>
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-extrabold text-lg text-white tracking-tight">DNSentinel</span>
+                    <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 bg-cyan-950 text-cyan-400 border border-cyan-800 rounded">
+                      Gateway SOC
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400">Secure Recursive DNS Resolver & Threat Monitor</p>
+                </div>
+              </div>
+
+              {/* Navigation Tabs */}
+              <nav className="flex space-x-1 sm:space-x-2">
+                {navItems.map((item) => {
+                  const isActive = activeTab === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      onClick={() => setActiveTab(item.id)}
+                      className={`relative px-3 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-medium transition-all duration-150 flex items-center gap-1.5 ${
+                        isActive
+                          ? 'bg-slate-800 text-cyan-400 border border-slate-700 shadow-sm'
+                          : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                      }`}
+                    >
+                      <span>{item.icon}</span>
+                      <span>{item.label}</span>
+                      {item.badge !== undefined && item.badge > 0 && (
+                        <span className="ml-1 px-1.5 py-0.5 text-[10px] font-bold rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/40">
+                          {item.badge}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </nav>
+            </div>
+          </div>
+        </header>
+      );
+    }
+
+    // --- 2. METRIC CARD COMPONENT ---
+    function MetricCard({ title, value, subtext, icon, trend, color = 'cyan' }) {
+      const colorStyles = {
+        cyan: 'border-cyan-500/30 bg-cyan-950/20 text-cyan-400',
+        rose: 'border-rose-500/30 bg-rose-950/20 text-rose-400',
+        emerald: 'border-emerald-500/30 bg-emerald-950/20 text-emerald-400',
+        purple: 'border-purple-500/30 bg-purple-950/20 text-purple-400',
+      };
+
+      return (
+        <div className="bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl hover:border-slate-700 transition">
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-xs font-medium text-slate-400 uppercase tracking-wider">{title}</span>
+            <div className={`w-10 h-10 rounded-xl border flex items-center justify-center text-lg ${colorStyles[color]}`}>
+              {icon}
+            </div>
+          </div>
+          <div className="flex items-baseline gap-2">
+            <span className="text-3xl font-black tracking-tight text-white">{value}</span>
+            {trend && (
+              <span className={`text-xs font-semibold ${trend.positive ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {trend.value}
+              </span>
+            )}
+          </div>
+          {subtext && <p className="mt-2 text-xs text-slate-500">{subtext}</p>}
+        </div>
+      );
+    }
+
+    // --- 3. QUERY ACTIVITY CHART ---
+    function QueryChart({ points = [] }) {
+      if (!points || points.length === 0) {
+        return (
+          <div className="h-48 flex items-center justify-center text-slate-500 text-xs">
+            No activity points available to chart.
+          </div>
+        );
+      }
+
+      const maxVal = Math.max(...points.map((p) => p.total), 10);
+      const width = 600;
+      const height = 180;
+      const padding = 24;
+
+      const getX = (index) => padding + (index / (points.length - 1 || 1)) * (width - padding * 2);
+      const getY = (val) => height - padding - (val / maxVal) * (height - padding * 2);
+
+      const totalPath = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${getX(i)} ${getY(p.total)}`).join(' ');
+      const allowedPath = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${getX(i)} ${getY(p.allowed)}`).join(' ');
+      const blockedPath = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${getX(i)} ${getY(p.blocked)}`).join(' ');
+
+      const areaTotalPath = `${totalPath} L ${getX(points.length - 1)} ${height - padding} L ${getX(0)} ${height - padding} Z`;
+
+      return (
+        <div>
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="text-base font-semibold text-white">DNS Query Activity Timeline</h3>
+              <p className="text-xs text-slate-400">Total volume, allowed traffic, and blocked security threats</p>
+            </div>
+            <div className="flex items-center gap-4 text-xs">
+              <div className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-cyan-500"></span>
+                <span className="text-slate-300">Total</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+                <span className="text-slate-300">Allowed</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-rose-500"></span>
+                <span className="text-slate-300">Blocked</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="relative bg-slate-950/60 rounded-xl p-3 border border-slate-800/80">
+            <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-48 overflow-visible">
+              <line x1={padding} y1={padding} x2={width - padding} y2={padding} stroke="#334155" strokeDasharray="3 3" opacity="0.3" />
+              <line x1={padding} y1={height / 2} x2={width - padding} y2={height / 2} stroke="#334155" strokeDasharray="3 3" opacity="0.3" />
+              <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="#334155" opacity="0.6" />
+
+              <defs>
+                <linearGradient id="cyanGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.35" />
+                  <stop offset="100%" stopColor="#06b6d4" stopOpacity="0" />
+                </linearGradient>
+              </defs>
+
+              <path d={areaTotalPath} fill="url(#cyanGrad)" />
+              <path d={totalPath} fill="none" stroke="#06b6d4" strokeWidth="2.5" strokeLinecap="round" />
+              <path d={allowedPath} fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round" />
+              <path d={blockedPath} fill="none" stroke="#f43f5e" strokeWidth="2" strokeLinecap="round" />
+
+              {points.map((p, i) => (
+                <g key={i}>
+                  <circle cx={getX(i)} cy={getY(p.total)} r="3" fill="#06b6d4" />
+                  <circle cx={getX(i)} cy={getY(p.blocked)} r="3" fill="#f43f5e" />
+                </g>
+              ))}
+            </svg>
+
+            <div className="flex justify-between px-3 mt-2 text-[10px] text-slate-500 font-mono">
+              {points.map((p, i) => (
+                <span key={i}>{p.time_label}</span>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // --- 4. OVERVIEW PAGE ---
+    function Overview({ metrics, activity, recentQueries, onNavigate }) {
+      if (!metrics) {
+        return <div className="text-center p-12 text-slate-400">Loading DNSentinel metrics...</div>;
+      }
+
+      return (
+        <div className="space-y-6">
+          {/* Active Security Threat Callout */}
+          {metrics.active_alerts_count > 0 && (
+            <div className="bg-gradient-to-r from-rose-950/60 to-slate-900 border border-rose-800/80 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-lg shadow-rose-950/20">
+              <div className="flex items-center gap-3">
+                <span className="w-10 h-10 rounded-xl bg-rose-600/20 border border-rose-500/40 flex items-center justify-center text-rose-400 text-xl">
+                  ⚠️
+                </span>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-bold text-rose-300">
+                      {metrics.active_alerts_count} Active Security Threats Detected
+                    </span>
+                    <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 bg-rose-900/60 text-rose-300 rounded border border-rose-700">
+                      Action Recommended
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-300 mt-0.5">
+                    DGA botnet domains and covert DNS tunneling channels have been flagged and blocked.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => onNavigate('alerts')}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-lg shadow transition flex items-center gap-1.5 whitespace-nowrap"
+              >
+                Inspect Alerts →
+              </button>
+            </div>
+          )}
+
+          {/* 4 Metric Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <MetricCard
+              title="Total DNS Queries"
+              value={metrics.total_queries.toLocaleString()}
+              subtext={`${metrics.allowed_queries} allowed • ${metrics.blocked_queries} blocked`}
+              icon="🌐"
+              color="cyan"
+            />
+            <MetricCard
+              title="Blocked Queries"
+              value={metrics.blocked_queries.toLocaleString()}
+              subtext={`${metrics.block_rate_percent}% overall block rate`}
+              icon="🛡️"
+              color="rose"
+              trend={{ value: `${metrics.block_rate_percent}% filtered`, positive: false }}
+            />
+            <MetricCard
+              title="Cache Hit Ratio"
+              value={`${(metrics.cache_hit_ratio * 100).toFixed(1)}%`}
+              subtext={`${metrics.cache_hits} hits • ${metrics.cache_misses} misses`}
+              icon="⚡"
+              color="emerald"
+              trend={{ value: 'Sub-ms response', positive: true }}
+            />
+            <MetricCard
+              title="Average Latency"
+              value={`${metrics.avg_latency_ms} ms`}
+              subtext="Recursive + cache speed"
+              icon="⏱️"
+              color="purple"
+            />
+          </div>
+
+          {/* Activity Chart & Threats Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl">
+              <QueryChart points={activity?.points || []} />
+            </div>
+
+            <div className="bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl flex flex-col justify-between">
+              <div>
+                <h3 className="text-base font-semibold text-white mb-1">Defense Interceptions</h3>
+                <p className="text-xs text-slate-400 mb-4">Sample attack mitigation breakdown</p>
+
+                <div className="space-y-3.5">
+                  <div>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-slate-300 font-medium">DGA Malware Domains</span>
+                      <span className="text-rose-400 font-mono font-semibold">41%</span>
+                    </div>
+                    <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                      <div className="h-full bg-rose-500 rounded-full" style={{ width: '41%' }}></div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-slate-300 font-medium">Covert DNS Tunnels</span>
+                      <span className="text-amber-400 font-mono font-semibold">28%</span>
+                    </div>
+                    <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                      <div className="h-full bg-amber-500 rounded-full" style={{ width: '28%' }}></div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-slate-300 font-medium">CNAME Cloaking Trackers</span>
+                      <span className="text-purple-400 font-mono font-semibold">19%</span>
+                    </div>
+                    <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                      <div className="h-full bg-purple-500 rounded-full" style={{ width: '19%' }}></div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-slate-300 font-medium">DNS Rebinding Exploits</span>
+                      <span className="text-cyan-400 font-mono font-semibold">12%</span>
+                    </div>
+                    <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                      <div className="h-full bg-cyan-500 rounded-full" style={{ width: '12%' }}></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-5 pt-4 border-t border-slate-800 text-xs text-slate-400 flex items-center justify-between">
+                <span>Resolver Mode:</span>
+                <span className="text-emerald-400 font-medium flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400"></span> Active (Recursive)
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Recent Queries Preview */}
+          <div className="bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-base font-semibold text-white">Recent DNS Queries Stream</h3>
+                <p className="text-xs text-slate-400">Real-time inspection of client requests</p>
+              </div>
+              <button
+                onClick={() => onNavigate('queries')}
+                className="text-xs text-cyan-400 hover:text-cyan-300 font-semibold flex items-center gap-1"
+              >
+                View Full Query Log ({metrics.total_queries}) →
+              </button>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-950/60 text-slate-400 uppercase tracking-wider text-[11px] border-b border-slate-800">
+                  <tr>
+                    <th className="py-2.5 px-3">Time</th>
+                    <th className="py-2.5 px-3">Client</th>
+                    <th className="py-2.5 px-3">Domain (QNAME)</th>
+                    <th className="py-2.5 px-3">Type</th>
+                    <th className="py-2.5 px-3">Latency</th>
+                    <th className="py-2.5 px-3">Cache</th>
+                    <th className="py-2.5 px-3">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 font-mono">
+                  {(recentQueries || []).slice(0, 6).map((q) => (
+                    <tr key={q.id} className="hover:bg-slate-800/40 transition">
+                      <td className="py-2.5 px-3 text-slate-400 whitespace-nowrap">
+                        {q.timestamp.split('T')[1]?.slice(0, 8) || q.timestamp}
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-300">
+                        <span className="text-white font-sans">{q.client_name}</span>
+                        <span className="block text-[10px] text-slate-500">{q.client_ip}</span>
+                      </td>
+                      <td className="py-2.5 px-3 text-cyan-300 font-semibold max-w-[200px] truncate">
+                        {q.qname}
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-300">{q.qtype}</td>
+                      <td className="py-2.5 px-3 text-slate-300">{q.latency_ms} ms</td>
+                      <td className="py-2.5 px-3">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                            q.cache_status === 'HIT'
+                              ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/60'
+                              : 'bg-slate-800 text-slate-400'
+                          }`}
+                        >
+                          {q.cache_status}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            q.policy_action === 'BLOCK'
+                              ? 'bg-rose-950 text-rose-400 border border-rose-800/60'
+                              : 'bg-emerald-950 text-emerald-400 border border-emerald-800/60'
+                          }`}
+                        >
+                          {q.policy_action}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // --- 5. DNS QUERIES PAGE ---
+    function DnsQueries({
+      queries,
+      total,
+      page,
+      limit,
+      onPageChange,
+      onSearchChange,
+      statusFilter,
+      onStatusFilterChange,
+      qtypeFilter,
+      onQtypeFilterChange,
+      onSimulateQuery,
+    }) {
+      const [searchTerm, setSearchTerm] = useState('');
+      const [simDomain, setSimDomain] = useState('');
+      const [selectedQuery, setSelectedQuery] = useState(null);
+      const [isSimulating, setIsSimulating] = useState(false);
+
+      const handleSearchSubmit = (e) => {
+        e.preventDefault();
+        onSearchChange(searchTerm);
+      };
+
+      const handleSimulate = async (e) => {
+        e.preventDefault();
+        if (!simDomain.trim()) return;
+        setIsSimulating(true);
+        await onSimulateQuery(simDomain.trim());
+        setSimDomain('');
+        setIsSimulating(false);
+      };
+
+      const totalPages = Math.ceil(total / limit) || 1;
+
+      return (
+        <div className="space-y-6">
+          {/* Page Title & Simulator Box */}
+          <div className="bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4">
+              <div>
+                <h2 className="text-xl font-bold text-white">DNS Queries Log</h2>
+                <p className="text-xs text-slate-400">
+                  Inspect recursive resolutions, cache hits, latency, and firewall block decisions
+                </p>
+              </div>
+
+              {/* Interactive Simulation Form */}
+              <form onSubmit={handleSimulate} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="Test domain (e.g. evil-dga.biz)..."
+                  value={simDomain}
+                  onChange={(e) => setSimDomain(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 w-56 font-mono"
+                />
+                <button
+                  type="submit"
+                  disabled={isSimulating}
+                  className="px-3 py-1.5 bg-gradient-to-r from-cyan-600 to-emerald-600 hover:from-cyan-500 hover:to-emerald-500 text-white text-xs font-semibold rounded-lg shadow transition disabled:opacity-50 whitespace-nowrap"
+                >
+                  {isSimulating ? 'Testing...' : '⚡ Test Query'}
+                </button>
+              </form>
+            </div>
+
+            {/* Filter & Search Bar */}
+            <div className="flex flex-col sm:flex-row gap-3 pt-4 border-t border-slate-800">
+              <form onSubmit={handleSearchSubmit} className="flex-1 flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Search domain or client (e.g. github, 192.168.1.10)..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                />
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg transition"
+                >
+                  Search
+                </button>
+              </form>
+
+              <div className="flex gap-2">
+                <select
+                  value={statusFilter}
+                  onChange={(e) => onStatusFilterChange(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500"
+                >
+                  <option value="">All Statuses</option>
+                  <option value="ALLOW">Allowed</option>
+                  <option value="BLOCK">Blocked</option>
+                </select>
+
+                <select
+                  value={qtypeFilter}
+                  onChange={(e) => onQtypeFilterChange(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500"
+                >
+                  <option value="">All Types</option>
+                  <option value="A">A (IPv4)</option>
+                  <option value="AAAA">AAAA (IPv6)</option>
+                  <option value="TXT">TXT</option>
+                  <option value="CNAME">CNAME</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          {/* Table */}
+          <div className="bg-slate-900/90 rounded-2xl border border-slate-800 shadow-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-950/80 text-slate-400 uppercase tracking-wider text-[11px] border-b border-slate-800">
+                  <tr>
+                    <th className="py-3 px-4">Time</th>
+                    <th className="py-3 px-4">Client</th>
+                    <th className="py-3 px-4">Domain (QNAME)</th>
+                    <th className="py-3 px-4">Type</th>
+                    <th className="py-3 px-4">RCode</th>
+                    <th className="py-3 px-4">Proto</th>
+                    <th className="py-3 px-4">Latency</th>
+                    <th className="py-3 px-4">Cache</th>
+                    <th className="py-3 px-4">Decision</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 font-mono">
+                  {queries.length === 0 ? (
+                    <tr>
+                      <td colSpan="9" className="py-8 text-center text-slate-500 font-sans">
+                        No DNS queries found matching your filters.
+                      </td>
+                    </tr>
+                  ) : (
+                    queries.map((q) => (
+                      <tr
+                        key={q.id}
+                        onClick={() => setSelectedQuery(q)}
+                        className="hover:bg-slate-800/50 cursor-pointer transition"
+                      >
+                        <td className="py-3 px-4 text-slate-400 whitespace-nowrap">
+                          {q.timestamp.split('T')[1]?.slice(0, 8) || q.timestamp}
+                        </td>
+                        <td className="py-3 px-4 text-slate-300">
+                          <span className="text-white font-sans font-medium block">{q.client_name}</span>
+                          <span className="text-[10px] text-slate-500">{q.client_ip}</span>
+                        </td>
+                        <td className="py-3 px-4 text-cyan-300 font-semibold max-w-[240px] truncate">
+                          {q.qname}
+                          {q.block_reason && (
+                            <span className="block text-[10px] text-rose-400 font-sans truncate font-normal">
+                              {q.block_reason}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 text-slate-300">{q.qtype}</td>
+                        <td className="py-3 px-4">
+                          <span
+                            className={`text-[11px] font-bold ${
+                              q.rcode === 'NOERROR'
+                                ? 'text-emerald-400'
+                                : q.rcode === 'NXDOMAIN'
+                                ? 'text-amber-400'
+                                : 'text-rose-400'
+                            }`}
+                          >
+                            {q.rcode}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4">
+                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300 border border-slate-700">
+                            {q.protocol}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 text-slate-300">{q.latency_ms} ms</td>
+                        <td className="py-3 px-4">
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                              q.cache_status === 'HIT'
+                                ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/60'
+                                : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {q.cache_status}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              q.policy_action === 'BLOCK'
+                                ? 'bg-rose-950 text-rose-400 border border-rose-800/60'
+                                : 'bg-emerald-950 text-emerald-400 border border-emerald-800/60'
+                            }`}
+                          >
+                            {q.policy_action}
+                          </span>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination */}
+            <div className="bg-slate-950/60 px-4 py-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
+              <span>
+                Showing page <span className="text-white font-semibold">{page}</span> of{' '}
+                <span className="text-white font-semibold">{totalPages}</span> ({total} total queries)
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onPageChange(page - 1)}
+                  disabled={page <= 1}
+                  className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-40 transition"
+                >
+                  Previous
+                </button>
+                <button
+                  onClick={() => onPageChange(page + 1)}
+                  disabled={page >= totalPages}
+                  className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-40 transition"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Modal */}
+          {selectedQuery && (
+            <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl">🔍</span>
+                    <h3 className="text-base font-bold text-white">DNS Query Inspection</h3>
+                  </div>
+                  <button
+                    onClick={() => setSelectedQuery(null)}
+                    className="text-slate-400 hover:text-white text-lg font-bold"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <div className="space-y-3 text-xs">
+                  <div>
+                    <span className="text-slate-500 block">Requested Domain (QNAME)</span>
+                    <span className="text-cyan-400 font-mono font-bold text-sm break-all">
+                      {selectedQuery.qname}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 bg-slate-950 p-3 rounded-xl border border-slate-800 font-mono">
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Client Hostname</span>
+                      <span className="text-white font-sans">{selectedQuery.client_name}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Client IP</span>
+                      <span className="text-white">{selectedQuery.client_ip}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Record Type</span>
+                      <span className="text-white">{selectedQuery.qtype}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Transport Protocol</span>
+                      <span className="text-white">{selectedQuery.protocol}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Response Code</span>
+                      <span className="text-white">{selectedQuery.rcode}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Resolution Latency</span>
+                      <span className="text-white">{selectedQuery.latency_ms} ms</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Cache Engine</span>
+                      <span className="text-white">{selectedQuery.cache_status}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px]">Policy Action</span>
+                      <span className="text-white font-bold">{selectedQuery.policy_action}</span>
+                    </div>
+                  </div>
+
+                  {selectedQuery.block_reason && (
+                    <div className="bg-rose-950/40 border border-rose-800/80 rounded-xl p-3">
+                      <span className="text-rose-400 font-bold block mb-1">Defense Interception Reason</span>
+                      <p className="text-rose-200 text-xs">{selectedQuery.block_reason}</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="pt-2 flex justify-end">
+                  <button
+                    onClick={() => setSelectedQuery(null)}
+                    className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-xs font-semibold transition"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // --- 6. CLIENTS PAGE ---
+    function Clients({ clients = [] }) {
+      const [filterRisk, setFilterRisk] = useState('');
+      const [searchTerm, setSearchTerm] = useState('');
+
+      const filteredClients = clients.filter((c) => {
+        const matchesRisk = filterRisk ? c.risk_level === filterRisk : true;
+        const matchesSearch = searchTerm
+          ? c.hostname.toLowerCase().includes(searchTerm.toLowerCase()) || c.ip.includes(searchTerm)
+          : true;
+        return matchesRisk && matchesSearch;
+      });
+
+      const getDeviceIcon = (type) => {
+        switch (type.toLowerCase()) {
+          case 'desktop': return '🖥️';
+          case 'laptop': return '💻';
+          case 'mobile': return '📱';
+          case 'iot gateway': return '📡';
+          default: return '🔌';
+        }
+      };
+
+      const getRiskStyle = (risk) => {
+        switch (risk.toLowerCase()) {
+          case 'high': return 'bg-rose-950 text-rose-400 border-rose-800/80';
+          case 'medium': return 'bg-amber-950 text-amber-400 border-amber-800/80';
+          default: return 'bg-emerald-950 text-emerald-400 border-emerald-800/60';
+        }
+      };
+
+      return (
+        <div className="space-y-6">
+          <div className="bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-bold text-white">Network Clients & Devices</h2>
+                <p className="text-xs text-slate-400">
+                  Per-device DNS resolution volume, threat assessments, and security posture
+                </p>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <input
+                  type="text"
+                  placeholder="Search hostname or IP..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 w-48 font-mono"
+                />
+                <select
+                  value={filterRisk}
+                  onChange={(e) => setFilterRisk(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-cyan-500"
+                >
+                  <option value="">All Risk Levels</option>
+                  <option value="High">High Risk</option>
+                  <option value="Medium">Medium Risk</option>
+                  <option value="Low">Low Risk</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+            {filteredClients.map((client) => {
+              const blockRate = client.total_queries > 0
+                ? Math.round((client.blocked_queries / client.total_queries) * 100)
+                : 0;
+
+              return (
+                <div
+                  key={client.ip}
+                  className="bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl hover:border-slate-700 transition flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex items-center gap-3">
+                        <span className="w-11 h-11 rounded-xl bg-slate-800 flex items-center justify-center text-xl shadow-inner">
+                          {getDeviceIcon(client.device_type)}
+                        </span>
+                        <div>
+                          <h3 className="text-sm font-bold text-white tracking-tight">{client.hostname}</h3>
+                          <span className="text-xs text-cyan-400 font-mono">{client.ip}</span>
+                        </div>
+                      </div>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${getRiskStyle(client.risk_level)}`}>
+                        {client.risk_level} Risk
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 text-xs text-slate-400 mb-4">
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px]">
+                        {client.device_type}
+                      </span>
+                      <span className="flex items-center gap-1 text-[11px] text-emerald-400">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                        {client.status}
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800/80 mb-3 space-y-2">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-slate-400">Total Queries</span>
+                        <span className="text-white font-mono font-bold">{client.total_queries}</span>
+                      </div>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-slate-400">Threats Blocked</span>
+                        <span className="text-rose-400 font-mono font-bold">
+                          {client.blocked_queries} ({blockRate}%)
+                        </span>
+                      </div>
+                      <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full ${
+                            blockRate > 30 ? 'bg-rose-500' : blockRate > 10 ? 'bg-amber-500' : 'bg-emerald-500'
+                          }`}
+                          style={{ width: `${Math.min(100, Math.max(5, blockRate))}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 border-t border-slate-800 text-[11px] text-slate-500 flex justify-between items-center">
+                    <span>Last active</span>
+                    <span className="font-mono text-slate-400">
+                      {client.last_seen.split('T')[1]?.slice(0, 8) || 'Just now'}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // --- 7. SECURITY ALERTS PAGE ---
+    function SecurityAlerts({ alerts = [], onDismiss, onToggleMitigate }) {
+      const [filterSeverity, setFilterSeverity] = useState('');
+      const [filterThreat, setFilterThreat] = useState('');
+
+      const filteredAlerts = alerts.filter((a) => {
+        const matchesSev = filterSeverity ? a.severity === filterSeverity : true;
+        const matchesThreat = filterThreat ? a.threat_type === filterThreat : true;
+        return matchesSev && matchesThreat;
+      });
+
+      const getSeverityBadge = (sev) => {
+        switch (sev.toLowerCase()) {
+          case 'critical': return 'bg-rose-950 text-rose-300 border-rose-700';
+          case 'high': return 'bg-orange-950 text-orange-300 border-orange-700';
+          case 'medium': return 'bg-amber-950 text-amber-300 border-amber-700';
+          default: return 'bg-blue-950 text-blue-300 border-blue-700';
+        }
+      };
+
+      return (
+        <div className="space-y-6">
+          <div className="bg-slate-900/90 rounded-2xl border border-slate-800 p-5 shadow-xl">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-xl font-bold text-white">Security Threat Intelligence</h2>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-rose-950 text-rose-400 border border-rose-800">
+                    AI / Policy Defense
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 mt-1">
+                  Deep forensic explanations for algorithmically generated domains, DNS tunnels, and cache attacks
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <select
+                  value={filterSeverity}
+                  onChange={(e) => setFilterSeverity(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-cyan-500"
+                >
+                  <option value="">All Severities</option>
+                  <option value="Critical">Critical</option>
+                  <option value="High">High</option>
+                  <option value="Medium">Medium</option>
+                </select>
+
+                <select
+                  value={filterThreat}
+                  onChange={(e) => setFilterThreat(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-cyan-500"
+                >
+                  <option value="">All Threat Types</option>
+                  <option value="DGA Malware Domain">DGA Malware Domain</option>
+                  <option value="DNS Data Exfiltration Tunnel">DNS Data Exfiltration Tunnel</option>
+                  <option value="CNAME Cloaking Tracker">CNAME Cloaking Tracker</option>
+                  <option value="DNS Rebinding Attack">DNS Rebinding Attack</option>
+                  <option value="Off-Path Cache Poisoning Attempt">Off-Path Cache Poisoning Attempt</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            {filteredAlerts.length === 0 ? (
+              <div className="bg-slate-900/80 rounded-2xl border border-slate-800 p-12 text-center text-slate-500">
+                No security threat alerts found matching the selected filters.
+              </div>
+            ) : (
+              filteredAlerts.map((alert) => (
+                <div
+                  key={alert.id}
+                  className={`bg-slate-900/90 rounded-2xl border p-5 shadow-xl transition ${
+                    alert.status === 'Active'
+                      ? 'border-rose-800/80 hover:border-rose-700 shadow-rose-950/10'
+                      : 'border-slate-800 opacity-75'
+                  }`}
+                >
+                  <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
+                    <div className="space-y-3 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className={`px-2.5 py-0.5 rounded-md text-[11px] font-bold border uppercase tracking-wider ${getSeverityBadge(alert.severity)}`}>
+                          {alert.severity}
+                        </span>
+                        <span className="text-white font-bold text-base">{alert.threat_type}</span>
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${
+                            alert.status === 'Active'
+                              ? 'bg-rose-950/70 text-rose-300 border-rose-800'
+                              : 'bg-emerald-950/70 text-emerald-300 border-emerald-800'
+                          }`}
+                        >
+                          {alert.status}
+                        </span>
+                        <span className="text-xs text-slate-500 font-mono">
+                          Logged {alert.timestamp.split('T')[1]?.slice(0, 8) || alert.timestamp}
+                        </span>
+                      </div>
+
+                      <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-500 text-xs font-semibold">Flagged Domain:</span>
+                          <span className="text-cyan-400 font-mono font-bold text-sm tracking-wide">
+                            {alert.domain}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3 text-xs">
+                          <span className="text-slate-400">
+                            Client: <span className="text-white font-mono">{alert.client_ip}</span>
+                          </span>
+                          <span className="text-slate-400">
+                            ML Risk Score:{' '}
+                            <span className="text-rose-400 font-mono font-bold">
+                              {(alert.risk_score * 100).toFixed(0)}%
+                            </span>
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="text-xs text-slate-300 leading-relaxed">{alert.description}</p>
+
+                      <div className="bg-slate-950/90 rounded-xl border border-slate-800/80 p-3.5 space-y-2">
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-amber-400">
+                          <span>🔬</span>
+                          <span>Forensic Evidence & Detection Breakdown ("Why Flagged?"):</span>
+                        </div>
+                        <ul className="space-y-1.5 text-xs text-slate-300 pl-2">
+                          {alert.detection_evidence.map((evidence, idx) => (
+                            <li key={idx} className="flex items-start gap-2">
+                              <span className="text-cyan-400 text-sm leading-none">•</span>
+                              <span>{evidence}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+
+                    <div className="flex lg:flex-col items-center lg:items-end justify-between gap-2 pt-2 lg:pt-0 border-t lg:border-t-0 border-slate-800">
+                      <div className="text-right hidden lg:block">
+                        <span className="text-[10px] text-slate-500 block">Enforcement Action</span>
+                        <span className="text-xs font-bold text-emerald-400 font-mono">
+                          {alert.action_taken}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => onToggleMitigate(alert.id)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                            alert.status === 'Active'
+                              ? 'bg-emerald-900/60 hover:bg-emerald-800 text-emerald-200 border border-emerald-700'
+                              : 'bg-rose-900/60 hover:bg-rose-800 text-rose-200 border border-rose-700'
+                          }`}
+                        >
+                          {alert.status === 'Active' ? 'Mark Mitigated' : 'Reactivate'}
+                        </button>
+                        <button
+                          onClick={() => onDismiss(alert.id)}
+                          className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium transition"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // --- 8. SETTINGS PAGE ---
+    function Settings({ settings, onSaveSettings, onResetDemoData }) {
+      const [formData, setFormData] = useState(settings || {
+        ml_dga_threshold: 0.75,
+        tunnel_entropy_threshold: 4.5,
+        rate_limit_rps: 100,
+        cache_ttl_seconds: 300,
+        enable_cname_inspection: true,
+        enable_0x20_encoding: true,
+        log_retention_days: 7,
+        demo_mode: true
+      });
+      const [saveStatus, setSaveStatus] = useState('');
+      const [isResetting, setIsResetting] = useState(false);
+
+      const handleChange = (field, val) => {
+        setFormData((prev) => ({ ...prev, [field]: val }));
+      };
+
+      const handleSave = async (e) => {
+        e.preventDefault();
+        setSaveStatus('Saving demo settings...');
+        await onSaveSettings(formData);
+        setSaveStatus('Settings updated successfully in SQLite demo database!');
+        setTimeout(() => setSaveStatus(''), 4000);
+      };
+
+      const handleReset = async () => {
+        if (confirm('Reset all demo queries, clients, and alerts back to default sample state?')) {
+          setIsResetting(true);
+          await onResetDemoData();
+          setIsResetting(false);
+          alert('Demo sample dataset reset successfully.');
+        }
+      };
+
+      return (
+        <div className="space-y-6 max-w-4xl">
+          <div className="bg-emerald-950/40 border border-emerald-800/80 rounded-2xl p-4 flex items-start gap-3 shadow-lg">
+            <span className="text-2xl">🔒</span>
+            <div>
+              <h3 className="text-sm font-bold text-emerald-300">Safety Sandbox Active</h3>
+              <p className="text-xs text-emerald-200/90 mt-0.5 leading-relaxed">
+                All controls on this page modify the local demonstration SQLite database only. The core C++ resolver
+                configuration (<code className="bg-emerald-950 px-1 py-0.5 rounded text-white font-mono text-[11px]">config/dnsentinel.yaml</code>)
+                is strictly protected and will not be touched or altered.
+              </p>
+            </div>
+          </div>
+
+          <form onSubmit={handleSave} className="bg-slate-900/90 rounded-2xl border border-slate-800 p-6 shadow-xl space-y-6">
+            <div>
+              <h2 className="text-xl font-bold text-white">Dashboard Policy & ML Controls</h2>
+              <p className="text-xs text-slate-400">
+                Tune algorithmic detection thresholds, caching behavior, and rate limiting rules for evaluation
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-slate-800">
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-semibold text-slate-200">DGA Classifier Cutoff</label>
+                  <span className="text-cyan-400 font-mono font-bold text-xs">{formData.ml_dga_threshold}</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.50"
+                  max="0.95"
+                  step="0.05"
+                  value={formData.ml_dga_threshold}
+                  onChange={(e) => handleChange('ml_dga_threshold', parseFloat(e.target.value))}
+                  className="w-full accent-cyan-500 cursor-pointer"
+                />
+                <p className="text-[11px] text-slate-500">
+                  Confidence threshold for blocking algorithmically generated domain names.
+                </p>
+              </div>
+
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-semibold text-slate-200">Tunnel Shannon Entropy</label>
+                  <span className="text-cyan-400 font-mono font-bold text-xs">
+                    {formData.tunnel_entropy_threshold} bits
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="3.0"
+                  max="6.5"
+                  step="0.1"
+                  value={formData.tunnel_entropy_threshold}
+                  onChange={(e) => handleChange('tunnel_entropy_threshold', parseFloat(e.target.value))}
+                  className="w-full accent-cyan-500 cursor-pointer"
+                />
+                <p className="text-[11px] text-slate-500">
+                  Flags subdomains with high character randomness indicative of encoded binary data.
+                </p>
+              </div>
+
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-semibold text-slate-200">Client Rate Limit</label>
+                  <span className="text-emerald-400 font-mono font-bold text-xs">
+                    {formData.rate_limit_rps} req/sec
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="20"
+                  max="500"
+                  step="10"
+                  value={formData.rate_limit_rps}
+                  onChange={(e) => handleChange('rate_limit_rps', parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 cursor-pointer"
+                />
+                <p className="text-[11px] text-slate-500">
+                  Maximum queries per second permitted before applying response rate limiting (RRL).
+                </p>
+              </div>
+
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-semibold text-slate-200">Negative Cache TTL</label>
+                  <span className="text-emerald-400 font-mono font-bold text-xs">
+                    {formData.cache_ttl_seconds} s
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="30"
+                  max="1800"
+                  step="30"
+                  value={formData.cache_ttl_seconds}
+                  onChange={(e) => handleChange('cache_ttl_seconds', parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 cursor-pointer"
+                />
+                <p className="text-[11px] text-slate-500">
+                  Duration to store NXDOMAIN and failure responses to protect upstream root servers.
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-slate-800 space-y-3">
+              <h3 className="text-sm font-semibold text-white">Active Defense Modules</h3>
+
+              <div className="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800">
+                <div>
+                  <span className="text-xs font-semibold text-white block">CNAME-Cloaking Deep Inspection</span>
+                  <span className="text-[11px] text-slate-400">
+                    Chases canonical aliases to block disguised ad-trackers before returning answers.
+                  </span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={formData.enable_cname_inspection}
+                  onChange={(e) => handleChange('enable_cname_inspection', e.target.checked)}
+                  className="w-4 h-4 accent-cyan-500 rounded cursor-pointer"
+                />
+              </div>
+
+              <div className="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800">
+                <div>
+                  <span className="text-xs font-semibold text-white block">0x20 Bit-Case Anti-Poisoning Randomization</span>
+                  <span className="text-[11px] text-slate-400">
+                    Randomizes capitalization in upstream query names (e.g. gOoGLe.cOM) to thwart off-path spoofers.
+                  </span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={formData.enable_0x20_encoding}
+                  onChange={(e) => handleChange('enable_0x20_encoding', e.target.checked)}
+                  className="w-4 h-4 accent-cyan-500 rounded cursor-pointer"
+                />
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4">
+              <div className="text-xs font-medium text-emerald-400">{saveStatus}</div>
+              <div className="flex items-center gap-3 w-full sm:w-auto">
+                <button
+                  type="button"
+                  onClick={handleReset}
+                  disabled={isResetting}
+                  className="flex-1 sm:flex-initial px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg transition"
+                >
+                  {isResetting ? 'Resetting...' : 'Reset Demo Dataset'}
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 sm:flex-initial px-5 py-2 bg-gradient-to-r from-cyan-600 to-emerald-600 hover:from-cyan-500 hover:to-emerald-500 text-white text-xs font-semibold rounded-lg shadow-lg shadow-cyan-950/50 transition"
+                >
+                  Save Demo Settings
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      );
+    }
+
+    // --- 9. MAIN APP COMPONENT ---
+    function App() {
+      const [activeTab, setActiveTab] = useState('overview');
+      const [metrics, setMetrics] = useState(null);
+      const [activity, setActivity] = useState(null);
+      const [queriesData, setQueriesData] = useState({ total: 0, page: 1, limit: 25, queries: [] });
+      const [clients, setClients] = useState([]);
+      const [alerts, setAlerts] = useState([]);
+      const [settings, setSettings] = useState(null);
+
+      const [querySearch, setQuerySearch] = useState('');
+      const [queryStatus, setQueryStatus] = useState('');
+      const [queryType, setQueryType] = useState('');
+      const [queryPage, setQueryPage] = useState(1);
+
+      const API_BASE = window.location.origin;
+
+      const fetchAllData = async () => {
+        try {
+          const [metricsRes, activityRes, clientsRes, alertsRes, settingsRes] = await Promise.all([
+            fetch(`${API_BASE}/api/metrics`).then((r) => r.json()),
+            fetch(`${API_BASE}/api/activity`).then((r) => r.json()),
+            fetch(`${API_BASE}/api/clients`).then((r) => r.json()),
+            fetch(`${API_BASE}/api/alerts`).then((r) => r.json()),
+            fetch(`${API_BASE}/api/settings`).then((r) => r.json()),
+          ]);
+
+          setMetrics(metricsRes);
+          setActivity(activityRes);
+          setClients(clientsRes);
+          setAlerts(alertsRes);
+          setSettings(settingsRes);
+        } catch (err) {
+          console.error('Failed to load dashboard data:', err);
+        }
+      };
+
+      const fetchQueries = async () => {
+        try {
+          const params = new URLSearchParams({
+            page: queryPage.toString(),
+            limit: '25',
+          });
+          if (querySearch) params.append('search', querySearch);
+          if (queryStatus) params.append('status', queryStatus);
+          if (queryType) params.append('qtype', queryType);
+
+          const res = await fetch(`${API_BASE}/api/queries?${params.toString()}`);
+          const data = await res.json();
+          setQueriesData(data);
+        } catch (err) {
+          console.error('Failed to fetch queries:', err);
+        }
+      };
+
+      useEffect(() => {
+        fetchAllData();
+      }, []);
+
+      useEffect(() => {
+        fetchQueries();
+      }, [querySearch, queryStatus, queryType, queryPage]);
+
+      const handleSimulateQuery = async (domain) => {
+        try {
+          await fetch(`${API_BASE}/api/queries/simulate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ qname: domain }),
+          });
+          await Promise.all([fetchQueries(), fetchAllData()]);
+        } catch (err) {
+          console.error('Failed to simulate query:', err);
+        }
+      };
+
+      const handleDismissAlert = async (id) => {
+        try {
+          await fetch(`${API_BASE}/api/alerts/${id}/dismiss`, { method: 'POST' });
+          await fetchAllData();
+        } catch (err) {
+          console.error('Failed to dismiss alert:', err);
+        }
+      };
+
+      const handleToggleMitigate = async (id) => {
+        try {
+          await fetch(`${API_BASE}/api/alerts/${id}/toggle-mitigate`, { method: 'POST' });
+          await fetchAllData();
+        } catch (err) {
+          console.error('Failed to toggle alert status:', err);
+        }
+      };
+
+      const handleSaveSettings = async (newSettings) => {
+        try {
+          const res = await fetch(`${API_BASE}/api/settings`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(newSettings),
+          });
+          const data = await res.json();
+          setSettings(data);
+        } catch (err) {
+          console.error('Failed to save settings:', err);
+        }
+      };
+
+      const handleResetDemoData = async () => {
+        try {
+          await fetch(`${API_BASE}/api/settings/reset-demo-data`, { method: 'POST' });
+          await Promise.all([fetchAllData(), fetchQueries()]);
+        } catch (err) {
+          console.error('Failed to reset demo dataset:', err);
+        }
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-cyan-500 selection:text-white">
+          <Header
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            activeAlertsCount={metrics?.active_alerts_count || 0}
+          />
+
+          <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            {activeTab === 'overview' && (
+              <Overview
+                metrics={metrics}
+                activity={activity}
+                recentQueries={queriesData.queries}
+                onNavigate={(tab) => setActiveTab(tab)}
+              />
+            )}
+
+            {activeTab === 'queries' && (
+              <DnsQueries
+                queries={queriesData.queries}
+                total={queriesData.total}
+                page={queryPage}
+                limit={queriesData.limit}
+                onPageChange={(p) => setQueryPage(p)}
+                onSearchChange={(s) => {
+                  setQuerySearch(s);
+                  setQueryPage(1);
+                }}
+                statusFilter={queryStatus}
+                onStatusFilterChange={(st) => {
+                  setQueryStatus(st);
+                  setQueryPage(1);
+                }}
+                qtypeFilter={queryType}
+                onQtypeFilterChange={(qt) => {
+                  setQueryType(qt);
+                  setQueryPage(1);
+                }}
+                onSimulateQuery={handleSimulateQuery}
+              />
+            )}
+
+            {activeTab === 'clients' && <Clients clients={clients} />}
+
+            {activeTab === 'alerts' && (
+              <SecurityAlerts
+                alerts={alerts}
+                onDismiss={handleDismissAlert}
+                onToggleMitigate={handleToggleMitigate}
+              />
+            )}
+
+            {activeTab === 'settings' && (
+              <Settings
+                settings={settings}
+                onSaveSettings={handleSaveSettings}
+                onResetDemoData={handleResetDemoData}
+              />
+            )}
+          </main>
+
+          <footer className="bg-slate-900 border-t border-slate-800/80 py-4 text-center text-xs text-slate-500">
+            <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
+              <span>DNSentinel — Secure Recursive DNS Resolver Dashboard</span>
+              <span className="font-mono text-[11px] text-slate-400">
+                C++20 Gateway Core • FastAPI Backend • React Frontend • SQLite Demo Mode
+              </span>
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    // Render root application
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
