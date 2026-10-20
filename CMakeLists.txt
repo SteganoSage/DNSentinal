@@ -145,6 +145,7 @@ if(DNSENTINEL_ENABLE_ML)
         core/ml/dga_features.cpp
         core/ml/gbdt.cpp
         core/ml/dga_classifier.cpp
+        core/ml/dga_check.cpp
     )
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_ML=1)
 endif()
@@ -202,7 +203,7 @@ if(DNSENTINEL_ENABLE_TESTS)
     )
     include(GoogleTest)
     if(DNSENTINEL_ENABLE_ML)
-        target_sources(dnsentinel_tests PRIVATE tests/unit/ml/test_dga_classifier.cpp)
+        target_sources(dnsentinel_tests PRIVATE tests/unit/ml/test_dga_classifier.cpp tests/unit/ml/test_dga_check.cpp)
     endif()
     gtest_discover_tests(dnsentinel_tests)
 

@@ -155,6 +155,31 @@ families and was 3x slower; the boosting libraries tied and random forest traile
 Name-only detection misses syllable-built and pseudo-word DGAs (pushdo, simda, vawtrak,
 ngioweb, symmi) and dictionary DGAs: those are for the NXDOMAIN-burst detector (README §7.8).
 
+## In the resolver
+
+`core/ml` reads the same model (`models/dga`): the Public Suffix List split, the features and
+LightGBM's trees in C++, giving the Python scorer's inputs and scores to the last bit
+(`tests/unit/ml`, on 551 names `python -m ml.dga.export models/dga --parity ...` scored).
+`ml.dga` in `config/dnsentinel.yaml` turns it on:
+
+```yaml
+ml:
+  dga:
+    enabled: true
+    mode: monitor          # monitor: log what it flags | enforce: answer it like a blocked name
+    model: models/dga
+    words: config/english_words.txt
+    allowlist: config/lists/feeds/tranco_top100k.txt  # from config/lists/download_feeds.sh
+    threshold: 0           # 0: the model's own (0.9558)
+    cache_size: 100000     # verdicts, one per registrable domain
+```
+
+It runs after the block and allow lists, on names neither mentions; it skips special-use names
+(`.arpa`, `.local`, `.test`, ...), single labels and the Tranco top 100k (the popular sites the
+training kept apart), and scores each registrable domain once. A flagged domain is logged the
+first time it is seen; in enforce mode its names get the blocked answer (`policy.block_response`)
+without going upstream. The daemon sums up at exit: names checked, scored, cached, flagged.
+
 ## Tests
 
 ```bash

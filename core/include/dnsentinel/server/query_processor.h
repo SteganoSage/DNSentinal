@@ -3,12 +3,16 @@
 /// The fast path (plan §1): every well-formed query from every transport
 /// comes through here. Stages so far: access control, the per-client rate
 /// limit, rejecting queries we can't answer, the block and allow lists,
+/// the DGA classifier (plan §7.8.2, on names the lists don't mention),
 /// resolution (the resolver answers from the cache when it can), checking
 /// the answer's CNAME chain against the lists, then removing private
 /// addresses from answers for public names (rebinding protection). Every
 /// UDP response, whatever produced it, passes response rate limiting on
 /// its way out. ML slots in as it lands.
 
+#ifdef DNSENTINEL_ML
+#include "dnsentinel/ml/dga_check.h"
+#endif
 #include "dnsentinel/net/query_handler.h"
 #include "dnsentinel/policy/acl.h"
 #include "dnsentinel/policy/blocklists.h"
@@ -18,6 +22,7 @@
 #include "dnsentinel/types.h"
 
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace dnsentinel::resolver {
@@ -47,18 +52,34 @@ struct RebindingEvent {
     bool            emptied = false;  // no address was left, so the client got NXDOMAIN
 };
 
+#ifdef DNSENTINEL_ML
+/// A query for a name the DGA classifier judged machine-generated (plan §7.8.2).
+struct DgaEvent {
+    Question       question;  // as the client asked it
+    ml::DgaVerdict verdict;   // its registrable domain and the model's score
+    bool           cached   = false;  // judged before: not the first query for that domain
+    bool           enforced = false;  // answered like a blocked name (enforce mode), not resolved
+};
+#endif
+
 /// The processor's own checks, each built from its config section.
 struct Checks {
     policy::AccessControl         access;      // who may use the resolver (§5.5)
     policy::RateLimiter           rate_limit;  // queries per client (§5.9)
     policy::RebindingFilter       rebinding;   // private addresses in answers (§5.8)
     security::ResponseRateLimiter rrl;         // identical UDP responses per client network (§5.9)
+#ifdef DNSENTINEL_ML
+    std::optional<ml::DgaCheck> dga{};  // the DGA classifier (§7.8.2); none: off
+#endif
 };
 
 class QueryProcessor {
 public:
     using BlockFn     = std::function<void(const BlockEvent&)>;
     using RebindingFn = std::function<void(const RebindingEvent&)>;
+#ifdef DNSENTINEL_ML
+    using DgaFn = std::function<void(const DgaEvent&)>;
+#endif
 
     /// `resolver` and `lists` must outlive the processor, and resolutions it
     /// started must not complete after it is gone: destroy it only once the
@@ -69,6 +90,11 @@ public:
     void on_block(BlockFn fn) { on_block_ = std::move(fn); }
     /// Called whenever rebinding protection changes an answer, before it is sent.
     void on_rebinding(RebindingFn fn) { on_rebinding_ = std::move(fn); }
+#ifdef DNSENTINEL_ML
+    /// Called for every query the DGA classifier flags, before it is answered
+    /// (resolved in monitor mode, answered like a blocked name in enforce mode).
+    void on_dga(DgaFn fn) { on_dga_ = std::move(fn); }
+#endif
 
     /// The checks, for their counters.
     [[nodiscard]] const Checks& checks() const { return checks_; }
@@ -93,6 +119,9 @@ private:
     Checks                       checks_;
     BlockFn                      on_block_;
     RebindingFn                  on_rebinding_;
+#ifdef DNSENTINEL_ML
+    DgaFn on_dga_;
+#endif
 };
 
 }  // namespace dnsentinel::server

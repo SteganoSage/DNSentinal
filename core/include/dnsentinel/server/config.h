@@ -5,6 +5,7 @@
 /// resolver, not quietly fall back to defaults.
 
 #include "dnsentinel/cache/cache.h"
+#include "dnsentinel/ml/dga_config.h"
 #include "dnsentinel/net/tcp_listener.h"
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/policy/acl.h"
@@ -42,6 +43,7 @@ struct Config {
     security::RrlConfig      rrl;         // default: off
     policy::ListsConfig      lists;   // default: no lists, nothing blocked
     policy::RebindingConfig  rebinding;  // default: on; stub zones are always exempt
+    ml::DgaConfig            dga;        // ml.dga, the DGA classifier (plan §7.8.2); default: off
 
     /// Features the config turns on (in the file, or by default) that this
     /// build doesn't implement yet ("listen.dot", "policy", ...), so startup

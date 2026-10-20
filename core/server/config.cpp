@@ -318,6 +318,42 @@ void read_rebinding(Section& policy, Config& c) {
 
 /// policy: the block and allow lists (plan §5.6), the CNAME check (§5.7) and
 /// rebinding protection (§5.8).
+/// ml (plan §7.8): the DGA classifier.
+void read_ml(Section& top, Config& c) {
+    Section        ml(top.take("ml"), "ml");
+    Section        dga(ml.take("dga"), "ml.dga");
+    ml::DgaConfig& d = c.dga;
+    dga.read_bool("enabled", d.enabled);
+    if (auto node = dga.take("mode")) {
+        const std::string mode = scalar_or_empty(*node);
+        if (mode == "monitor") {
+            d.mode = ml::DgaMode::Monitor;
+        } else if (mode == "enforce") {
+            d.mode = ml::DgaMode::Enforce;
+        } else {
+            fail(*node, "ml.dga.mode must be 'monitor' or 'enforce'");
+        }
+    }
+    dga.read_string("model", d.model);
+    dga.read_string("words", d.words);
+    dga.read_string("allowlist", d.allowlist);
+    if (auto node = dga.take("threshold")) {
+        const std::string text  = scalar_or_empty(*node);
+        double            value = -1;
+        auto [end, ec]          = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (ec != std::errc{} || end != text.data() + text.size() || !(value >= 0 && value < 1)) {
+            fail(*node, "ml.dga.threshold must be a probability below 1 (0: the model's own)");
+        }
+        d.threshold = value;
+    }
+    dga.read_uint("cache_size", d.cache_size);
+    dga.finish();
+    ml.finish();
+#ifndef DNSENTINEL_ML
+    if (d.enabled) c.not_implemented.push_back("ml.dga (built without DNSENTINEL_ENABLE_ML)");
+#endif
+}
+
 void read_policy(Section& top, Config& c) {
     Section              policy(top.take("policy"), "policy");
     policy::ListsConfig& lists = c.lists;
@@ -419,9 +455,10 @@ Config parse(const YAML::Node& document) {
     read_access(top, c.access);
     read_rate_limit(top, c);
     read_policy(top, c);
+    read_ml(top, c);
 
-    // Sections for modules still to come (plan §5-§7).
-    for (const char* key : {"ml", "telemetry"}) {
+    // Sections for modules still to come (plan §7).
+    for (const char* key : {"telemetry"}) {
         if (top.take(key)) c.not_implemented.push_back(key);
     }
     top.finish();

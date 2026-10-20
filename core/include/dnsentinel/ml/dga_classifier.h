@@ -41,6 +41,9 @@ public:
     [[nodiscard]] std::optional<std::vector<double>> inputs(std::string_view domain) const;
     /// The registrable domain the verdict for `domain` would be about, without scoring it.
     [[nodiscard]] std::optional<std::string> registrable(std::string_view domain) const;
+    /// classify() in two steps, for callers that look the split name up first.
+    [[nodiscard]] std::optional<SplitName> split(std::string_view domain) const { return split_name(domain, psl_); }
+    [[nodiscard]] DgaVerdict               classify(const SplitName& name) const;
 
     [[nodiscard]] double                          threshold() const { return threshold_; }
     void                                          set_threshold(double threshold) { threshold_ = threshold; }

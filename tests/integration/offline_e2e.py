@@ -41,7 +41,7 @@ A, NS, CNAME, SOA, TXT, AAAA = 1, 2, 5, 6, 16, 28
 CLASS_IN, CLASS_CH = 1, 3
 NOERROR, SERVFAIL, NXDOMAIN, REFUSED = 0, 2, 3, 5
 
-ROOT_IP, LAB_IP = "127.0.0.2", "127.0.0.3"
+ROOT_IP, LAB_IP, INFO_IP = "127.0.0.2", "127.0.0.3", "127.0.0.4"
 DEAD_IP = "127.0.0.9"  # delegated to, but nothing listens there
 DAEMON = ("127.0.0.1", 5353)
 DOT = ("127.0.0.1", 8853)
@@ -52,7 +52,7 @@ ZONES = {
     ROOT_IP: {
         "origin": "",
         "records": {("", NS): ["a.root-servers.test"], ("a.root-servers.test", A): [ROOT_IP]},
-        "delegations": {"lab": ("ns.lab", LAB_IP), "dead": ("ns.dead", DEAD_IP)},
+        "delegations": {"lab": ("ns.lab", LAB_IP), "dead": ("ns.dead", DEAD_IP), "info": ("ns.info", INFO_IP)},
     },
     LAB_IP: {
         "origin": "lab",
@@ -70,7 +70,17 @@ ZONES = {
         "cnames": {"alias.example.lab": "www.example.lab",
                    "metrics.shop.lab": "collect.tracker.lab"},  # a tracker cloaked as a first-party name
     },
+    INFO_IP: {  # a real TLD, for the DGA classifier (special-use ones like .lab's cousins it skips)
+        "origin": "info",
+        "records": {
+            ("www.mdexmtiwmjia.info", A): ["192.0.2.77"],  # a sisron DGA name: scores 0.997
+            ("www.plasticbags.info", A): ["192.0.2.78"],   # a real-looking one: 0.001
+            ("www.lcafyatwxd.info", A): ["192.0.2.79"],    # generated, but on the test's allowlist
+            ("ns.info", A): [INFO_IP],
+        },
+    },
 }
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Answered over UDP only after this delay, so identical queries pile up meanwhile.
 # Kept under the resolver's 100 ms minimum timeout for a server it has measured as fast.
@@ -430,7 +440,8 @@ class Daemon:
         return status
 
 
-def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None, dot=None, doh=None, cache=None):
+def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None, dot=None, doh=None, cache=None,
+                 ml=None):
     """access: (allowed subnets, deny action), or None for the default (localhost).
     policy, rate_limit: those sections' settings (indented YAML), or None for none.
     dot, doh: (cert, key) for a DoT listener on DOT or a DoH one on DOH, or None for none."""
@@ -438,7 +449,8 @@ def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None
     with open(hints, "w") as f:
         f.write(f".  NS  a.root-servers.test.\na.root-servers.test.  A  {ROOT_IP}\n")
     name = ("stub" if stub_zone else f"access-{access[1]}" if access else "policy" if policy
-            else f"rate-{abs(hash(rate_limit))}" if rate_limit else "dot" if dot else "doh" if doh else "cache" if cache else "root")
+            else f"rate-{abs(hash(rate_limit))}" if rate_limit else "dot" if dot else "doh" if doh else "cache" if cache
+            else f"ml-{abs(hash(ml))}" if ml else "root")
     path = os.path.join(tmp, name + ".yaml")
     with open(path, "w") as f:
         f.write(f'listen:\n  udp: "{DAEMON[0]}:{DAEMON[1]}"\n')
@@ -458,6 +470,8 @@ def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None
             f.write("rate_limit:\n" + rate_limit)
         if cache:
             f.write("cache:\n" + cache)
+        if ml:
+            f.write("ml:\n" + ml)
     return path
 
 
@@ -795,6 +809,71 @@ def refusing_clients_outside_the_allowed_subnets(binary, servers, tmp):
     run_daemon(binary, write_config(tmp, access=(["10.0.0.0/8"], "drop")), dropped)
 
 
+def built_with_ml(binary, config):
+    """Start the daemon and read its log until it listens: False if it says ML isn't compiled in."""
+    proc = subprocess.Popen([binary, "-c", config], stderr=subprocess.PIPE, text=True)
+    try:
+        for line in proc.stderr:  # it either listens or stops; both end the startup log
+            if "built without DNSENTINEL_ENABLE_ML" in line:
+                return False
+            if "listening on" in line:
+                break
+        return True
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def flagging_generated_names(binary, servers, tmp):
+    allow = os.path.join(tmp, "top.csv")
+    with open(allow, "w") as f:
+        f.write("1,lcafyatwxd.info\n")  # pretend the generated name is a popular site
+
+    def ml(mode):
+        return (f"  dga:\n    enabled: true\n    mode: {mode}\n    model: {REPO}/models/dga\n"
+                f"    words: {REPO}/config/english_words.txt\n    allowlist: {allow}\n")
+
+    if not built_with_ml(binary, write_config(tmp, ml=ml("monitor"))):
+        print("  skip  the binary was built without DNSENTINEL_ENABLE_ML")
+        return
+
+    def monitor(daemon):
+        check(any("dga classifier: 450 trees over 20 features, flags scores above 0.9558; 1 popular sites never "
+                  "scored; monitor mode" in line for line in daemon.log), "startup log describes the classifier")
+        r = ask("www.mdexmtiwmjia.info")
+        check(r.rcode == NOERROR and r.answers == [("www.mdexmtiwmjia.info.", A, "192.0.2.77")],
+              "monitor mode: a generated name is still resolved")
+        check(daemon.wait_for("dga: www.mdexmtiwmjia.info. looks machine-generated (mdexmtiwmjia.info, score 0.997); "
+                              "resolved (monitor mode)"), "...and logged with its score")
+        r = ask("www.plasticbags.info")
+        check(r.answers == [("www.plasticbags.info.", A, "192.0.2.78")], "a real-looking name is resolved")
+        ask("www.mdexmtiwmjia.info")  # judged once: from the verdict cache now
+        r = ask("www.lcafyatwxd.info")
+        check(r.answers == [("www.lcafyatwxd.info.", A, "192.0.2.79")], "a popular site is never scored")
+
+    log = run_daemon(binary, write_config(tmp, ml=ml("monitor")), monitor)
+    check(any("dga since startup: 4 names checked: 2 scored, 1 from the verdict cache, 1 popular, 0 not scored; "
+              "2 flagged (1 domains)" in line for line in log), "...and the daemon sums it up at exit")
+    check(sum("looks machine-generated" in line for line in log) == 1, "a flagged domain is logged once, not per query")
+
+    def enforce(daemon):
+        before = len(servers.seen)
+        r = ask("www.mdexmtiwmjia.info")
+        check(r.rcode == NOERROR and r.answers == [("www.mdexmtiwmjia.info.", A, "0.0.0.0")],
+              "enforce mode: a generated name gets 0.0.0.0, like a blocked one")
+        check(len(servers.seen) == before, "...without any upstream query")
+        check(daemon.wait_for("score 0.997); answered as blocked"), "...and the log says so")
+        r = ask("www.plasticbags.info")
+        check(r.answers == [("www.plasticbags.info.", A, "192.0.2.78")], "real-looking names still resolve")
+
+    run_daemon(binary, write_config(tmp, ml=ml("enforce")), enforce)
+
+    path = write_config(tmp, ml=ml("monitor").replace(f"{REPO}/models/dga", os.path.join(tmp, "no-model")))
+    proc = subprocess.run([binary, "-c", path], capture_output=True, text=True, timeout=10)
+    check(proc.returncode != 0 and "ml.dga: " in proc.stderr and "no-model" in proc.stderr,
+          "a missing model stops startup, naming what is missing")
+
+
 def main():
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} <path to the dnsentinel binary>", file=sys.stderr)
@@ -812,7 +891,7 @@ def main():
         for scenario in (resolving_from_the_root, resolving_a_stub_zone,
                          refusing_clients_outside_the_allowed_subnets, rate_limiting_a_flood, blocking_listed_names,
                          serving_stale_during_an_outage, answering_over_tls, answering_over_https,
-                         rejecting_a_bad_config):
+                         flagging_generated_names, rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
                 scenario(binary, servers, tmp)

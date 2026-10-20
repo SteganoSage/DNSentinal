@@ -60,6 +60,25 @@ protected:
             Checks{AccessControl(access), RateLimiter(rate_limit), RebindingFilter(rebinding), ResponseRateLimiter(rrl)});
     }
 
+#ifdef DNSENTINEL_ML
+    /// A processor that also runs the shipped DGA classifier.
+    void use_dga(ml::DgaMode mode) {
+        static const ml::DgaClassifier model = [] {
+            const std::string source = DNSENTINEL_SOURCE_DIR;
+            auto loaded = ml::DgaClassifier::load(source + "/models/dga", source + "/config/english_words.txt");
+            EXPECT_TRUE(loaded.has_value()) << loaded.error();
+            return std::move(*loaded);
+        }();
+        ml::DgaConfig config;
+        config.mode = mode;
+        Checks checks{AccessControl(access), RateLimiter(rate_limit), RebindingFilter(rebinding), ResponseRateLimiter(rrl)};
+        checks.dga.emplace(model, ml::StringSet{}, config);
+        processor = std::make_unique<QueryProcessor>(*resolver, *lists, std::move(checks));
+        processor->on_dga([this](const DgaEvent& event) { dga_events.push_back(event); });
+    }
+    std::vector<DgaEvent> dga_events;
+#endif
+
     /// Use these block and allow lists from now on.
     void use_lists(ListsConfig config) {
         processor.reset();  // it refers to the old lists
@@ -643,3 +662,62 @@ TEST_F(QueryProcessorTest, RrlAlsoLimitsRefusals) {
     EXPECT_EQ(replies, 1);
     EXPECT_EQ(processor->checks().rrl.dropped(), 3u);
 }
+
+#ifdef DNSENTINEL_ML
+// ─── The DGA classifier (plan §7.8.2) ───────────────────────────────────────
+
+TEST_F(QueryProcessorTest, DgaMonitorModeReportsAndResolves) {
+    auth->add("www.mdexmtiwmjia.info", RRType::A, ipv4("192.0.2.7"));
+    use_dga(ml::DgaMode::Monitor);
+    auto r = ask(query("www.mdexmtiwmjia.info"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.0.2.7")});  // the real answer
+    ASSERT_EQ(dga_events.size(), 1u);
+    EXPECT_EQ(dga_events[0].verdict.registrable, "mdexmtiwmjia.info");
+    EXPECT_GT(dga_events[0].verdict.score, 0.95);
+    EXPECT_FALSE(dga_events[0].enforced);
+    EXPECT_FALSE(dga_events[0].cached);
+
+    ASSERT_TRUE(ask(query("www.mdexmtiwmjia.info")).has_value());
+    ASSERT_EQ(dga_events.size(), 2u);
+    EXPECT_TRUE(dga_events[1].cached);  // judged once per registrable domain
+    EXPECT_EQ(processor->checks().dga->stats().scored, 1u);
+}
+
+TEST_F(QueryProcessorTest, DgaEnforceModeAnswersLikeABlockedName) {
+    auth->add("www.mdexmtiwmjia.info", RRType::A, ipv4("192.0.2.7"));
+    use_dga(ml::DgaMode::Enforce);
+    auto r = ask(query("www.mdexmtiwmjia.info"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")});
+    EXPECT_EQ(auth->queries, 0);  // never sent upstream
+    ASSERT_EQ(dga_events.size(), 1u);
+    EXPECT_TRUE(dga_events[0].enforced);
+}
+
+TEST_F(QueryProcessorTest, RealNamesPassTheDgaCheck) {
+    auth->add("plasticbags.com", RRType::A, ipv4("192.0.2.8"));
+    use_dga(ml::DgaMode::Enforce);
+    auto r = ask(query("plasticbags.com"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.0.2.8")});
+    EXPECT_TRUE(dga_events.empty());
+    EXPECT_EQ(processor->checks().dga->stats().scored, 1u);
+}
+
+TEST_F(QueryProcessorTest, AllowlistedNamesSkipTheDgaCheck) {
+    auth->add("www.mdexmtiwmjia.info", RRType::A, ipv4("192.0.2.7"));
+    const ListFile allow("mdexmtiwmjia.info\n");
+    use_lists({.allowlists = {allow.path()}});
+    use_dga(ml::DgaMode::Enforce);
+    auto r = ask(query("www.mdexmtiwmjia.info"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.0.2.7")});  // vouched for: resolved
+    EXPECT_TRUE(dga_events.empty());
+    EXPECT_EQ(processor->checks().dga->stats().queries, 0u);  // not even looked at
+}
+#endif

@@ -251,6 +251,27 @@ int main(int argc, char** argv) {
         log("the public lists come from config/lists/download_feeds.sh; policy.blocklists names the files to read");
         return 1;
     }
+#ifdef DNSENTINEL_ML
+    std::optional<ml::DgaCheck> dga;
+    if (config->dga.enabled) {
+        auto loaded = ml::DgaCheck::load(config->dga);
+        if (!loaded) {
+            log("ml.dga: " + loaded.error());
+            log("the model is models/dga (ml/dga/README.md); the allowlist comes from "
+                "config/lists/download_feeds.sh; or set ml.dga.enabled: false");
+            return 1;
+        }
+        dga = std::move(*loaded);
+        const auto& model = dga->classifier();
+        char        threshold[32];
+        std::snprintf(threshold, sizeof threshold, "%.4f", model.threshold());
+        log("dga classifier: " + std::to_string(model.trees().tree_count()) + " trees over " +
+            std::to_string(model.features().size()) + " features, flags scores above " + threshold + "; " +
+            std::to_string(dga->allowlist_size()) + " popular sites never scored; " +
+            (dga->mode() == ml::DgaMode::Enforce ? "enforce mode: flagged names are answered as blocked"
+                                                 : "monitor mode: flagged names are logged, then resolved"));
+    }
+#endif
 
     // ─── Components, destroyed in reverse: listener first, loop last ────────
     auto loop = net::EventLoop::create();
@@ -260,10 +281,12 @@ int main(int argc, char** argv) {
     }
     cache::Cache                cache(config->cache);
     resolver::RecursiveResolver resolver(config->resolver, std::move(*hints), **loop, cache);
-    server::QueryProcessor      processor(resolver, lists,
-                                          {policy::AccessControl(config->access), policy::RateLimiter(config->rate_limit),
-                                           policy::RebindingFilter(config->rebinding),
-                                           security::ResponseRateLimiter(config->rrl)});
+    server::Checks              checks{policy::AccessControl(config->access), policy::RateLimiter(config->rate_limit),
+                          policy::RebindingFilter(config->rebinding), security::ResponseRateLimiter(config->rrl)};
+#ifdef DNSENTINEL_ML
+    checks.dga = std::move(dga);
+#endif
+    server::QueryProcessor processor(resolver, lists, std::move(checks));
     processor.on_block([](const server::BlockEvent& block) {
         // Names blocked by their own list entry are too many to log here (the
         // query log will record them); cloaked ones are rare and worth seeing.
@@ -279,6 +302,15 @@ int main(int argc, char** argv) {
              " (private); " + (event.emptied ? "answered NXDOMAIN" : "removed from the answer") +
              ". If it is a local name, add it to policy.rebinding_protection.exempt");
     });
+#ifdef DNSENTINEL_ML
+    processor.on_dga([](const server::DgaEvent& event) {
+        if (event.cached) return;  // logged when its registrable domain was first seen
+        char score[32];
+        std::snprintf(score, sizeof score, "%.3f", event.verdict.score);
+        log("dga: " + event.question.qname.to_string() + " looks machine-generated (" + event.verdict.registrable +
+            ", score " + score + "); " + (event.enforced ? "answered as blocked" : "resolved (monitor mode)"));
+    });
+#endif
     resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
         char server[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &alert.server, server, sizeof server);
@@ -401,6 +433,15 @@ int main(int argc, char** argv) {
     if (const LimitCounts total = LimitCounts::of(processor.checks()); total != LimitCounts{}) {
         log("rate limiting since startup: " + total.describe());
     }
+#ifdef DNSENTINEL_ML
+    if (const auto& d = processor.checks().dga) {
+        const ml::DgaStats& s = d->stats();
+        log("dga since startup: " + std::to_string(s.queries) + " names checked: " + std::to_string(s.scored) +
+            " scored, " + std::to_string(s.cache_hits) + " from the verdict cache, " + std::to_string(s.allowlisted) +
+            " popular, " + std::to_string(s.skipped) + " not scored; " + std::to_string(s.flagged) + " flagged (" +
+            std::to_string(s.flagged_new) + " domains)");
+    }
+#endif
     log("cache since startup: " + std::to_string(cache.hits()) + " hits, " + std::to_string(cache.misses()) +
         " misses, " + std::to_string(resolver.stats().stale_answers) + " stale answers, " +
         std::to_string(resolver.stats().prefetches) + " prefetches");

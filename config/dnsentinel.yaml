@@ -77,17 +77,14 @@ rate_limit:                # plan §5.9
   exempt: []               # subnets neither limit applies to, e.g. a router forwarding a whole LAN
 
 ml:
-  mode: monitor           # monitor | enforce
-  dga:
-    model: models/dga_rf.cpp
-    threshold: 0.9
-    skip_top_n: 100000
-    cache_verdicts: true
-  analyzer_socket: /run/dnsentinel/events.sock
-  risk_thresholds:
-    low: 0.3
-    medium: 0.6
-    high: 0.9
+  dga:                     # plan §7.8.2: is a name's registrable label machine-generated?
+    enabled: true
+    mode: monitor          # monitor: log what it flags | enforce: answer it like a blocked name
+    model: models/dga      # the model ml/dga trained (ml/dga/README.md)
+    words: config/english_words.txt
+    allowlist: config/lists/feeds/tranco_top100k.txt  # popular sites, never scored (download_feeds.sh)
+    threshold: 0           # 0: the model's own, flagging 0.1% of benign names in training
+    cache_size: 100000     # verdicts kept, one per registrable domain
 
 telemetry:
   prometheus:

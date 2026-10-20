@@ -49,6 +49,11 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_TRUE(c->cache.serve_stale);
     EXPECT_EQ(c->cache.stale_answer_after_ms, 1800u);
     EXPECT_TRUE(lists(*c, "telemetry"));
+    EXPECT_FALSE(lists(*c, "ml"));  // the DGA classifier is implemented (plan §7.8.2)
+    EXPECT_TRUE(c->dga.enabled);
+    EXPECT_EQ(c->dga.mode, ml::DgaMode::Monitor);
+    EXPECT_EQ(c->dga.model, "models/dga");
+    EXPECT_EQ(c->dga.allowlist, "config/lists/feeds/tranco_top100k.txt");
     EXPECT_TRUE(c->resolver.use_0x20);
     EXPECT_FALSE(lists(*c, "resolver.use_0x20"));  // implemented (plan §5.2)
     EXPECT_FALSE(lists(*c, "access"));             // implemented (plan §5.5)
@@ -175,6 +180,31 @@ TEST(Config, ParsesPolicyLists) {
     c = parse_config("policy:\n  allowlist: [x.txt, y.txt]\n");
     ASSERT_TRUE(c.has_value()) << c.error();
     EXPECT_EQ(c->lists.allowlists, (std::vector<std::string>{"x.txt", "y.txt"}));
+}
+
+TEST(Config, ParsesTheDgaClassifier) {
+    auto c = parse_config("");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_FALSE(c->dga.enabled);  // off unless asked for: it needs the model files
+    c = parse_config(
+        "ml:\n"
+        "  dga:\n"
+        "    enabled: true\n"
+        "    mode: enforce\n"
+        "    model: m\n"
+        "    words: w.txt\n"
+        "    allowlist: top.csv\n"
+        "    threshold: 0.99\n"
+        "    cache_size: 10\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_TRUE(c->dga.enabled);
+    EXPECT_EQ(c->dga.mode, ml::DgaMode::Enforce);
+    EXPECT_EQ(c->dga.model, "m");
+    EXPECT_EQ(c->dga.words, "w.txt");
+    EXPECT_EQ(c->dga.allowlist, "top.csv");
+    EXPECT_DOUBLE_EQ(c->dga.threshold, 0.99);
+    EXPECT_EQ(c->dga.cache_size, 10u);
+    EXPECT_FALSE(lists(*c, "ml"));
 }
 
 TEST(Config, AccessDefaultsToLocalhostOnly) {
@@ -375,6 +405,11 @@ TEST(Config, ErrorsNameTheSettingAndLine) {
         {"policy:\n  rebinding_protection:\n    exempt: [\".\"]\n", "exempting the root exempts everything; use enabled: false"},
         {"policy:\n  rebinding_protection:\n    exempt: [lan, LAN.]\n", "lan. is listed twice"},
         {"policy:\n  rebinding_protection:\n    exempt_tlds: [lan]\n", "unknown setting 'policy.rebinding_protection.exempt_tlds'"},
+        {"ml:\n  dga:\n    mode: block\n", "line 3: ml.dga.mode must be 'monitor' or 'enforce'"},
+        {"ml:\n  dga:\n    threshold: 1.5\n", "ml.dga.threshold must be a probability below 1"},
+        {"ml:\n  dga:\n    threshold: high\n", "ml.dga.threshold must be a probability below 1"},
+        {"ml:\n  dga:\n    skip_top_n: 100000\n", "unknown setting 'ml.dga.skip_top_n'"},
+        {"ml:\n  analyzer_socket: /run/x.sock\n", "unknown setting 'ml.analyzer_socket'"},
         {"rate_limit:\n  per_client:\n    burst: 0\n", "rate_limit.per_client.burst must be between 1 and"},
         {"rate_limit:\n  per_client:\n    action: block\n", "rate_limit.per_client.action must be 'refuse' or 'drop'"},
         {"rate_limit:\n  rrl:\n    slip: 11\n", "rate_limit.rrl.slip must be between 0 and 10"},

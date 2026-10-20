@@ -1,6 +1,6 @@
 /// @file server/query_processor.cpp
-/// Query checks and the block lists, then resolution, then the checks on
-/// the answer: the CNAME chain and rebinding protection.
+/// Query checks, the block lists and the DGA classifier, then resolution,
+/// then the checks on the answer: the CNAME chain and rebinding protection.
 
 #include "dnsentinel/server/query_processor.h"
 
@@ -120,6 +120,20 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
         respond(blocked(wire::make_response(query), lists_.config()));
         return;
     }
+#ifdef DNSENTINEL_ML
+    // The DGA classifier (plan §7.8.2), for names the lists say nothing
+    // about: an allowlisted name was vouched for, a blocked one is answered.
+    if (checks_.dga && !match.matched) {
+        if (auto result = checks_.dga->check(question.qname); result && result->verdict.dga) {
+            const bool enforce = checks_.dga->mode() == ml::DgaMode::Enforce;
+            if (on_dga_) on_dga_(DgaEvent{question, result->verdict, result->cached, enforce});
+            if (enforce) {
+                respond(blocked(wire::make_response(query), lists_.config()));
+                return;
+            }
+        }
+    }
+#endif
     // CNAME cloaking (plan §5.7) can only be seen in the answer. An
     // allowlisted name is exempt: whatever it aliases was vouched for too.
     const bool check_chain = lists_.config().check_cname_chain && !match.matched;

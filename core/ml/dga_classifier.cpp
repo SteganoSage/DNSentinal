@@ -189,11 +189,15 @@ std::optional<std::string> DgaClassifier::registrable(std::string_view domain) c
     return name->registrable();
 }
 
+DgaVerdict DgaClassifier::classify(const SplitName& name) const {
+    const double score = trees_.predict(select(label_features(name.label, name.suffix, tables_)));
+    return DgaVerdict{name.registrable(), score, score > threshold_};
+}
+
 std::optional<DgaVerdict> DgaClassifier::classify(std::string_view domain) const {
     const auto name = split_name(domain, psl_);
     if (!name) return std::nullopt;
-    const double score = trees_.predict(select(label_features(name->label, name->suffix, tables_)));
-    return DgaVerdict{name->registrable(), score, score > threshold_};
+    return classify(*name);
 }
 
 }  // namespace dnsentinel::ml
