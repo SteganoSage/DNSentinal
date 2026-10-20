@@ -71,11 +71,14 @@ class Tuning(unittest.TestCase):
     def test_committed_tuned_settings_build_a_model(self):
         from ml.dga import models, pipeline
 
-        tuned = json.loads((pipeline.REPO / "ml" / "dga" / "params" / "lgbm_tuned.json").read_text())
-        model = models.make("lgbm", 1, 1, tuned["lgbm"])
-        self.assertEqual(model.params["num_leaves"], tuned["lgbm"]["num_leaves"])
-        self.assertIn(tuned["family_balance"], (0.0, 0.25, 0.5, 0.75, 1.0))
-        self.assertLessEqual(tuned["lgbm"]["n_estimators"] * tuned["lgbm"]["num_leaves"], 60_000)  # C++-sized
+        files = sorted((pipeline.REPO / "ml" / "dga" / "params").glob("*.json"))
+        self.assertTrue(files)
+        for path in files:
+            tuned = json.loads(path.read_text())
+            model = models.make("lgbm", 1, 1, tuned["lgbm"])
+            self.assertEqual(model.params["num_leaves"], tuned["lgbm"]["num_leaves"], path.name)
+            self.assertIn(tuned["family_balance"], (0.0, 0.25, 0.5, 0.75, 1.0), path.name)
+            self.assertLessEqual(tuned["lgbm"]["n_estimators"] * tuned["lgbm"]["num_leaves"], 60_000, path.name)
 
     def test_tune_then_use_the_settings(self):
         try:

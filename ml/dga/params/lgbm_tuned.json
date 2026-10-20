@@ -1,16 +1,16 @@
 {
  "lgbm": {
-  "n_estimators": 500,
-  "learning_rate": 0.011091,
-  "num_leaves": 45,
-  "min_child_samples": 22,
-  "subsample": 0.982692,
-  "colsample_bytree": 0.739901,
-  "reg_lambda": 10.35612
+  "n_estimators": 400,
+  "learning_rate": 0.013663,
+  "num_leaves": 97,
+  "min_child_samples": 76,
+  "subsample": 0.744918,
+  "colsample_bytree": 0.501187,
+  "reg_lambda": 2.750131
  },
- "family_balance": 1.0,
+ "family_balance": 0.0,
  "source": {
-  "how": "python -m ml.dga.pipeline --mode tune --models lgbm --trials 40 (Kaggle, 4 CPUs)",
+  "how": "first tuning round (python -m ml.dga.pipeline --mode tune --models lgbm --trials 40, Kaggle, 4 CPUs), trial 10: second best on its objective (0.5998 vs 0.6014, a tie) and without family balancing",
   "date": "2026-10-19",
   "git_commit": "48a1d48421ab03d39ff11f6643f113bfc39b91e9",
   "features": [
@@ -21,18 +21,7 @@
    "E"
   ],
   "benign": "stable",
-  "objective": "mean recall at 0.1% FPR over unseen families (5 family groups, training data only)",
-  "best": 0.6014,
-  "defaults": 0.5601,
-  "trials": 29,
-  "pruned": 11,
-  "versions": {
-   "python": "3.13.15",
-   "numpy": "2.1.3",
-   "sklearn": "1.6.1",
-   "lightgbm": "4.6.0",
-   "torch": "2.11.0+cpu",
-   "matplotlib": "3.10.0"
-  }
+  "why_not_the_best_trial": "the best trial (31, family balancing 1.0) lost on known families; full runs (all modes, stable benign), defaults / trial 31 / trial 10: unseen families 0.570 / 0.595 / 0.605, real names 0.624 / 0.562 / 0.611, cross-validation 0.864 / 0.783 / 0.830, later dates 0.909 / 0.850 / 0.881",
+  "replaced_by": "the second round (two-part objective) when it reports"
  }
 }

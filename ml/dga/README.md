@@ -120,7 +120,16 @@ real names fell 0.624 -> 0.562, cross-validation 0.864 -> 0.783, later dates 0.9
 Switching balancing off recovered only a third of that. So the objective now asks both
 questions: each fold also holds back a fifth of the names of the families it trains on, and a
 trial scores `--unseen-weight` (0.5) x unseen-family recall + the rest x known-family recall.
-`params/lgbm_tuned.json` holds the first round's settings until the second round replaces them.
+`params/lgbm_tuned.json` holds the first round's trial 10 until the second round replaces them: it tied
+the best trial on the tuning objective without family balancing, and in full runs beat it everywhere
+(unseen families 0.605, real names 0.611, cross-validation 0.830, later dates 0.881).
+
+Second round (2026-10-20, two-part objective, 80 trials per feature set; unseen / known recall on
+the tuning folds): A-E went from 0.553 / 0.863 (defaults) to 0.578 / 0.874, better on both;
+A-E+G from 0.532 / 0.841 to 0.606 / 0.858. Every top trial chose no family balancing. Untuned, the
+rhythm features hurt; tuned (strong L2), they give the best unseen-family recall but cost some on
+known families, and the objectives differ by only 0.006, so full runs decide between
+`params/lgbm_round2_ABCDE.json` and `params/lgbm_round2_ABCDEG.json` (use each with its `--features`).
 
 ## Tests
 
