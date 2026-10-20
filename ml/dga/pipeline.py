@@ -465,6 +465,9 @@ def save_final(result: SplitResult, data: Dataset, features: Features, groups: l
         "lightgbm_params": result.fitted["lgbm"].params,
     }
     (out / "model.json").write_text(json.dumps(card, indent=1) + "\n")
+    from .export import export  # features.txt and public_suffixes.txt: what the resolver reads
+
+    export(out)
     return card
 
 

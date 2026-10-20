@@ -139,7 +139,13 @@ endif()
 
 # ─── ML fast-path ────────────────────────────────────────────────────────────
 if(DNSENTINEL_ENABLE_ML)
-    # target_sources(dnsentinel_core PRIVATE core/ml/dga_classifier.cpp)
+    # The DGA classifier (README §7.8.2): the model ml/dga trains, read from models/dga.
+    target_sources(dnsentinel_core PRIVATE
+        core/ml/psl.cpp
+        core/ml/dga_features.cpp
+        core/ml/gbdt.cpp
+        core/ml/dga_classifier.cpp
+    )
     target_compile_definitions(dnsentinel_core PUBLIC DNSENTINEL_ML=1)
 endif()
 
@@ -186,7 +192,6 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/policy/test_rebinding.cpp
         tests/unit/policy/test_rate_limiter.cpp
         tests/unit/security/test_rrl.cpp
-        # tests/unit/ml/test_dga_classifier.cpp
     )
     target_link_libraries(dnsentinel_tests PRIVATE
         dnsentinel_core
@@ -196,6 +201,9 @@ if(DNSENTINEL_ENABLE_TESTS)
         DNSENTINEL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"  # tests read files in config/
     )
     include(GoogleTest)
+    if(DNSENTINEL_ENABLE_ML)
+        target_sources(dnsentinel_tests PRIVATE tests/unit/ml/test_dga_classifier.cpp)
+    endif()
     gtest_discover_tests(dnsentinel_tests)
 
     # The daemon end to end, offline, in a private network namespace.

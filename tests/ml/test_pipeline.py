@@ -41,7 +41,8 @@ class Pipeline(unittest.TestCase):
             self.assertGreater(cv["models"]["lgbm"]["roc_auc"]["value"], 0.95)  # smoke data is easy
             self.assertIn("lgbm vs rf", cv["mcnemar"])
             for figure in ("cv/F8_roc_pr.png", "lofo/F9_lofo_recall.png", "cv/T4_model_comparison.md",
-                           "final/dga_lgbm.txt", "final/features.json", "final/model.json"):
+                           "final/dga_lgbm.txt", "final/features.json", "final/model.json", "final/features.txt",
+                           "final/public_suffixes.txt"):
                 self.assertTrue((runs / figure).exists(), figure)
             leaderboard = subprocess.run([sys.executable, "-m", "ml.dga.leaderboard", str(root / "runs")],
                                          capture_output=True, text=True)
