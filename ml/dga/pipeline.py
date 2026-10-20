@@ -606,7 +606,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--data", type=Path, default=REPO / "ml" / "data")
     parser.add_argument("--out", type=Path, default=REPO / "ml" / "runs")
     parser.add_argument("--tag", default="main", help="experiment name: results go to <out>/<tag>/")
-    parser.add_argument("--features", nargs="+", default=["A,B,C,D,E"],  # F added nothing (ablation, 2026-10-18)
+    parser.add_argument("--features", nargs="+", default=["A,B,C,D,E,G"],  # F added nothing; G a little (2026-10-20)
                         help="feature groups (features.py), e.g. A,B,C; several sets give one run each")
     parser.add_argument("--benign", choices=["stable", "all"], default="stable",
                         help="benign names: only those in Tranco a year ago too (default), or all")

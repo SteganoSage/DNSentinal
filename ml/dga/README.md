@@ -131,6 +131,30 @@ rhythm features hurt; tuned (strong L2), they give the best unseen-family recall
 known families, and the objectives differ by only 0.006, so full runs decide between
 `params/lgbm_round2_ABCDE.json` and `params/lgbm_round2_ABCDEG.json` (use each with its `--features`).
 
+## Final model (2026-10-20)
+
+Features A-E + G, LightGBM with `params/lgbm_tuned.json` (round 2, tuned with G), no family
+balancing; trained on everything by `--mode final` and stored in `models/dga/`
+(`python -m ml.dga.scorer <name>` scores with it). Chosen over the round-2 A-E settings and
+round-1 trial 10 in full runs on identical test names (McNemar, all p < 1e-4), and over the
+same settings without G (G: +0.4 unseen, +0.8 real names, +0.4 cross-validation, all
+significant; no cost in size or speed).
+
+| At 0.1% FPR (stable benign) | Recall | 95% CI |
+|---|---|---|
+| Unseen families (leave-family-out, mean of 50) | 0.613 | (per family in metrics.json) |
+| Unseen families at 1% FPR | 0.800 | |
+| Real Netlab names of families we generate | 0.630 | 0.628-0.632 |
+| Cross-validation | 0.847 | 0.846-0.849 |
+| Names dated after training | 0.900 | 0.894-0.905 |
+| Dictionary DGAs | 0.000 | (ROC-AUC 0.44: they look like real sites) |
+
+Against the unfiltered Tranco tail (`--benign all`), unseen-family recall drops by about 14
+points (measured with the round-1 settings). The CNN (untuned) reached 0.577 on unseen
+families and was 3x slower; the boosting libraries tied and random forest trailed (phase 2).
+Name-only detection misses syllable-built and pseudo-word DGAs (pushdo, simda, vawtrak,
+ngioweb, symmi) and dictionary DGAs: those are for the NXDOMAIN-burst detector (README §7.8).
+
 ## Tests
 
 ```bash

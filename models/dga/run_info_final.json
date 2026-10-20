@@ -1,0 +1,196 @@
+{
+ "mode": "final",
+ "tag": "final-r2g",
+ "features": [
+  "A",
+  "B",
+  "C",
+  "D",
+  "E",
+  "G"
+ ],
+ "benign": "stable",
+ "params": {
+  "lgbm": {
+   "n_estimators": 450,
+   "learning_rate": 0.016013,
+   "num_leaves": 108,
+   "min_child_samples": 9,
+   "subsample": 0.705087,
+   "colsample_bytree": 0.55414,
+   "reg_lambda": 21.829713
+  },
+  "family_balance": 0.0,
+  "source": {
+   "how": "second tuning round: python -m ml.dga.pipeline --mode tune --models lgbm --trials 80 --features A,B,C,D,E,G (Kaggle, 4 CPUs)",
+   "use_with": "--features A,B,C,D,E,G",
+   "date": "2026-10-19",
+   "git_commit": "ad3fb6b17f86e4d73c98662a2c72708e3fc9a743",
+   "benign": "stable",
+   "objective": "0.5 x unseen-family recall + 0.5 x known-family recall at 0.1% FPR (5 family groups, training data only)",
+   "best": {
+    "objective": 0.7319,
+    "unseen": 0.60585,
+    "known": 0.85794
+   },
+   "defaults": {
+    "objective": 0.686,
+    "unseen": 0.5315,
+    "known": 0.8405
+   },
+   "trials": 40,
+   "pruned": 40,
+   "versions": {
+    "python": "3.13.15",
+    "numpy": "2.1.3",
+    "sklearn": "1.6.1",
+    "lightgbm": "4.6.0",
+    "torch": "2.11.0+cpu",
+    "matplotlib": "3.10.0"
+   }
+  }
+ },
+ "started": "2026-10-20T13:00:31+00:00",
+ "seconds": 26.6,
+ "models": [
+  "lgbm"
+ ],
+ "rows": 969615,
+ "args": {
+  "mode": "all",
+  "data": "/kaggle/input/datasets/peter0729/dnsentinal-dga",
+  "out": "/kaggle/working/dga_runs",
+  "tag": "final-r2g",
+  "features": "['A,B,C,D,E,G']",
+  "benign": "stable",
+  "models": "lgbm",
+  "add_models": "",
+  "epochs": "5",
+  "fraction": "1.0",
+  "folds": "5",
+  "fpr": "0.001",
+  "calibration": "0.1",
+  "benign_test": "0.2",
+  "cutoff": "2024-07-01",
+  "bootstrap": "1000",
+  "bootstrap_curve": "200",
+  "seed": "42",
+  "threads": "4",
+  "params": "{'lgbm': {'n_estimators': 450, 'learning_rate': 0.016013, 'num_leaves': 108, 'min_child_samples': 9, 'subsample': 0.705087, 'colsample_bytree': 0.55414, 'reg_lambda': 21.829713}, 'family_balance': 0.0, 'source': {'how': 'second tuning round: python -m ml.dga.pipeline --mode tune --models lgbm --trials 80 --features A,B,C,D,E,G (Kaggle, 4 CPUs)', 'use_with': '--features A,B,C,D,E,G', 'date': '2026-10-19', 'git_commit': 'ad3fb6b17f86e4d73c98662a2c72708e3fc9a743', 'benign': 'stable', 'objective': '0.5 x unseen-family recall + 0.5 x known-family recall at 0.1% FPR (5 family groups, training data only)', 'best': {'objective': 0.7319, 'unseen': 0.60585, 'known': 0.85794}, 'defaults': {'objective': 0.686, 'unseen': 0.5315, 'known': 0.8405}, 'trials': 40, 'pruned': 40, 'versions': {'python': '3.13.15', 'numpy': '2.1.3', 'sklearn': '1.6.1', 'lightgbm': '4.6.0', 'torch': '2.11.0+cpu', 'matplotlib': '3.10.0'}}}",
+  "trials": "40",
+  "timeout_hours": "None",
+  "unseen_weight": "0.5"
+ },
+ "dataset": {
+  "tranco_list": "64VVX",
+  "tranco_history": {
+   "VQYYN": "2026-04-16",
+   "8LZGV": "2025-10-16"
+  },
+  "bader_commit": "0faef452d267a62a94124ef2806bc4a72e0913bd",
+  "chrmor_commit": "9dcc29e5cc644fdfd99d82a3abec993c15bbc7bc",
+  "benign": 899903,
+  "benign_stable": 460570,
+  "dga": 218532,
+  "dictionary": 23998,
+  "families": {
+   "bazarbackdoor": 6000,
+   "bumblebee": 6000,
+   "chinad": 6000,
+   "corebot": 4360,
+   "darkcracks": 192,
+   "kraken": 5609,
+   "locky": 6000,
+   "m0yv": 6000,
+   "monerodownloader": 6000,
+   "murofet": 6000,
+   "mydoom": 1960,
+   "necurs": 6000,
+   "newgoz": 6000,
+   "nymaim": 6000,
+   "orchard": 5024,
+   "padcrypt": 6000,
+   "pitou": 6000,
+   "proslikefan": 6000,
+   "pushdo": 6000,
+   "pykspa": 3961,
+   "qadars": 6000,
+   "qakbot": 6000,
+   "ranbyus": 6000,
+   "sharkbot": 2697,
+   "sisron": 6000,
+   "symmi": 6000,
+   "tempedreve": 3572,
+   "tufik": 6000,
+   "unnamed_javascript": 6000,
+   "verblecon": 2192,
+   "zloader": 6000,
+   "dircrypt": 6000,
+   "dnschanger": 6000,
+   "ramnit": 6000,
+   "shiotob": 6000,
+   "banjori": 1000,
+   "dmsniff": 70,
+   "fobber": 600,
+   "fosniw": 202,
+   "ngioweb": 1022,
+   "qsnatch": 2590,
+   "ramdo": 20,
+   "reconyc": 100,
+   "simda": 1000,
+   "tinba": 2211,
+   "vawtrak": 150,
+   "gozi": 6000,
+   "nymaim2": 6000,
+   "suppobox": 5998,
+   "conficker (netlab)": 6000,
+   "cryptolocker (netlab)": 6000,
+   "emotet (netlab)": 6000,
+   "matsnu (netlab)": 6000,
+   "rovnix (netlab)": 6000
+  },
+  "dropped": {
+   "invalid": 0,
+   "duplicate": 6,
+   "popular": 0,
+   "benign_blocklisted": 97
+  },
+  "failed_runs": {},
+  "allowlist": 100000,
+  "external": 266515,
+  "external_overlap": 3485,
+  "blocklists": {
+   "threatfox": {
+    "url": "https://threatfox.abuse.ch/downloads/hostfile/",
+    "domains": 31144,
+    "downloaded": "2026-10-18T21:10:45+00:00",
+    "sha256": "a8a65d514d844831fa87db5c5433f55fb9dfdfae69d430e04b46e96ce30af7a7"
+   },
+   "urlhaus": {
+    "url": "https://urlhaus.abuse.ch/downloads/hostfile/",
+    "domains": 433,
+    "downloaded": "2026-10-18T21:10:45+00:00",
+    "sha256": "6be0ecfd0adfa10e65c1d728cd4c76066ab67d70bc006ea0943c4c9b0bb712ee"
+   }
+  }
+ },
+ "dataset_sha256": "61aeb6adc990964244e9f77bdec15bc8dfd00dd7f8893d884c2ec77dc1b1c52e",
+ "environment": {
+  "host": "42b67800a297",
+  "platform": "Linux-6.18.48+-x86_64-with-glibc2.39",
+  "cpus": 4,
+  "gpu": "",
+  "versions": {
+   "python": "3.13.15",
+   "numpy": "2.1.3",
+   "sklearn": "1.6.1",
+   "lightgbm": "4.6.0",
+   "torch": "2.11.0+cpu",
+   "matplotlib": "3.10.0"
+  },
+  "git_commit": "5c35c112fa52733d45bb6d7997529c2e3fd4b952"
+ },
+ "headline": {
+  "threshold": 0.9558349998164555
+ }
+}

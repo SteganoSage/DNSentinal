@@ -93,7 +93,7 @@ class Tuning(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 pipeline.main(["--mode", "tune", "--data", str(root / "data"), "--out", str(root / "runs"),
                                "--models", "lgbm", "--trials", "3", "--threads", "2"])
-                best = root / "runs" / "main" / "f-ABCDE" / "tune" / "best_params.json"
+                best = root / "runs" / "main" / "f-ABCDEG" / "tune" / "best_params.json"
                 self.assertIn("lgbm", json.loads(best.read_text()))
                 tuned = json.loads(best.read_text())["tuned"]["lgbm"]
                 self.assertTrue(0 <= tuned["unseen"] <= 1 and 0 <= tuned["known"] <= 1)
@@ -102,7 +102,7 @@ class Tuning(unittest.TestCase):
                 pipeline.main(["--mode", "dictionary", "--data", str(root / "data"), "--out", str(root / "runs"),
                                "--models", "lgbm", "--params", str(best), "--bootstrap", "20",
                                "--bootstrap-curve", "5", "--threads", "2"])
-            info = json.loads((root / "runs" / "main" / "f-ABCDE" / "dictionary" / "run_info_dictionary.json")
+            info = json.loads((root / "runs" / "main" / "f-ABCDEG" / "dictionary" / "run_info_dictionary.json")
                               .read_text())
             self.assertEqual(info["params"]["lgbm"], json.loads(best.read_text())["lgbm"])
 
