@@ -40,6 +40,34 @@ Training requires `scikit-learn` and `joblib`. Generated model files are
 ignored by git. Do not train on random strings alone: include CDN-like benign
 domains and multiple real DGA families.
 
+To train the XGBoost comparison model with the same features:
+
+```bash
+python -m ml.dga.xgboost_train ml/data/dga.csv --output models/dga_xgb.joblib
+python -m ml.dga.evaluate models/dga_xgb.joblib ml/data/dga-test.csv
+```
+
+Use the same train/test split and random seed for both models when comparing
+metrics.
+
+To train the LightGBM comparison model:
+
+```bash
+python -m ml.dga.lightgbm_train ml/data/dga.csv --output models/dga_lgbm.joblib
+python -m ml.dga.evaluate models/dga_lgbm.joblib ml/data/dga-test.csv
+```
+
+To train the character-level CNN comparison model:
+
+```bash
+python -m ml.dga.char_cnn_train ml/data/dga-train.csv ml/data/dga-test.csv \
+  --output models/dga_char_cnn.pt
+```
+
+The CNN uses the registrable domain as a character sequence and is trained
+with PyTorch. Its model format is separate from the tree-model `joblib`
+bundles.
+
 ## Current limitation
 
 The fallback public-suffix handling includes only common multi-label suffixes.
