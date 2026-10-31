@@ -41,6 +41,7 @@ import csv
 import gzip
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import pickle
@@ -285,24 +286,38 @@ def _deal(items: list[int], parts: int, rng, group=lambda i: "") -> list[list[in
     return [ordered[i::parts] for i in range(parts)]
 
 
-def hold_back(benign: list[int], captures: list[dict], share: float, rng) -> tuple[list[int], list[int]]:
+def hold_back(benign: list[int], captures: list[dict], share: float, rng, windows: dict[int, int] | None = None,
+              min_windows: int = 0) -> tuple[list[int], list[int]]:
     """(kept, held back): `share` of each benign set's captures, so every set's windows set the threshold.
 
     Not of all of them at random: the crawl's many easy windows would set it
     alone, and the real browsing's harder ones would then be flagged far more
-    often than the target rate.
+    often than the target rate. And at least `min_windows` of each set's
+    windows (counted in `windows`, per capture), up to half its captures: at
+    0.01% of a single browsing capture's ~5,000 windows no window may be
+    flagged, so its one highest-scoring window set the threshold, and one odd
+    window moved it from 0.003 to 0.998 (second full run, 2026-10-31).
     """
     kept, held = [], []
     for kind in sorted({captures[i]["set"] for i in benign}):
         group = [i for i in benign if captures[i]["set"] == kind]
         rng.shuffle(group)
         n = max(1, round(len(group) * share)) if len(group) > 2 else 0
+        if windows is not None and n:
+            while sum(windows.get(i, 0) for i in group[:n]) < min_windows and n < len(group) // 2:
+                n += 1
         held += group[:n]
         kept += group[n:]
     return sorted(kept), sorted(held)
 
 
-def benign_partition(captures: list[dict], args) -> tuple[list[int], list[int], list[int]]:
+def calibration_windows(args) -> int:
+    """Each benign set's held-back windows: enough that --fpr of them is at least one window."""
+    return math.ceil(1 / args.fpr) if args.fpr > 0 else 0
+
+
+def benign_partition(captures: list[dict], args, windows: dict[int, int] | None = None
+                     ) -> tuple[list[int], list[int], list[int]]:
     """(train, calibration, test) benign captures: per set, test 20%, then 10% of the rest held back."""
     rng = np.random.default_rng(args.seed)
     rest, test = [], []
@@ -315,7 +330,7 @@ def benign_partition(captures: list[dict], args) -> tuple[list[int], list[int], 
         n_test = max(1, round(len(group) * args.benign_test)) if len(group) > 1 else 0
         test += group[:n_test]
         rest += group[n_test:]
-    train, calibration = hold_back(rest, captures, args.calibration, rng)
+    train, calibration = hold_back(rest, captures, args.calibration, rng, windows, calibration_windows(args))
     return train, calibration, sorted(test)
 
 
@@ -341,7 +356,8 @@ def splits_for(mode: str, captures: list[dict], rows: Rows, args) -> list[Split]
     tunnels = [i for i, c in enumerate(captures) if c["label"] == "tunnel"]
     known = [i for i in tunnels if captures[i]["set"] in KNOWN_SETS]
     unseen = [i for i in tunnels if captures[i]["set"] in UNSEEN_SETS]
-    benign_train, benign_calibration, benign_test = benign_partition(captures, args)
+    windows = {i: len(rows.by_capture.get(i, ())) for i, c in enumerate(captures) if c["label"] == "benign"}
+    benign_train, benign_calibration, benign_test = benign_partition(captures, args, windows)
     train_s, test_s = args.train_slowdowns, [1.0]
 
     def split(name, train_tunnels, test_tunnels, train_benign=benign_train, calibration=benign_calibration,
@@ -361,7 +377,7 @@ def splits_for(mode: str, captures: list[dict], rows: Rows, args) -> list[Split]
         out = []
         for k in range(args.folds):
             train_b, held = hold_back([i for i in benign if i not in set(benign_folds[k])], captures,
-                                      args.calibration, rng)
+                                      args.calibration, rng, windows, calibration_windows(args))
             out.append(split(f"fold {k + 1}", [i for i in known if i not in set(tunnel_folds[k])], tunnel_folds[k],
                              train_b, held, sorted(benign_folds[k] + apart_folds[k])))
         return out

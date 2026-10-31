@@ -47,8 +47,8 @@ python3 -m venv ~/venvs/dnsentinel-ml && ~/venvs/dnsentinel-ml/bin/pip install -
 
 Captures, not windows, are split: windows of one capture overlap and must not be on both sides
 (`tests/ml/test_tunnel_pipeline.py` checks it). Outside `cv`, the same 20% of each benign set's
-captures is the test set. In every split 10% of each benign set's training captures is held back,
-and each model's threshold is set so that at most 0.01% (`--fpr`) of **each set's** windows are
+captures is the test set. In every split 10% of each benign set's training captures is held back
+(and at least 10,000 of its windows, so that 0.01% of them is a window), and each model's threshold is set so that at most 0.01% (`--fpr`) of **each set's** windows are
 flagged (the strictest set decides; `--calibrate pooled` uses them all together). In the first
 full run the threshold was set on them all together, about 90% crawl windows that score almost
 exactly 0: it came out low (0.008 for LightGBM) and real browsing, scoring a little higher,
@@ -159,6 +159,31 @@ least 1/100, the slowest rate tested then. Cobaltstrike, never trained on, is th
 (0.78-0.84 of its windows). The weak spot is false alerts on real browsing, from where the
 threshold sat (above): the per-set threshold, benign weights, two-window alerts, features D and
 tuning are the answer, measured by the next run.
+
+**Second full run** (2026-10-31, untuned; threshold per benign set, two-window alerts, rates down
+to 1/10000, `V,N,R` and `V,N,R,D`; 48 min):
+
+| | XGBoost D | XGBoost | LightGBM D | HistGB D | RF D | RF |
+|---|---|---|---|---|---|---|
+| Unseen tools | 0.952 | 0.952 | 0.957 | 0.964 | 0.836 | 0.854 |
+| Left-out known tool | **0.994** | 0.798 | 0.766 | 0.913 | 0.694 | 0.930 |
+| Browsing alerts in 39.7 h (`cv`; one window alone; allowlisted) | 4 (13; 0) | 5 (16; 0) | 6 (19; 0) | 5 (15; 0) | 6 (8; 1) | 8 (13; 1) |
+
+- The threshold per benign set did what it was for: browsing alerts fell from 31-52 (first run,
+  one window) to 13-19 with one window, and 4-8 with two (about 2.4-4.8 a day; with the
+  allowlist 0-1). The window false-positive rate is now under the target (3-7e-5).
+- D fixed XGBoost's blind spot: DNS-shell left out, 0.02 of its windows flagged without D, 1.00
+  with it (left-out tools 0.798 -> 0.994). It is kept.
+- The untuned random forest lost recall: its scores move in steps of 1/100 (100 trees) and the
+  stricter threshold landed at 0.3-0.7 (left-out iodine 0.16, tuns 0.34 with D). Tuning is
+  scored at the same threshold: in the first trials it took the forest from 0.947 to 0.999.
+- Rates (D, tree models): every capture caught to 1/10 and 98-99% at 1/100, median delay 15 s.
+  At 1/1000 and 1/10000 two windows come too late for 14-27% (one window alone: 98-99%).
+- Cobaltstrike stays the hardest unseen tool for every model (0.77-0.82 of its windows).
+- In `cv` one fold's threshold for XGBoost was 0.998, the others 0.003-0.2: that fold held back a
+  single browsing capture (~5,000 windows), so at 0.01% its one highest-scoring window set the
+  threshold, and DNS-shell, in that fold, was missed. Each set now holds back at least 1/FPR
+  (10,000) windows, up to half its captures.
 
 ## Tuning
 

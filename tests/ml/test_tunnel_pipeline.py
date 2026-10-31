@@ -130,6 +130,19 @@ class Pipeline(unittest.TestCase):
         self.assertAlmostEqual(weight[:1000].sum(), weight[1000:1100].sum())  # each benign set weighs the same
         self.assertTrue((weight[1100:] == 1).all())
 
+    def test_enough_windows_are_held_back_for_the_threshold(self):
+        from ml.tunnel.pipeline import hold_back
+
+        captures = [{"set": "browsing"}] * 10 + [{"set": "crawl"}] * 10
+        windows = {i: 3000 for i in range(10)} | {i: 50_000 for i in range(10, 20)}
+        kept, held = hold_back(list(range(20)), captures, 0.1, np.random.default_rng(0), windows, 10_000)
+        browsing = [i for i in held if i < 10]
+        self.assertEqual(len(browsing), 4)  # 3 x 3000 windows aren't 10,000: a fourth capture
+        self.assertEqual(len([i for i in held if i >= 10]), 1)  # one crawl capture is plenty
+        self.assertEqual(sorted(kept + held), list(range(20)))
+        _, capped = hold_back(list(range(10)), captures, 0.1, np.random.default_rng(0), windows, 10**9)
+        self.assertEqual(len(capped), 5)  # never more than half a set
+
     def test_folds_spread_each_tool(self):
         from ml.tunnel.pipeline import _deal
 
@@ -145,7 +158,7 @@ class Pipeline(unittest.TestCase):
 
         args = argparse.Namespace(data=self.root / "data", out=self.root / "leak", cache=None, fraction=1.0, seed=42,
                                   step=10.0, train_slowdowns=[1, 2], test_slowdowns=[1, 10], threads=2, folds=3,
-                                  calibration=0.1, benign_test=0.2, test_only={"wildcard"})
+                                  calibration=0.1, benign_test=0.2, test_only={"wildcard"}, fpr=1e-4)
         with contextlib.redirect_stdout(io.StringIO()):
             captures, table = pipeline.load(args, 60.0)
         rows = pipeline.Rows(table)
