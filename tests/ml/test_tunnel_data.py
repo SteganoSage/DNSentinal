@@ -5,12 +5,15 @@ import csv
 import gzip
 import io
 import json
+import tarfile
 import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
 
 from ml.tunnel import data
+from ml.tunnel.pcap import Stats
+from tests.ml.test_tunnel_pcap import dns, ethernet, pcap_file, udp4
 
 
 class PinnedSources(unittest.TestCase):
@@ -40,6 +43,34 @@ class PinnedSources(unittest.TestCase):
             self.assertEqual((capture.set, capture.label, capture.tool), expected, path)
         tools = {data.graphtunnel_capture(p).tool for p in data.GRAPHTUNNEL["files"] if p.startswith("tunnel/")}
         self.assertEqual(tools, {"dnscat2", "dnspot", "iodine", "dns-shell", "tuns"})
+
+    def test_korving_sessions_and_where_their_tools_go(self):
+        files = data.KORVING["files"]
+        self.assertEqual(len(data.KORVING["commit"]), 40)
+        self.assertEqual(len(files), 136)
+        self.assertEqual(Counter(s["tool"] for s in files.values()), {"iodine": 96, "dns2tcp": 32, "dnscat2": 8})
+        self.assertEqual(Counter(s["server"] for s in files.values()),
+                         {"bind9": 34, "coredns": 34, "dnsmasq": 34, "powerdns": 34})
+        captures = [data.korving_capture(archive) for archive in files]
+        self.assertEqual(len({c.capture for c in captures}), 136)
+        # dns2tcp is one of GraphTunnel's held-out tools, so it stays held out here too
+        self.assertEqual({(c.tool, c.set) for c in captures},
+                         {("iodine", "known"), ("dnscat2", "known"), ("dns2tcp", "unknown")})
+        self.assertIn("dns2tcp", data.UNSEEN_TOOLS)
+
+    def test_korving_archives_keep_only_the_clients_queries(self):
+        query = dns(1, [b"abcdefgh", b"example", b"attack"], 10)
+        frames = [(1.0, ethernet(udp4("192.168.0.30", "192.168.0.10", 4000, 53, query))),   # client -> resolver
+                  (1.1, ethernet(udp4("192.168.0.10", "192.168.0.20", 5000, 53, query)))]   # resolver -> upstream
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp) / "dns.pcap"
+            capture.write_bytes(pcap_file(frames))
+            archive = Path(tmp) / "session_full_dataset.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(capture, arcname="session/bind9/dns.pcap")
+            events = data.korving_events(archive, "192.168.0.30", Stats())
+        self.assertEqual([(e.client, e.qname, e.qtype) for e in events],
+                         [("192.168.0.30", "abcdefgh.example.attack", "NULL")])
 
     def test_browsing_choices(self):
         def sizes(browsing):

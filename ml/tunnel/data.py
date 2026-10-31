@@ -19,6 +19,14 @@ graphtunnel  ggyggy666/DNS-Tunnel-Datasets (the GraphTunnel paper's data) at
              The pcapng files in the subfolders hold the same packets as the
              whole captures again and are not used (tunnel/dns2tcp-key/ is
              unkownTunnel/dns2tcp-key.pcap).
+korving      Korving-F/dns-tunnel-dataset at the commit in korving_files.json,
+             which pins each session's archive (size, git blob SHA-1) and
+             settings: 136 short sessions of iodine (6 record types x 4
+             encodings), dns2tcp and dnscat2, each through one of four
+             resolvers (BIND 9, CoreDNS, dnsmasq, PowerDNS). Captured on the
+             lab resolver, so only the client's own queries are kept (not the
+             resolver's copies sent upstream). dns2tcp is in the "unknown" set,
+             as GraphTunnel's is, so `unknown` still tests a tool never trained on.
 stratosphere The Stratosphere Lab's normal captures (CTU-Normal-*): real
              people's machines browsing for hours ("browsing"). Most are
              full captures; only their DNS is kept. No published hashes, so
@@ -34,7 +42,7 @@ A tunnel capture's tunnel is the registrable domain it queries most
 (captures.csv: tunnel_domain); the pipeline labels that domain's windows as
 tunnel and leaves the capture's other traffic out.
 
-    python -m ml.tunnel.data --out ml/data/tunnel            # downloads (~6.8 GB) and parses
+    python -m ml.tunnel.data --out ml/data/tunnel            # downloads (~7.5 GB) and parses
     python -m ml.tunnel.data --out x --browsing small        # only the smaller browsing captures (~1.1 GB)
     python -m ml.tunnel.data --out /tmp/x --smoke            # tiny made-up dataset for tests
 """
@@ -51,6 +59,7 @@ import json
 import random
 import shutil
 import string
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -68,7 +77,8 @@ from .pcap import Stats, read_events
 
 HERE = Path(__file__).resolve().parent
 GRAPHTUNNEL = json.loads((HERE / "graphtunnel_files.json").read_text())
-GRAPHTUNNEL_URL = "https://raw.githubusercontent.com/{repository}/{commit}/{path}"
+KORVING = json.loads((HERE / "korving_files.json").read_text())
+GITHUB_FILE = "https://raw.githubusercontent.com/{repository}/{commit}/{path}"
 GRAPHTUNNEL_SETS = {"tunnel": "known", "unkownTunnel": "unknown", "crossEndPoint": "android",
                     "normal": "crawl", "wildcard": "wildcard"}
 TOOL_NAMES = {"cobalstrike": "cobaltstrike"}  # the repository's spelling
@@ -182,12 +192,38 @@ def graphtunnel_capture(path: str) -> Capture:
     return Capture(f"graphtunnel/{folder}/{stem}", "graphtunnel", kind, "tunnel", tool=tool, file=path)
 
 
+# GraphTunnel's held-out tools: held out wherever they come from
+UNSEEN_TOOLS = frozenset(graphtunnel_capture(p).tool for p in GRAPHTUNNEL["files"] if p.startswith("unkownTunnel/"))
+
+
+def korving_capture(archive: str) -> Capture:
+    """A Korving-F session, named by its settings: korving/file_transfer/iodine-null-base128-bind9-0455ce."""
+    s = KORVING["files"][archive]
+    settings = "-".join(v.lower() for v in (s["tool"], s["rtype"], s["encoding"], s["compression"], s["server"]) if v)
+    session = archive.split("/")[1]
+    return Capture(f"korving/{s['scenario']}/{settings}-{session[:6]}", "korving",
+                   "unknown" if s["tool"] in UNSEEN_TOOLS else "known", "tunnel", tool=s["tool"], file=archive)
+
+
+def korving_events(archive: Path, client: str, stats: Stats) -> list:
+    """The client's queries in a session archive's dns.pcap (read from the archive, not unpacked)."""
+    with tarfile.open(archive) as tar:
+        member = next((m for m in tar if m.name.endswith("/dns.pcap")), None)
+        if member is None:
+            raise RuntimeError(f"{archive}: no dns.pcap")
+        events = read_events(tar.extractfile(member), stats)
+    return [e for e in events if e.client == client]
+
+
 def captures_for(browsing: str, local: Path | None) -> list[tuple[Capture, str | None, Path | None, int | None]]:
     """(capture, URL or None, local file or None, expected size) for every capture to build."""
     jobs = []
     for path, (size, _) in GRAPHTUNNEL["files"].items():
-        url = GRAPHTUNNEL_URL.format(repository=GRAPHTUNNEL["repository"], commit=GRAPHTUNNEL["commit"], path=path)
+        url = GITHUB_FILE.format(repository=GRAPHTUNNEL["repository"], commit=GRAPHTUNNEL["commit"], path=path)
         jobs.append((graphtunnel_capture(path), url, None, size))
+    for archive, session in KORVING["files"].items():
+        url = GITHUB_FILE.format(repository=KORVING["repository"], commit=KORVING["commit"], path=archive)
+        jobs.append((korving_capture(archive), url, None, session["size"]))
     for name, (path, size) in STRATOSPHERE.items():
         if browsing == "all" or (browsing == "small" and size <= SMALL_BROWSING):
             jobs.append((Capture(f"stratosphere/{name}", "stratosphere", "browsing", "benign", file=path),
@@ -247,16 +283,20 @@ def _build_one(capture: Capture, url: str | None, file: Path | None, size: int |
     if file is None:
         file = fetch(url, cache / "pcaps" / capture.source / Path(capture.file), size)
     capture.bytes = file.stat().st_size
-    if capture.source == "graphtunnel":
+    if capture.source in ("graphtunnel", "korving"):  # pinned by git's own hash
         capture.digest = git_blob_sha1(file)
-        expected = GRAPHTUNNEL["files"][capture.file][1]
-        if capture.digest != expected:
+        pinned = (GRAPHTUNNEL["files"][capture.file][1] if capture.source == "graphtunnel"
+                  else KORVING["files"][capture.file]["sha1"])
+        if capture.digest != pinned:
             file.unlink()
-            raise RuntimeError(f"{capture.file}: git blob SHA-1 {capture.digest}, expected {expected}")
+            raise RuntimeError(f"{capture.file}: git blob SHA-1 {capture.digest}, expected {pinned}")
     else:
         capture.digest = sha256(file)
     stats = Stats()
-    events = read_events(file, stats)
+    if capture.source == "korving":
+        events = korving_events(file, KORVING["files"][capture.file]["client"], stats)
+    else:
+        events = read_events(file, stats)
     summarise(capture, events)
     write_events(events_path, capture.capture, events)
     meta_path.write_text(json.dumps({"capture": asdict(capture), "stats": asdict(stats)}) + "\n")
@@ -289,6 +329,7 @@ def build(out: Path, cache: Path, browsing: str = "all", local: Path | None = No
     (out / "allowlist_top100k.txt").write_text("\n".join(popular) + "\n")
     return _write(out, cache, built, {
         "graphtunnel": {"repository": GRAPHTUNNEL["repository"], "commit": GRAPHTUNNEL["commit"]},
+        "korving": {"repository": KORVING["repository"], "commit": KORVING["commit"]},
         "stratosphere": {"url": STRATOSPHERE_URL, "browsing": browsing},
         "allowlist": {"url": ALLOWLIST_URL, "domains": len(popular)},
         "local": str(local) if local else None,

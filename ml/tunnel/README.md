@@ -9,7 +9,7 @@ everything here builds its data, trains it and measures it.
 |---|---|
 | `pcap.py` | Query events from pcap/pcapng captures, in the resolver's own form (name text, rcode, response size) |
 | `data.py` | Builds the dataset from pinned sources (`ml/DATA.md`), or your own captures |
-| `graphtunnel_files.json` | The GraphTunnel files used: commit, sizes, git blob hashes |
+| `graphtunnel_files.json`, `korving_files.json` | The tunnel captures used: commits, sizes, git blob hashes (and each Korving session's settings) |
 | `pipeline.py` | Cuts the detector's windows, trains and evaluates every E8 split, writes the final model |
 | `models.py` | The candidates and E8's baselines |
 | `plots.py`, `leaderboard.py` | F10, F11, ROC/PR; every run side by side |
@@ -24,12 +24,12 @@ Locally (`ml/requirements.txt`):
 
 ```bash
 python3 -m venv ~/venvs/dnsentinel-ml && ~/venvs/dnsentinel-ml/bin/pip install -r ml/requirements.txt
-~/venvs/dnsentinel-ml/bin/python -m ml.tunnel.data --out ml/data/tunnel     # downloads ~6.8 GB, keeps ~1 GB
+~/venvs/dnsentinel-ml/bin/python -m ml.tunnel.data --out ml/data/tunnel     # downloads ~7.5 GB, keeps ~1.5 GB
 ~/venvs/dnsentinel-ml/bin/python -m ml.tunnel.pipeline --mode all           # or cv, tool, unknown, rates, final
 ~/venvs/dnsentinel-ml/bin/python -m ml.tunnel.leaderboard ml/runs/tunnel
 ```
 
-`--browsing small` downloads only the smaller browsing captures (~1.8 GB in all); `--fraction
+`--browsing small` downloads only the smaller browsing captures (~2.5 GB in all); `--fraction
 0.1` trains on a tenth of each benign set, for a quick look; `python -m ml.tunnel.data --out
 /tmp/x --smoke` makes a tiny made-up dataset with the same files, without the network.
 
@@ -39,15 +39,21 @@ python3 -m venv ~/venvs/dnsentinel-ml && ~/venvs/dnsentinel-ml/bin/pip install -
 |---|---|---|---|
 | `cv` | 5 folds over captures: known tools and every benign set | the held-out captures | ROC/PR, false alerts a day per benign set |
 | `tool` | every known tool but one | the one left out | recall per tool |
-| `unknown` | the known tools | tools never trained on: cobaltstrike, dns2tcp, ozymandns, tcp-over-dns, and iodine's Android client | recall per tool (GraphTunnel's robustness test) |
+| `unknown` | the known tools | tools never trained on: cobaltstrike, dns2tcp (GraphTunnel's and Korving's), ozymandns, tcp-over-dns, and iodine's Android client | recall per tool (GraphTunnel's robustness test) |
 | `rates` | 5 folds over known-tool captures | each held-out capture at every rate | F10, F11, T5, R_min |
 | `final` | everything | — | `tunnel_lgbm.txt`, `model.json` |
 
 Captures, not windows, are split: windows of one capture overlap and must not be on both sides
 (`tests/ml/test_tunnel_pipeline.py` checks it). Outside `cv`, the same 20% of each benign set's
-captures is the test set. In every split 10% of the benign training captures is held back, and
-each model's threshold is set so that at most 0.01% (`--fpr`) of their windows are flagged. The
-hand-written rules keep their own "high" threshold.
+captures is the test set. In every split 10% of each benign set's training captures is held back,
+and each model's threshold is set so that at most 0.01% (`--fpr`) of their windows are flagged:
+per set, so the real browsing's harder windows always help set it, not only the crawl's easy
+ones. The hand-written rules keep their own "high" threshold.
+
+`cv` and `rates` deal captures into folds tool by tool, so each tool's captures spread over the
+folds and the tools with a single capture land in different ones. Dealt at random, dnspot and
+DNS-shell (the only tunnels in A records) once fell in the same fold: that fold's model had seen
+no A-record tunnel and missed both, which is `tool` mode's question, not `cv`'s.
 
 **Wildcard DNS is only tested.** Enumerating a wildcard domain's subdomains makes thousands of
 unique names under one domain a minute: the very shape of a tunnel, which training on it as

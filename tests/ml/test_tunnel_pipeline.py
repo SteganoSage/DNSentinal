@@ -75,6 +75,16 @@ class Pipeline(unittest.TestCase):
             self.assertEqual(leaderboard.main(), 0)
         self.assertIn("lgbm", (runs / "leaderboard.md").read_text())
 
+    def test_folds_spread_each_tool(self):
+        from ml.tunnel.pipeline import _deal
+
+        tools = {0: "dnspot", 1: "dns-shell", 2: "tuns", **{i: "iodine" for i in range(3, 20)}}
+        folds = _deal(list(tools), 5, np.random.default_rng(0), tools.get)
+        self.assertEqual(sorted(i for f in folds for i in f), list(tools))
+        where = {i: k for k, f in enumerate(folds) for i in f}
+        self.assertEqual(len({where[0], where[1], where[2]}), 3)  # single-capture tools: different folds
+        self.assertTrue(all(any(tools[i] == "iodine" for i in f) for f in folds))
+
     def test_no_capture_is_on_both_sides_of_a_split(self):
         from ml.tunnel import pipeline
 

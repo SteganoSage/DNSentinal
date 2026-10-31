@@ -261,48 +261,50 @@ def dns_message(message: bytes) -> tuple[bool, int, int, str, str] | None:
 # ─── Events ─────────────────────────────────────────────────────────────────
 
 
-def read_events(path: str | Path, stats: Stats | None = None) -> list[Query]:
-    """Every query in a capture with its response's rcode and size, in time order."""
+def read_events(capture: str | Path | BinaryIO, stats: Stats | None = None) -> list[Query]:
+    """Every query in a capture (a file, or an open stream) with its response's rcode and size, in time order."""
+    if not hasattr(capture, "read"):
+        with open(capture, "rb") as stream:
+            return read_events(stream, stats)
     stats = stats if stats is not None else Stats()
     asked: list[list] = []  # [time, client, name, type, rcode, size], filled in as responses match
     waiting: dict[tuple, list[tuple[float, int]]] = defaultdict(list)  # key -> [(time, index in asked)]
     answers: dict[tuple, list[tuple[float, int, int]]] = defaultdict(list)  # key -> [(time, rcode, size)]
-    with open(path, "rb") as stream:
-        for timestamp, link, frame in packets(stream):
-            stats.packets += 1
-            network = _network(link, frame)
-            if network is None:
-                if link not in _LINKS:
-                    stats.other_links[link] = stats.other_links.get(link, 0) + 1
-                continue
-            transport = _transport(*network, stats)
-            if transport is None or transport[2] not in (6, 17) or len(transport[3]) < 8:
-                continue
-            source, destination, protocol, segment = transport
-            source_port, destination_port, length = struct.unpack("!HHH", segment[:6])
-            if 53 not in (source_port, destination_port):
-                continue
-            if protocol == 6:
-                stats.tcp_dns += 1
-                continue
-            stats.dns += 1
-            try:
-                parsed = dns_message(segment[8:])
-            except ValueError:
-                stats.malformed += 1
-                continue
-            if parsed is None:
-                continue
-            response, ident, rcode, qname, qtype = parsed
-            if response and source_port == 53:
-                stats.responses += 1
-                # length - 8: the whole message, also when the capture holds only its first fragment
-                answers[(destination, destination_port, source, ident, qname, qtype)].append(
-                    (timestamp, rcode, length - 8))
-            elif not response and destination_port == 53:
-                stats.queries += 1
-                waiting[(source, source_port, destination, ident, qname, qtype)].append((timestamp, len(asked)))
-                asked.append([timestamp, source, qname, qtype, NO_RESPONSE, 0])
+    for timestamp, link, frame in packets(capture):
+        stats.packets += 1
+        network = _network(link, frame)
+        if network is None:
+            if link not in _LINKS:
+                stats.other_links[link] = stats.other_links.get(link, 0) + 1
+            continue
+        transport = _transport(*network, stats)
+        if transport is None or transport[2] not in (6, 17) or len(transport[3]) < 8:
+            continue
+        source, destination, protocol, segment = transport
+        source_port, destination_port, length = struct.unpack("!HHH", segment[:6])
+        if 53 not in (source_port, destination_port):
+            continue
+        if protocol == 6:
+            stats.tcp_dns += 1
+            continue
+        stats.dns += 1
+        try:
+            parsed = dns_message(segment[8:])
+        except ValueError:
+            stats.malformed += 1
+            continue
+        if parsed is None:
+            continue
+        response, ident, rcode, qname, qtype = parsed
+        if response and source_port == 53:
+            stats.responses += 1
+            # length - 8: the whole message, also when the capture holds only its first fragment
+            answers[(destination, destination_port, source, ident, qname, qtype)].append(
+                (timestamp, rcode, length - 8))
+        elif not response and destination_port == 53:
+            stats.queries += 1
+            waiting[(source, source_port, destination, ident, qname, qtype)].append((timestamp, len(asked)))
+            asked.append([timestamp, source, qname, qtype, NO_RESPONSE, 0])
     for key, replies in answers.items():
         pending = sorted(waiting.get(key, ()))
         position = 0

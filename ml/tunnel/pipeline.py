@@ -149,9 +149,21 @@ def choose_captures(captures: list[dict], fraction: float, seed: int) -> list[di
     return sorted(kept, key=lambda c: c["capture"])
 
 
+def events_file(data: Path) -> Path:
+    """events.csv.gz, or events.csv if it was unpacked (as uploading a dataset may do)."""
+    return data / "events.csv.gz" if (data / "events.csv.gz").exists() else data / "events.csv"
+
+
+def dataset_info(data: Path) -> dict:
+    """dataset_info.json, if it came with the data: only events and captures.csv are needed."""
+    path = data / "dataset_info.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
 def read_events(path: Path, wanted: set[str]) -> dict[str, list[tuple]]:
     grouped: dict[str, list[tuple]] = defaultdict(list)
-    with gzip.open(path, "rt", newline="") as stream:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", newline="") as stream:
         reader = csv.reader(stream)
         next(reader)
         for capture, *event in reader:
@@ -199,23 +211,28 @@ def load(args, window: float) -> tuple[list[dict], Table]:
     """The captures and their windows; the windows are cached (--cache), keyed by everything they depend on."""
     captures = choose_captures(read_captures(args.data / "captures.csv"), args.fraction, args.seed)
     slowdowns = sorted(set(args.train_slowdowns) | set(args.test_slowdowns))
-    info = json.loads((args.data / "dataset_info.json").read_text())
-    stamp = json.dumps([info.get("events_sha256"), [c["capture"] for c in captures], slowdowns, window, args.step,
-                        ALL_FEATURES, _code_digest()])
+    events = events_file(args.data)
+    stamp = json.dumps([dataset_info(args.data).get("events_sha256") or f"{events.name}:{events.stat().st_size}",
+                        [c["capture"] for c in captures], slowdowns, window, args.step,
+                        ALL_FEATURES, _code_digest(), 2])  # 2: the cache's format
     digest = hashlib.sha256(stamp.encode()).hexdigest()[:12]
     cache = (args.cache or args.out / "cache") / f"windows-w{window:g}-s{args.step:g}-{digest}.pkl"
     if cache.exists():
         log(f"windows from {cache}")
         with open(cache, "rb") as stream:
-            return captures, pickle.load(stream)
-    log(f"reading {args.data / 'events.csv.gz'}")
-    events = read_events(args.data / "events.csv.gz", {c["capture"] for c in captures})
+            state = pickle.load(stream)
+        state["tracks"] = {c: Track(*track) for c, track in state["tracks"].items()}
+        return captures, Table(**state)
+    log(f"reading {events}")
+    events = read_events(events, {c["capture"] for c in captures})
     log(f"cutting windows ({window:g} s every {args.step:g} s) of {len(captures)} captures, "
         f"{sum(map(len, events.values())):,} queries, at slowdowns {slowdowns}")
     table = build_table(captures, events, slowdowns, window, args.step, args.threads)
     cache.parent.mkdir(parents=True, exist_ok=True)
+    # plain arrays and tuples, not the classes: `python -m` would record them as __main__'s
+    state = dict(vars(table), tracks={c: (t.start, t.times, t.upstream) for c, t in table.tracks.items()})
     with open(cache.with_suffix(".part"), "wb") as stream:
-        pickle.dump(table, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(state, stream, protocol=pickle.HIGHEST_PROTOCOL)
     cache.with_suffix(".part").rename(cache)
     return captures, table
 
@@ -237,16 +254,46 @@ class Split:
     test: np.ndarray
 
 
-def _deal(items: list[int], parts: int, rng) -> list[list[int]]:
-    items = list(items)
-    rng.shuffle(items)
-    return [items[i::parts] for i in range(parts)]
+def _deal(items: list[int], parts: int, rng, group=lambda i: "") -> list[list[int]]:
+    """Captures dealt into folds round-robin, group by group (smallest first), shuffled within each.
+
+    Grouped by tool, every tool's captures spread over the folds, and tools
+    with one capture each land in different folds: two that only resemble each
+    other (dnspot and DNS-shell, the only A-record tunnels) must not be held out
+    together, or `cv` turns into a leave-two-tools-out test by chance.
+    """
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i in items:
+        groups[group(i)].append(i)
+    ordered = []
+    for name in sorted(groups, key=lambda g: (len(groups[g]), g)):
+        members = list(groups[name])
+        rng.shuffle(members)
+        ordered += members
+    return [ordered[i::parts] for i in range(parts)]
+
+
+def hold_back(benign: list[int], captures: list[dict], share: float, rng) -> tuple[list[int], list[int]]:
+    """(kept, held back): `share` of each benign set's captures, so every set's windows set the threshold.
+
+    Not of all of them at random: the crawl's many easy windows would set it
+    alone, and the real browsing's harder ones would then be flagged far more
+    often than the target rate.
+    """
+    kept, held = [], []
+    for kind in sorted({captures[i]["set"] for i in benign}):
+        group = [i for i in benign if captures[i]["set"] == kind]
+        rng.shuffle(group)
+        n = max(1, round(len(group) * share)) if len(group) > 2 else 0
+        held += group[:n]
+        kept += group[n:]
+    return sorted(kept), sorted(held)
 
 
 def benign_partition(captures: list[dict], args) -> tuple[list[int], list[int], list[int]]:
     """(train, calibration, test) benign captures: per set, test 20%, then 10% of the rest held back."""
     rng = np.random.default_rng(args.seed)
-    train, calibration, test = [], [], []
+    rest, test = [], []
     for kind in sorted({c["set"] for c in captures if c["label"] == "benign"}):
         group = [i for i, c in enumerate(captures) if c["set"] == kind]
         if kind in args.test_only:
@@ -254,12 +301,10 @@ def benign_partition(captures: list[dict], args) -> tuple[list[int], list[int], 
             continue
         rng.shuffle(group)
         n_test = max(1, round(len(group) * args.benign_test)) if len(group) > 1 else 0
-        rest = group[n_test:]
-        n_calibration = max(1, round(len(rest) * args.calibration)) if len(rest) > 2 else 0
         test += group[:n_test]
-        calibration += rest[:n_calibration]
-        train += rest[n_calibration:]
-    return sorted(train), sorted(calibration), sorted(test)
+        rest += group[n_test:]
+    train, calibration = hold_back(rest, captures, args.calibration, rng)
+    return train, calibration, sorted(test)
 
 
 class Rows:
@@ -298,15 +343,13 @@ def splits_for(mode: str, captures: list[dict], rows: Rows, args) -> list[Split]
     if mode == "cv":
         benign = [i for i, c in enumerate(captures) if c["label"] == "benign" and c["set"] not in args.test_only]
         apart = [i for i, c in enumerate(captures) if c["set"] in args.test_only]
-        tunnel_folds = _deal(known, args.folds, rng)
-        benign_folds = [sorted(f) for f in _deal(benign, args.folds, rng)]
+        tunnel_folds = _deal(known, args.folds, rng, lambda i: captures[i]["tool"])
+        benign_folds = [sorted(f) for f in _deal(benign, args.folds, rng, lambda i: captures[i]["set"])]
         apart_folds = _deal(apart, args.folds, rng)  # tested once each, by whichever fold
         out = []
         for k in range(args.folds):
-            train_b = [i for i in benign if i not in set(benign_folds[k])]
-            n_cal = max(1, round(len(train_b) * args.calibration)) if len(train_b) > 2 else 0
-            held = [train_b[j] for j in sorted(rng.choice(len(train_b), n_cal, replace=False))]
-            train_b = [i for i in train_b if i not in set(held)]
+            train_b, held = hold_back([i for i in benign if i not in set(benign_folds[k])], captures,
+                                      args.calibration, rng)
             out.append(split(f"fold {k + 1}", [i for i in known if i not in set(tunnel_folds[k])], tunnel_folds[k],
                              train_b, held, sorted(benign_folds[k] + apart_folds[k])))
         return out
@@ -317,7 +360,7 @@ def splits_for(mode: str, captures: list[dict], rows: Rows, args) -> list[Split]
     if mode == "unknown":
         return [split("unknown tools", known, unseen)]
     if mode == "rates":
-        folds = _deal(known, args.folds, rng)
+        folds = _deal(known, args.folds, rng, lambda i: captures[i]["tool"])
         return [split(f"fold {k + 1}", [i for i in known if i not in set(f)], f, test_slowdowns=args.test_slowdowns)
                 for k, f in enumerate(folds) if f]
     if mode == "final":
@@ -604,7 +647,7 @@ def save_final(result: SplitResult, captures: list[dict], table: Table, groups: 
         "trained_on": {"tunnel_windows": int(table.y[rows].sum()), "benign_windows": int((~table.y[rows]).sum()),
                        "captures": len(trained),
                        "tools": sorted({captures[c]["tool"] for c in table.capture[rows] if captures[c]["tool"]})},
-        "dataset_sha256": json.loads((args.data / "dataset_info.json").read_text()).get("events_sha256"),
+        "dataset_sha256": dataset_info(args.data).get("events_sha256"),
         "lightgbm_params": model.params,
     }
     (out / "model.json").write_text(json.dumps(card, indent=1) + "\n")
@@ -669,7 +712,7 @@ def run_mode(mode: str, captures: list[dict], table: Table, rows: Rows, groups: 
         "splits": [{"name": s.name, "train": len(s.train), "calibration": len(s.calibration), "test": len(s.test),
                     "test_tunnel": int(table.y[s.test].sum())} for s in splits],
         "params": args.params, "seconds": round(time.monotonic() - started, 1),
-        "dataset": json.loads((args.data / "dataset_info.json").read_text()),
+        "dataset": dataset_info(args.data),
         "environment": environment(),
         "headline": headline(mode, report),
     }
@@ -739,8 +782,10 @@ def main(argv: list[str] | None = None) -> None:
     missing = [m for m in args.models + [args.final_model] if not models.available(m)]
     if missing:
         raise SystemExit(f"not installed: {missing} (pip install -r ml/requirements.txt)")
-    if not (args.data / "events.csv.gz").exists():
-        raise SystemExit(f"no {args.data / 'events.csv.gz'}: run python -m ml.tunnel.data --out {args.data}")
+    missing = [str(path) for path in (events_file(args.data), args.data / "captures.csv") if not path.exists()]
+    if missing:
+        raise SystemExit(f"no {' or '.join(missing)} (events.csv.gz or events.csv, and captures.csv): "
+                         f"run python -m ml.tunnel.data --out {args.data}")
     allowlist_path = args.allowlist or args.data / "allowlist_top100k.txt"
     allowlist = set(allowlist_path.read_text().split()) if allowlist_path.exists() else set()
     feature_sets = [parse_groups(text) for text in args.features]

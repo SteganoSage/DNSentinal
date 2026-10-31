@@ -39,6 +39,7 @@ the events the resolver gives the detector: `events.csv.gz`, one row per query, 
 | Part | Source | Pinned at | Licence | Used for |
 |---|---|---|---|---|
 | Tunnels | [ggyggy666/DNS-Tunnel-Datasets](https://github.com/ggyggy666/DNS-Tunnel-Datasets), the GraphTunnel paper's data: `tunnel/` (dnscat2, dnspot, iodine, DNS-shell, tuns, in each record type they support), `unkownTunnel/` (cobaltstrike, dns2tcp, ozymandns, tcp-over-dns), `crossEndPoint/` (AndIodine) | commit `e3dccb8`; every file's size and git blob SHA-1 in `ml/tunnel/graphtunnel_files.json`, checked after download | none stated; its README asks to cite the dataset and *GraphTunnel: Robust DNS Tunnel Detection Based on DNS Recursive Resolution Graph* | the `known` tools (trained on), the `unknown` and `android` tools (never trained on in `unknown` mode) |
+| More tunnels | [Korving-F/dns-tunnel-dataset](https://github.com/Korving-F/dns-tunnel-dataset): 136 short lab sessions (C2 and file transfer) of iodine (CNAME, MX, NULL, PRIVATE, SRV, TXT x base32, base64, base128, raw), dns2tcp (KEY, TXT) and dnscat2, each through one of four resolvers (BIND 9, CoreDNS, dnsmasq, PowerDNS) | commit `bdc4486`; every archive's size and git blob SHA-1, and each session's settings from its `.metadata`, in `ml/tunnel/korving_files.json` | the DACA framework that made it is MIT (Frank Korving, 2022); cite the repository | iodine and dnscat2 join the `known` tools; dns2tcp stays in `unknown`, as GraphTunnel's does. Captured on the lab resolver: only the client's queries (192.168.0.30) are kept, not the resolver's copies sent upstream |
 | Crawl | the same repository's `normal/`: one client resolving Cloudflare's top million domains | as above | as above | benign; mostly single queries per domain |
 | Wildcard | the same repository's `wildcard/`: subdomains of wildcard-DNS domains, enumerated | as above | as above | benign, **test only**: false alerts on traffic shaped like a tunnel |
 | Browsing | [Stratosphere Lab](https://www.stratosphereips.org/datasets-normal) normal captures CTU-Normal-4 (a home network, DNS only), 20-31 (Windows and Kali machines browsing Alexa/Moz top sites for hours, 2017; full captures, of which only DNS is kept) and 32 (DNS only) | file sizes in `data.py`; SHA-256 in `dataset_info.json` (no published hashes) | free to use citing Garcia, S., *Malware Capture Facility Project*, stratosphereips.org | benign: real people's browsing, the false alerts a day that matter |
@@ -47,7 +48,9 @@ the events the resolver gives the detector: `events.csv.gz`, one row per query, 
 
 The subfolders of the GraphTunnel repository hold the same captures again, split into pcapng
 parts, and are not used (`tunnel/dns2tcp-key/` is `unkownTunnel/dns2tcp-key.pcap`). Every tunnel
-there uses one domain (`ggy666.tk`); no feature names the domain, so a model can't learn it.
+there uses one domain (`ggy666.tk`) and every Korving session another (`example.attack`); no feature
+names the domain, so a model can't learn it. Korving's sessions are short (seconds to minutes, file
+transfers at full speed): they add many more tunnel sessions and settings, not many windows.
 
 ## Committed lists (`config/`)
 
