@@ -36,8 +36,8 @@ class Model:
     name = ""
     fixed_threshold: float | None = None  # None: set for the target false-positive rate
 
-    def fit(self, X: np.ndarray, y: np.ndarray, full: np.ndarray) -> "Model":
-        """X: the selected feature columns; full: every feature (for the baselines)."""
+    def fit(self, X: np.ndarray, y: np.ndarray, full: np.ndarray, weight: np.ndarray | None = None) -> "Model":
+        """X: the selected feature columns; full: every feature (for the baselines); weight: per window."""
         return self
 
     def score(self, X: np.ndarray, full: np.ndarray) -> np.ndarray:
@@ -56,8 +56,8 @@ class Trees(Model):
     def params(self) -> dict:
         return self.inner.params
 
-    def fit(self, X, y, full):
-        self.inner.fit(dga_models.Batch(X, _NOTHING, _NOTHING, y=y))
+    def fit(self, X, y, full, weight=None):
+        self.inner.fit(dga_models.Batch(X, _NOTHING, _NOTHING, y=y, weight=weight))
         return self
 
     def score(self, X, full):
@@ -74,10 +74,11 @@ class IsolationForest(Model):
         self.params = dict(n_estimators=200, max_samples=256, random_state=seed, n_jobs=threads) | (params or {})
         self.model = None
 
-    def fit(self, X, y, full):
+    def fit(self, X, y, full, weight=None):
         from sklearn.ensemble import IsolationForest as Forest
 
-        self.model = Forest(**self.params).fit(X[~np.asarray(y, dtype=bool)])
+        benign = ~np.asarray(y, dtype=bool)
+        self.model = Forest(**self.params).fit(X[benign], sample_weight=None if weight is None else weight[benign])
         return self
 
     def score(self, X, full):

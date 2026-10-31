@@ -72,6 +72,16 @@ class Features(unittest.TestCase):
                   DnsEvent(1.0, "c", "b.example.com", rcode="NONE")]
         self.assertEqual(extract_features(events).mean_response_size, 100)
 
+    def test_data_carried(self):
+        events = [DnsEvent(0.0, "c", "deadbeef0123.abcdefghijklmnopqrstuvwxyz0123456789ab.t.example"),
+                  DnsEvent(1.0, "c", "deadbeef0123.abcdefghijklmnopqrstuvwxyz0123456789ab.t.example"),  # sent twice
+                  DnsEvent(2.0, "c", "ff.t.example")]
+        features = extract_features(events)
+        self.assertEqual(features.unique_subdomain_bytes, 12 + 38 + 2)  # the repeat counted once
+        self.assertAlmostEqual(features.long_label_ratio, 2 / 5)  # labels of 12, 38, 12, 38 and 2 bytes
+        self.assertAlmostEqual(features.hex_ratio, (2 * (12 + 6 + 10 + 2) + 2) / 102)
+        self.assertAlmostEqual(features.length_cv, (512 ** 0.5) / 34)  # lengths 50, 50, 2
+
     def test_repeated_normal_queries_score_low(self):
         events = [DnsEvent(i * 5.0, "c", "www.example.com", "A", "NOERROR", 80) for i in range(12)]
         verdict = score_features(extract_features(events))
@@ -132,6 +142,22 @@ class Windows(unittest.TestCase):
         tunnel = [r for r in results if r["signal"] == "tunnel"]
         self.assertEqual(tunnel[-1]["registrable_domain"], "t.example")
         self.assertEqual(tunnel[-1]["verdict"]["label"], "high")
+        self.assertTrue(tunnel[-1]["alert"])
+
+    def test_an_alert_needs_consecutive_high_windows(self):
+        from analyzer.detectors.tunnel import TunnelVerdict, TunnelWindow
+        from analyzer.tunnel_analyzer import AlertRule
+
+        features = extract_features([DnsEvent(0.0, "c", "a.example.com")])
+        rule = AlertRule(after=2, gap=600)
+
+        def judged(end, label, domain="x.example"):
+            return rule(TunnelWindow("c", domain, end, features, TunnelVerdict(1.0, label, ())))
+
+        self.assertEqual([judged(10, "high"), judged(20, "low"), judged(30, "high"), judged(40, "high")],
+                         [False, False, False, True])
+        self.assertFalse(judged(50, "high", "other.example"))  # another key has its own streak
+        self.assertFalse(judged(2000, "high"))  # long after the last one: starts again
 
 
 class NxdomainBursts(unittest.TestCase):

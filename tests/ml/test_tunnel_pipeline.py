@@ -48,7 +48,10 @@ class Pipeline(unittest.TestCase):
             self.assertEqual(info["mode"], mode)
         base = runs / "main" / "w60-fVNR"
         rates = json.loads((base / "rates" / "metrics.json").read_text())
-        self.assertEqual([r["slowdown"] for r in rates["models"]["lgbm"]["rates"]], [1, 2, 10, 100])
+        self.assertEqual([r["slowdown"] for r in rates["models"]["lgbm"]["rates"]], [1, 2, 10, 100, 1000, 10000])
+        self.assertIn("detected_single_window", rates["models"]["lgbm"]["rates"][0])
+        card = json.loads((base / "final" / "model.json").read_text())
+        self.assertEqual((card["model"], card["alert_after"], card["calibrate"]), ("tunnel_rf.pkl", 2, "per-set"))
         for name in ("F10_recall_vs_rate.png", "F11_detection_delay.png", "T5_exfiltration.md"):
             self.assertTrue((base / "rates" / name).exists(), name)
         cv = json.loads((base / "cv" / "metrics.json").read_text())
@@ -74,6 +77,58 @@ class Pipeline(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), mock.patch("sys.argv", ["leaderboard", str(runs)]):
             self.assertEqual(leaderboard.main(), 0)
         self.assertIn("lgbm", (runs / "leaderboard.md").read_text())
+
+    def test_tune_then_use_the_settings(self):
+        from ml.tunnel import pipeline
+
+        runs = self.root / "tune"
+        with contextlib.redirect_stdout(io.StringIO()):
+            pipeline.main(["--mode", "tune", "--data", str(self.root / "data"), "--out", str(runs), "--threads", "2",
+                           "--models", "rf,lgbm,qpm", "--trials", "2", "--features", "V,N,R,D"])
+        best = json.loads((runs / "main" / "w60-fVNRD" / "tune" / "best_params.json").read_text())
+        self.assertEqual(set(best), {"rf", "lgbm", "tuned"})  # qpm has nothing to tune
+        self.assertIn("benign_balance", best["rf"])
+        self.assertEqual(set(best["tuned"]["rf"]["per_tool"]), {"alpha", "bravo", "charlie"})
+        params = runs / "best_params.json"
+        params.write_text(json.dumps(best))
+        with contextlib.redirect_stdout(io.StringIO()):
+            pipeline.main(["--mode", "final", "--data", str(self.root / "data"), "--out", str(runs), "--threads", "2",
+                           "--params", str(params), "--features", "V,N,R,D"])
+        card = json.loads((runs / "main" / "w60-fVNRD" / "final" / "model.json").read_text())
+        self.assertEqual(card["benign_balance"], best["rf"]["benign_balance"])
+        self.assertEqual(card["features"][-4:], ["unique_subdomain_bytes", "long_label_ratio", "hex_ratio", "length_cv"])
+
+    def test_alerts_need_consecutive_flagged_windows(self):
+        from ml.tunnel.pipeline import Table, alerting
+
+        # one key: windows at 10..60 s; another key interleaved; flagged pattern per window
+        key = np.array([0, 0, 0, 0, 0, 1, 1])
+        end = np.array([10.0, 20.0, 30.0, 40.0, 900.0, 10.0, 20.0])
+        table = Table(np.zeros((7, 1)), np.zeros(7, dtype=bool), np.zeros(7, dtype=np.int64), np.ones(7), end, key,
+                      [], {})
+        flagged = np.array([True, False, True, True, True, True, False])
+        rows = np.arange(7)
+        self.assertEqual(alerting(table, rows, flagged, 2, 600).tolist(),
+                         [False, False, False, True, False, False, False])  # 900 s: too long after, starts again
+        self.assertEqual(alerting(table, rows, flagged, 1, 600).tolist(), flagged.tolist())
+
+    def test_threshold_per_benign_set_and_balance_weights(self):
+        from ml.tunnel.pipeline import Table, balance_weights, threshold_for
+
+        # many crawl windows scoring 0 and a few browsing ones up to 0.5, as in the real data
+        scores = np.r_[np.zeros(100_000), np.linspace(0, 0.5, 100)]
+        sets = np.array(["crawl"] * 100_000 + ["browsing"] * 100, dtype=object)
+        self.assertEqual(threshold_for(scores, sets, 0.001, per_set=False), 0.0)  # every browsing window over it
+        self.assertEqual(threshold_for(scores, sets, 0.001, per_set=True), 0.5)  # browsing's own top window
+        y = np.r_[np.zeros(1100, dtype=bool), np.ones(10, dtype=bool)]
+        kinds = np.array(["crawl"] * 1000 + ["browsing"] * 100 + ["known"] * 10, dtype=object)
+        table = Table(np.zeros((1110, 1)), y, np.zeros(1110, dtype=np.int64), np.ones(1110), np.zeros(1110),
+                      np.zeros(1110, dtype=np.int64), [], {}, kinds)
+        rows = np.arange(1110)
+        self.assertIsNone(balance_weights(table, rows, 0.0))
+        weight = balance_weights(table, rows, 1.0)
+        self.assertAlmostEqual(weight[:1000].sum(), weight[1000:1100].sum())  # each benign set weighs the same
+        self.assertTrue((weight[1100:] == 1).all())
 
     def test_folds_spread_each_tool(self):
         from ml.tunnel.pipeline import _deal

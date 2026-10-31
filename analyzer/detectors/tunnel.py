@@ -135,6 +135,7 @@ class _NameStats:
     labels: tuple[int, ...]  # each one's length
     entropy: float
     digits: int
+    hex: int          # bytes in 0-9 a-f
     unusual: int      # bytes a hostname can't have (outside a-z 0-9 - _)
     counts: Counter
 
@@ -150,10 +151,11 @@ def _name_stats(labels: list[bytes], keep: int) -> _NameStats:
     data = b"".join(below)
     counts = Counter(data)
     digits = sum(count for byte, count in counts.items() if 0x30 <= byte <= 0x39)
+    hex_letters = sum(count for byte, count in counts.items() if 0x61 <= byte <= 0x66)
     usual = sum(count for byte, count in counts.items()
                 if 0x61 <= byte <= 0x7A or 0x30 <= byte <= 0x39 or byte in (0x2D, 0x5F))
     return _NameStats(b".".join(below), len(data), tuple(len(label) for label in below),
-                      _entropy(counts, len(data)), digits, len(data) - usual, counts)
+                      _entropy(counts, len(data)), digits, digits + hex_letters, len(data) - usual, counts)
 
 
 def _stats_for(qname: str, base: str | None = None) -> tuple[str, _NameStats]:
@@ -196,6 +198,11 @@ class TunnelFeatures:
     mean_response_size: float      # of the answered queries
     max_response_size: int
     nxdomain_ratio: float
+    # D, the data a window carries (added after the first full run, 2026-10-31)
+    unique_subdomain_bytes: int    # bytes of the distinct subdomains: what was sent up, counted once
+    long_label_ratio: float        # labels of 32 bytes or more: tunnels pack theirs, hostnames rarely are
+    hex_ratio: float               # subdomain bytes in 0-9 a-f: hex encodings (DNS-shell, dnscat2) are all of it
+    length_cv: float               # the subdomain lengths' standard deviation over their mean
 
     @classmethod
     def names(cls) -> list[str]:
@@ -214,6 +221,7 @@ FEATURE_GROUPS = {
           "mean_label_length", "max_label_length", "mean_subdomain_labels", "mean_subdomain_entropy",
           "pooled_entropy", "distinct_characters", "digit_ratio", "unusual_character_ratio"],
     "R": ["data_type_ratio", "mean_response_size", "max_response_size", "nxdomain_ratio"],
+    "D": ["unique_subdomain_bytes", "long_label_ratio", "hex_ratio", "length_cv"],
 }
 assert [n for group in FEATURE_GROUPS.values() for n in group] == TunnelFeatures.names()
 
@@ -258,7 +266,21 @@ def _aggregate(window: list[tuple[DnsEvent, _NameStats]]) -> TunnelFeatures:
         mean_response_size=sum(answered) / len(answered) if answered else 0.0,
         max_response_size=max(answered, default=0),
         nxdomain_ratio=sum(_is_nxdomain(event.rcode) for event, _ in window) / n,
+        unique_subdomain_bytes=sum({s.subdomain: s.length for s in stats}.values()),
+        long_label_ratio=sum(length >= 32 for length in label_lengths) / len(label_lengths) if label_lengths else 0.0,
+        hex_ratio=sum(s.hex for s in stats) / total if total else 0.0,
+        length_cv=_cv(lengths),
     )
+
+
+def _cv(values: list[float]) -> float:
+    """Standard deviation over mean; 0 for fewer than two values or a zero mean."""
+    if len(values) < 2:
+        return 0.0
+    average = sum(values) / len(values)
+    if average <= 0:
+        return 0.0
+    return math.sqrt(sum((v - average) ** 2 for v in values) / len(values)) / average
 
 
 def extract_features(events: Iterable[DnsEvent], base_domain: str | None = None) -> TunnelFeatures:

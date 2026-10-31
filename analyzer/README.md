@@ -21,8 +21,10 @@ The tunnel detector groups events by `(client, registrable domain)` and judges e
 last 60 s of queries, at window ends every 10 s, whenever the key had a new query since it was
 last judged; its first verdict comes at most 10 s after its first query. With `--model` the
 trained model decides (`high` above its threshold) and the hand-written rules' reasons explain
-the verdict; without it the rules judge alone (`high` from 0.75). Either way it only reports: it
-does not block. Training (`ml/tunnel`) feeds captured queries through the same
+the verdict; without it the rules judge alone (`high` from 0.75). `"alert": true` marks a window
+that completes two consecutive `high` windows of the client and domain (`--alert-after`, or the
+model's own setting): tunnels last minutes, a CDN's burst of lookups mostly one window. Either way
+it only reports: it does not block. Training (`ml/tunnel`) feeds captured queries through the same
 `SlidingWindowDetector`, so the model is trained on exactly these windows.
 
 `nxdomain_burst` records are emitted per client after each complete window. By default, a burst
@@ -43,5 +45,8 @@ characters are those of the wire labels, decoded from the escaped text:
 - **R, record types and responses:** `data_type_ratio` (types other than A, AAAA, HTTPS, SVCB,
   PTR, SOA, NS, DS, DNSKEY, CAA), `mean`/`max_response_size` (answered queries only),
   `nxdomain_ratio`.
+- **D, the data carried:** `unique_subdomain_bytes` (the distinct subdomains' bytes: a repeat
+  counted once), `long_label_ratio` (labels of 32 bytes or more), `hex_ratio` (bytes in 0-9 a-f),
+  `length_cv` (how much the subdomain lengths vary).
 
 `ml/tunnel/README.md` has the data, training and results.

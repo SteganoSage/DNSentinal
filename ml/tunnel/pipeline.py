@@ -17,12 +17,15 @@ models see slow tunnels too; testing uses --test-slowdowns.
 | unknown | the known tools | tools never trained on (unknown, android) |
 | rates | 5 folds over known-tool captures | each held-out capture at every slowdown: F10, F11, T5 |
 | final | everything | (writes the model the analyzer runs) |
+| tune | known tools but one, benign training captures (tune.py) | the left-out tool: best settings |
 
 Captures, not windows, are split: windows of one capture overlap and must
 not land on both sides. Outside cv, the same 20% of each benign set's
-captures is the test set; in every split 10% of the benign training captures
-is held back and each model's threshold set so at most --fpr of their windows
-are flagged. Wildcard DNS (subdomain enumeration: thousands of unique names
+captures is the test set; in every split 10% of each benign set's training
+captures is held back and each model's threshold set so at most --fpr of
+every set's windows are flagged (--calibrate). An alert needs --alert-after
+consecutive flagged windows of a client and domain; false alerts and delays
+are also reported for one window alone. Wildcard DNS (subdomain enumeration: thousands of unique names
 under one domain, the very shape of a tunnel) is GraphTunnel's robustness
 test and is only tested: its false alerts are reported on their own, not in
 the window metrics (--train-wildcard trains on it instead).
@@ -90,6 +93,7 @@ class Table:
     key: np.ndarray       # index into keys: (capture, client, domain)
     keys: list
     tracks: dict          # capture index -> Track
+    sets: np.ndarray | None = None  # each window's capture's set (filled in after loading)
 
     def __len__(self) -> int:
         return len(self.y)
@@ -172,8 +176,15 @@ def read_events(path: Path, wanted: set[str]) -> dict[str, list[tuple]]:
     return grouped
 
 
-def build_table(captures: list[dict], events: dict[str, list[tuple]], slowdowns: list[float], window: float,
-                step: float, threads: int) -> Table:
+def slowdowns_for(capture: dict, train: list[float], test: list[float]) -> list[float]:
+    """Training rates for every tunnel; the slower test-only ones just where `rates` tests (the known tools)."""
+    if capture["label"] != "tunnel":
+        return [1.0]
+    return sorted(set(train) | set(test) | {1.0}) if capture["set"] in KNOWN_SETS else sorted(set(train) | {1.0})
+
+
+def build_table(captures: list[dict], events: dict[str, list[tuple]], train_slowdowns: list[float],
+                test_slowdowns: list[float], window: float, step: float, threads: int) -> Table:
     order = sorted(range(len(captures)), key=lambda i: -len(events.get(captures[i]["capture"], ())))
     parts: dict[int, tuple] = {}
     # not fork: LightGBM's and scikit-learn's threads may already be running in this process
@@ -182,7 +193,8 @@ def build_table(captures: list[dict], events: dict[str, list[tuple]], slowdowns:
     with ProcessPoolExecutor(max_workers=max(1, threads), mp_context=context) as pool:
         futures = {i: pool.submit(capture_windows, events.get(captures[i]["capture"], []),
                                   captures[i]["tunnel_domain"] if captures[i]["label"] == "tunnel" else "",
-                                  slowdowns, window, step) for i in order}
+                                  slowdowns_for(captures[i], train_slowdowns, test_slowdowns), window, step)
+                   for i in order}
         for i, future in futures.items():
             parts[i] = future.result()
     X, y, capture, slowdown, end, key, keys, tracks = [], [], [], [], [], [], [], {}
@@ -210,11 +222,11 @@ def build_table(captures: list[dict], events: dict[str, list[tuple]], slowdowns:
 def load(args, window: float) -> tuple[list[dict], Table]:
     """The captures and their windows; the windows are cached (--cache), keyed by everything they depend on."""
     captures = choose_captures(read_captures(args.data / "captures.csv"), args.fraction, args.seed)
-    slowdowns = sorted(set(args.train_slowdowns) | set(args.test_slowdowns))
+    train_s, test_s = sorted(set(args.train_slowdowns)), sorted(set(args.test_slowdowns))
     events = events_file(args.data)
     stamp = json.dumps([dataset_info(args.data).get("events_sha256") or f"{events.name}:{events.stat().st_size}",
-                        [c["capture"] for c in captures], slowdowns, window, args.step,
-                        ALL_FEATURES, _code_digest(), 2])  # 2: the cache's format
+                        [c["capture"] for c in captures], train_s, test_s, window, args.step,
+                        ALL_FEATURES, _code_digest(), 3])  # 3: the cache's format
     digest = hashlib.sha256(stamp.encode()).hexdigest()[:12]
     cache = (args.cache or args.out / "cache") / f"windows-w{window:g}-s{args.step:g}-{digest}.pkl"
     if cache.exists():
@@ -226,8 +238,8 @@ def load(args, window: float) -> tuple[list[dict], Table]:
     log(f"reading {events}")
     events = read_events(events, {c["capture"] for c in captures})
     log(f"cutting windows ({window:g} s every {args.step:g} s) of {len(captures)} captures, "
-        f"{sum(map(len, events.values())):,} queries, at slowdowns {slowdowns}")
-    table = build_table(captures, events, slowdowns, window, args.step, args.threads)
+        f"{sum(map(len, events.values())):,} queries; tunnels at slowdowns {train_s} (known tools also {test_s})")
+    table = build_table(captures, events, train_s, test_s, window, args.step, args.threads)
     cache.parent.mkdir(parents=True, exist_ok=True)
     # plain arrays and tuples, not the classes: `python -m` would record them as __main__'s
     state = dict(vars(table), tracks={c: (t.start, t.times, t.upstream) for c, t in table.tracks.items()})
@@ -382,20 +394,47 @@ class SplitResult:
     fitted: dict = field(default_factory=dict)
 
 
+def balance_weights(table: Table, rows: np.ndarray, balance: float) -> np.ndarray | None:
+    """Training weights evening out the benign sets (0: none; 1: each set weighs the same in all).
+
+    The crawl's ~900k single-query windows would otherwise drown real
+    browsing's ~100k, the windows the false alerts come from. Tunnels weigh 1.
+    """
+    if not balance:
+        return None
+    weight = np.ones(len(rows))
+    benign = ~table.y[rows]
+    sets = table.sets[rows]
+    kinds = np.unique(sets[benign])
+    for kind in kinds:
+        mask = benign & (sets == kind)
+        weight[mask] = (benign.sum() / (len(kinds) * mask.sum())) ** balance
+    return weight
+
+
+def threshold_for(scores: np.ndarray, sets: np.ndarray, fpr: float, per_set: bool) -> float:
+    """Flag at most `fpr` of the calibration windows: of every benign set (the strictest), or of them all."""
+    if not per_set:
+        return metrics.threshold_at_fpr(scores, fpr)
+    return max(metrics.threshold_at_fpr(scores[sets == kind], fpr) for kind in np.unique(sets))
+
+
 def run_split(table: Table, split: Split, names: list[str], columns: list[int], args) -> SplitResult:
     result = SplitResult(split)
     full = table.X
     train, calibration, test = split.train, split.calibration, split.test
     for name in names:
-        model = models.make(name, args.seed, args.threads, args.params.get(name))
+        params = dict(args.params.get(name, {}))
+        balance = params.pop("benign_balance", 0.0)
+        model = models.make(name, args.seed, args.threads, params)
         started = time.monotonic()
-        model.fit(full[train][:, columns], table.y[train], full[train])
+        model.fit(full[train][:, columns], table.y[train], full[train], balance_weights(table, train, balance))
         result.fit_seconds[name] = round(time.monotonic() - started, 2)
         if model.fixed_threshold is not None:
             result.thresholds[name] = model.fixed_threshold
         else:
-            result.thresholds[name] = metrics.threshold_at_fpr(
-                model.score(full[calibration][:, columns], full[calibration]), args.fpr)
+            result.thresholds[name] = threshold_for(model.score(full[calibration][:, columns], full[calibration]),
+                                                    table.sets[calibration], args.fpr, args.calibrate == "per-set")
         result.scores[name] = model.score(full[test][:, columns], full[test]) if len(test) else np.empty(0)
         result.fitted[name] = model
     return result
@@ -409,12 +448,33 @@ def _family(table: Table, captures: list[dict], rows: np.ndarray) -> np.ndarray:
     return np.array([captures[c]["tool"] or captures[c]["set"] for c in table.capture[rows]], dtype=object)
 
 
-def false_alerts(table: Table, captures: list[dict], rows: np.ndarray, flagged: np.ndarray, gap: float,
+def alerting(table: Table, rows: np.ndarray, flagged: np.ndarray, after: int, gap: float) -> np.ndarray:
+    """Which windows raise an alert: flagged, as were the key's `after - 1` judged windows before it.
+
+    A window and the one before it count as consecutive if they are less than
+    `gap` s apart. Tunnels last minutes; a CDN burst is mostly one window.
+    """
+    if after <= 1:
+        return flagged.copy()
+    out = np.zeros(len(rows), dtype=bool)
+    key, slowdown, end = table.key[rows], table.slowdown[rows], table.end[rows]
+    streak, last = 0, None
+    for p in np.lexsort((end, slowdown, key)):  # each key's windows in time order (each slowdown apart)
+        here = (key[p], slowdown[p])
+        if last is None or here != last[0] or end[p] - last[1] > gap:
+            streak = 0
+        streak = streak + 1 if flagged[p] else 0
+        out[p] = streak >= after
+        last = (here, end[p])
+    return out
+
+
+def false_alerts(table: Table, captures: list[dict], rows: np.ndarray, alerts: np.ndarray, gap: float,
                  allowlist: set[str]) -> dict:
-    """Per benign set: alerts (flagged windows of one key less than `gap` s apart count once) per day of traffic."""
+    """Per benign set: alerts (alerting windows of one key less than `gap` s apart count once) per day of traffic."""
     out = {}
     benign = rows[~table.y[rows]]
-    benign_flagged = flagged[~table.y[rows]]
+    benign_flagged = alerts[~table.y[rows]]
     for kind in sorted({captures[c]["set"] for c in table.capture[benign]}):
         in_set = np.array([captures[c]["set"] == kind for c in table.capture[benign]], dtype=bool)
         hours = sum(captures[c]["hours"] for c in set(table.capture[benign[in_set]].tolist()))
@@ -441,29 +501,36 @@ def false_alerts(table: Table, captures: list[dict], rows: np.ndarray, flagged: 
     return out
 
 
-def detections(table: Table, captures: list[dict], rows: np.ndarray, flagged: np.ndarray, within: float) -> list[dict]:
-    """Per tunnel capture and slowdown: when the first alert came, and how much the client had sent up by then."""
+def detections(table: Table, captures: list[dict], rows: np.ndarray, flagged: np.ndarray, alerts: np.ndarray,
+               within: float) -> list[dict]:
+    """Per tunnel capture and slowdown: when the first alert came, and how much the client had sent up by then.
+
+    Also when the first flagged window came (`_single_window`): the alert's
+    delay had one flagged window been enough.
+    """
     out = []
     tunnel = rows[table.y[rows]]
-    tunnel_flagged = flagged[table.y[rows]]
+    tunnel_flagged, tunnel_alerts = flagged[table.y[rows]], alerts[table.y[rows]]
     groups: dict[tuple[int, float], list[int]] = defaultdict(list)
     for position, r in enumerate(tunnel):
         groups[(int(table.capture[r]), float(table.slowdown[r]))].append(position)
     for (c, slowdown), positions in sorted(groups.items()):
         track = table.tracks[c]
         times = track.start + (track.times - track.start) * slowdown
-        hits = [table.end[tunnel[p]] for p in positions if tunnel_flagged[p]]
-        first = min(hits) if hits else None
         span = max(times[-1] - track.start, 1e-9)
         entry = {"capture": captures[c]["capture"], "tool": captures[c]["tool"], "rtype": captures[c]["rtype"],
-                 "slowdown": slowdown, "windows": len(positions), "flagged": len(hits),
-                 "recall": len(hits) / len(positions), "seconds": float(span),
+                 "slowdown": slowdown, "windows": len(positions), "flagged": int(sum(tunnel_flagged[positions])),
+                 "recall": float(np.mean(tunnel_flagged[positions])), "seconds": float(span),
                  "upstream_bytes": int(track.upstream[-1]),
                  "upstream_bytes_per_hour": float(track.upstream[-1] / span * 3600)}
-        if first is not None:
-            sent = int(np.searchsorted(times, first, side="right"))
-            entry.update(delay=float(first - track.start), bytes_before=int(track.upstream[sent - 1]) if sent else 0)
-        entry["detected"] = first is not None and first - track.start <= within
+        for suffix, mask in (("", tunnel_alerts), ("_single_window", tunnel_flagged)):
+            hits = [table.end[tunnel[p]] for p in positions if mask[p]]
+            first = min(hits) if hits else None
+            if first is not None:
+                sent = int(np.searchsorted(times, first, side="right"))
+                entry[f"delay{suffix}"] = float(first - track.start)
+                entry[f"bytes_before{suffix}"] = int(track.upstream[sent - 1]) if sent else 0
+            entry[f"detected{suffix}"] = first is not None and first - track.start <= within
         out.append(entry)
     return out
 
@@ -473,22 +540,25 @@ def rate_summary(found: list[dict], within: float) -> list[dict]:
     out = []
     for slowdown in sorted({d["slowdown"] for d in found}):
         group = [d for d in found if d["slowdown"] == slowdown]
-        delays = [d["delay"] for d in group if "delay" in d]
-        out.append({
-            "slowdown": slowdown, "captures": len(group),
-            "detected": float(np.mean([d["detected"] for d in group])),
-            "window_recall": float(sum(d["flagged"] for d in group) / max(sum(d["windows"] for d in group), 1)),
-            "median_delay": float(np.median(delays)) if delays else None,
-            "p90_delay": float(np.percentile(delays, 90)) if delays else None,
-            "median_bytes_before": float(np.median([d.get("bytes_before", d["upstream_bytes"]) for d in group])),
-            "median_upstream_bytes_per_hour": float(np.median([d["upstream_bytes_per_hour"] for d in group])),
-        })
+        entry = {"slowdown": slowdown, "captures": len(group),
+                 "window_recall": float(sum(d["flagged"] for d in group) / max(sum(d["windows"] for d in group), 1)),
+                 "median_upstream_bytes_per_hour": float(np.median([d["upstream_bytes_per_hour"] for d in group]))}
+        for suffix in ("", "_single_window"):
+            delays = [d[f"delay{suffix}"] for d in group if f"delay{suffix}" in d]
+            entry.update({
+                f"detected{suffix}": float(np.mean([d[f"detected{suffix}"] for d in group])),
+                f"median_delay{suffix}": float(np.median(delays)) if delays else None,
+                f"p90_delay{suffix}": float(np.percentile(delays, 90)) if delays else None,
+                f"median_bytes_before{suffix}": float(np.median([d.get(f"bytes_before{suffix}", d["upstream_bytes"])
+                                                                 for d in group])),
+            })
+        out.append(entry)
     return out
 
 
-def r_min(summary: list[dict], target: float = 0.95) -> float | None:
+def r_min(summary: list[dict], target: float = 0.95, suffix: str = "") -> float | None:
     """The largest slowdown (slowest tunnel) still detected in time for at least `target` of the captures."""
-    caught = [s["slowdown"] for s in summary if s["detected"] >= target]
+    caught = [s["slowdown"] for s in summary if s[f"detected{suffix}"] >= target]
     return max(caught) if caught else None
 
 
@@ -504,18 +574,22 @@ def evaluate(table: Table, captures: list[dict], rows: np.ndarray, score: np.nda
     report = metrics.evaluate(table.y[rows[main]], score[main], flagged[main], _family(table, captures, rows[main]),
                               args.fpr, rng, args.bootstrap, args.bootstrap_curve, {})
     report["threshold"] = threshold
-    report["false_alerts"] = false_alerts(table, captures, rows, flagged, args.alert_gap, allowlist)
-    report["detections"] = detections(table, captures, rows, flagged, args.within)
+    alerts = alerting(table, rows, flagged, args.alert_after, args.alert_gap)
+    report["false_alerts"] = false_alerts(table, captures, rows, alerts, args.alert_gap, allowlist)
+    if args.alert_after > 1:  # what one flagged window alone would have raised, to compare
+        report["false_alerts_single_window"] = false_alerts(table, captures, rows, flagged, args.alert_gap, allowlist)
+    report["detections"] = detections(table, captures, rows, flagged, alerts, args.within)
     return report
 
 
 def headline_of(report: dict) -> dict:
     keys = ("recall", "fpr", "roc_auc", "pr_auc", "recall_at_target_fpr")
     out = {k: (report[k]["value"] if isinstance(report.get(k), dict) else report.get(k)) for k in keys if k in report}
-    for kind, entry in report.get("false_alerts", {}).items():
-        out[f"{kind}_alerts_per_day"] = entry.get("alerts_per_day")
-        if "alerts_per_day_allowlisted" in entry:
-            out[f"{kind}_alerts_per_day_allowlisted"] = entry["alerts_per_day_allowlisted"]
+    for suffix in ("", "_single_window"):
+        for kind, entry in report.get(f"false_alerts{suffix}", {}).items():
+            out[f"{kind}_alerts_per_day{suffix}"] = entry.get("alerts_per_day")
+            if "alerts_per_day_allowlisted" in entry:
+                out[f"{kind}_alerts_per_day_allowlisted{suffix}"] = entry["alerts_per_day_allowlisted"]
     found = report.get("detections", [])
     if found:
         out["captures_detected"] = float(np.mean([d["detected"] for d in found]))
@@ -557,10 +631,11 @@ def report_per_split(table, captures, results, names, args, rng, allowlist) -> d
             tunnel_rows.append(rows[positive])
             tunnel_margin.append(score[positive] - threshold)
             fpr.append(evaluated["fpr"]["value"])
-            for kind, entry in evaluated["false_alerts"].items():
-                for key in ("alerts_per_day", "alerts_per_day_allowlisted"):
-                    if entry.get(key) is not None:
-                        alerts[f"{kind}_{key}"].append(entry[key])
+            for suffix in ("", "_single_window"):
+                for kind, entry in evaluated.get(f"false_alerts{suffix}", {}).items():
+                    for key in ("alerts_per_day", "alerts_per_day_allowlisted"):
+                        if entry.get(key) is not None:
+                            alerts[f"{kind}_{key}{suffix}"].append(entry[key])
         rows = np.concatenate(tunnel_rows)
         flagged = np.concatenate(tunnel_margin) > 0
         tools = _family(table, captures, rows)
@@ -574,6 +649,7 @@ def report_per_split(table, captures, results, names, args, rng, allowlist) -> d
             **{k: float(np.mean(v)) for k, v in sorted(alerts.items())},  # over the splits
             "rates": summary,
             "r_min": r_min(summary),
+            "r_min_single_window": r_min(summary, suffix="_single_window"),
             "detections": found,
         }
         report["splits"][name] = per_split
@@ -585,21 +661,25 @@ def headline(mode: str, report: dict) -> dict:
         return {"threshold": report["threshold"]}
     if mode == "cv":
         return {n: headline_of(m) for n, m in report["models"].items()}
-    keys = ("mean_tool_recall", "recall", "fpr", "r_min")
+    keys = ("mean_tool_recall", "recall", "fpr", "r_min", "r_min_single_window")
     out = {}
     for n, m in report["models"].items():
         out[n] = {k: v for k, v in m.items() if k in keys or "_alerts_per_day" in k}
         for s in m.get("rates", []):
             out[n][f"detected_at_1/{s['slowdown']:g}"] = s["detected"]
+            out[n][f"detected_single_window_at_1/{s['slowdown']:g}"] = s["detected_single_window"]
             out[n][f"window_recall_at_1/{s['slowdown']:g}"] = s["window_recall"]
             if s["slowdown"] == 1:
                 out[n]["median_delay"] = s["median_delay"]
+                out[n]["median_delay_single_window"] = s["median_delay_single_window"]
     return out
 
 
-def table_t5(report: dict, names: list[str], path: Path, within: float) -> None:
+def table_t5(report: dict, names: list[str], path: Path, within: float, after: int) -> None:
     """T5: per slowdown, how often each detector caught the tunnel in time, and what slipping under it allows."""
-    lines = [f"Detected: share of held-out captures with an alert within {within:g} s of the tunnel's start. "
+    rule = f"{after} consecutive flagged windows" if after > 1 else "one flagged window"
+    lines = [f"Detected: share of held-out captures with an alert ({rule}) within {within:g} s of the tunnel's start; "
+             "in brackets, with one flagged window enough. Delay: median seconds from the first query to the alert. "
              "Capacity: the median capture's upstream bytes (data in the names) per hour at that rate.", "",
              "| Rate | Capacity (kB/h) | "
              + " | ".join(f"{models.TITLES.get(n, n)}: detected, delay (s)" for n in names) + " |",
@@ -610,11 +690,14 @@ def table_t5(report: dict, names: list[str], path: Path, within: float) -> None:
         for n in names:
             entry = report["models"][n]["rates"][i]
             delay = "-" if entry["median_delay"] is None else f"{entry['median_delay']:.0f}"
-            cells.append(f"{entry['detected']:.2f}, {delay}")
-        lines.append(f"| 1/{s['slowdown']:g} | {s['median_upstream_bytes_per_hour'] / 1000:,.1f} | "
+            single = "" if after <= 1 else f" ({entry['detected_single_window']:.2f})"
+            cells.append(f"{entry['detected']:.2f}{single}, {delay}")
+        lines.append(f"| 1/{s['slowdown']:g} | {s['median_upstream_bytes_per_hour'] / 1000:,.2f} | "
                      + " | ".join(cells) + " |")
     lines += ["", "R_min (slowest rate detected in time for >= 95% of captures): "
-              + ", ".join(f"{models.TITLES.get(n, n)} {_rate(report['models'][n]['r_min'])}" for n in names)]
+              + ", ".join(f"{models.TITLES.get(n, n)} {_rate(report['models'][n]['r_min'])}"
+                          + ("" if after <= 1 else f" ({_rate(report['models'][n]['r_min_single_window'])})")
+                          for n in names)]
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -627,28 +710,43 @@ def _rate(slowdown) -> str:
 
 def save_final(result: SplitResult, captures: list[dict], table: Table, groups: list[str], window: float,
                out: Path, args) -> dict:
-    """The deployed model: LightGBM's trees and model.json (features, threshold, windows)."""
+    """The deployed model and model.json (features, threshold, windows, alert rule).
+
+    LightGBM's trees are saved as its text model; other models are pickled
+    (the analyzer is Python too). A pickle runs code when loaded: load only
+    models trained here, with the library versions model.json records.
+    """
     name = args.final_model
     model = result.fitted[name]
-    if name != "lgbm":
-        raise SystemExit("the analyzer reads LightGBM models: use --final-model lgbm")
-    model.inner.model.booster_.save_model(str(out / "tunnel_lgbm.txt"))
+    if name == "lgbm":
+        file = "tunnel_lgbm.txt"
+        model.inner.model.booster_.save_model(str(out / file))
+    else:
+        file = f"tunnel_{name}.pkl"
+        with open(out / file, "wb") as stream:
+            pickle.dump(model, stream, protocol=pickle.HIGHEST_PROTOCOL)
     rows = result.split.train
     trained = sorted({captures[c]["capture"] for c in table.capture[rows]})
     card = {
-        "model": "tunnel_lgbm.txt",
+        "model": file,
+        "kind": name,
         "features": [n for g in groups for n in FEATURE_GROUPS[g]],
         "groups": groups,
         "threshold": result.thresholds[name],
         "target_fpr": args.fpr,
         "window_seconds": window,
         "step_seconds": args.step,
+        "alert_after": args.alert_after,
+        "alert_gap": args.alert_gap,
+        "calibrate": args.calibrate,
         "train_slowdowns": args.train_slowdowns,
         "trained_on": {"tunnel_windows": int(table.y[rows].sum()), "benign_windows": int((~table.y[rows]).sum()),
                        "captures": len(trained),
                        "tools": sorted({captures[c]["tool"] for c in table.capture[rows] if captures[c]["tool"]})},
         "dataset_sha256": dataset_info(args.data).get("events_sha256"),
-        "lightgbm_params": model.params,
+        "params": getattr(model, "params", {}),
+        "benign_balance": args.params.get(name, {}).get("benign_balance", 0.0),
+        "versions": environment()["versions"],
     }
     (out / "model.json").write_text(json.dumps(card, indent=1) + "\n")
     return card
@@ -699,7 +797,7 @@ def run_mode(mode: str, captures: list[dict], table: Table, rows: Rows, groups: 
 
             recall_vs_rate(report, names, out / "F10_recall_vs_rate.png", args.within)
             delay_cdf(report, names, out / "F11_detection_delay.png")
-            table_t5(report, names, out / "T5_exfiltration.md", args.within)
+            table_t5(report, names, out / "T5_exfiltration.md", args.within, args.alert_after)
     if mode != "final":
         report["thresholds"] = {n: [r.thresholds[n] for r in results] for n in names}
         report["fit_seconds"] = {n: sum(r.fit_seconds[n] for r in results) for n in names}
@@ -709,6 +807,7 @@ def run_mode(mode: str, captures: list[dict], table: Table, rows: Rows, groups: 
         "mode": mode, "tag": args.tag, "features": groups, "window": window, "step": args.step,
         "models": names, "fpr": args.fpr, "train_slowdowns": args.train_slowdowns,
         "test_slowdowns": args.test_slowdowns, "within": args.within, "fraction": args.fraction,
+        "alert_after": args.alert_after, "calibrate": args.calibrate, "final_model": args.final_model,
         "splits": [{"name": s.name, "train": len(s.train), "calibration": len(s.calibration), "test": len(s.test),
                     "test_tunnel": int(table.y[s.test].sum())} for s in splits],
         "params": args.params, "seconds": round(time.monotonic() - started, 1),
@@ -742,25 +841,30 @@ def parse_groups(text: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", choices=MODES + ["all"], required=True)
+    parser.add_argument("--mode", choices=MODES + ["all", "tune"], required=True)
     parser.add_argument("--data", type=Path, default=REPO / "ml" / "data" / "tunnel")
     parser.add_argument("--out", type=Path, default=REPO / "ml" / "runs" / "tunnel")
     parser.add_argument("--tag", default="main", help="experiment name: results go to <out>/<tag>/")
     parser.add_argument("--cache", type=Path, help="where cut windows are kept for the next run (default: OUT/cache)")
     parser.add_argument("--features", nargs="+", default=["V,N,R"],
-                        help="feature groups (V volume/timing, N names, R record types/responses); several sets "
-                             "give one run each")
+                        help="feature groups (V volume/timing, N names, R record types/responses, D data carried); "
+                             "several sets give one run each")
     parser.add_argument("--models", default=DEFAULT_MODELS, help=f"comma-separated, from {','.join(models.NAMES)}")
-    parser.add_argument("--final-model", default="lgbm")
+    parser.add_argument("--final-model", default="rf",
+                        help="the model final mode writes (rf: the first full run's choice, 2026-10-31)")
     parser.add_argument("--windows", type=float, nargs="+", default=[60.0], help="window lengths (s); one run each")
     parser.add_argument("--step", type=float, default=STEP_SECONDS)
     parser.add_argument("--train-slowdowns", type=float, nargs="+", default=[1, 2, 10],
                         help="stretched copies of the training tunnels (10: a tenth of the rate)")
-    parser.add_argument("--test-slowdowns", type=float, nargs="+", default=[1, 2, 10, 100])
+    parser.add_argument("--test-slowdowns", type=float, nargs="+", default=[1, 2, 10, 100, 1000, 10000])
     parser.add_argument("--within", type=float, default=600.0,
                         help="a tunnel counts as detected if an alert comes within this many seconds of its start")
     parser.add_argument("--alert-gap", type=float, default=600.0,
                         help="flagged windows of one client and domain less than this apart are one alert")
+    parser.add_argument("--alert-after", type=int, default=2,
+                        help="alert when this many consecutive windows of a client and domain are flagged")
+    parser.add_argument("--calibrate", choices=("per-set", "pooled"), default="per-set",
+                        help="threshold: at most --fpr of every benign set's held-back windows, or of them all")
     parser.add_argument("--fraction", type=float, default=1.0, help="share of each benign set's captures")
     parser.add_argument("--train-wildcard", action="store_true",
                         help="train on wildcard DNS as benign, instead of only testing for false alerts on it")
@@ -774,7 +878,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--bootstrap-curve", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 1)
-    parser.add_argument("--params", type=Path, help="JSON settings per model, e.g. {\"lgbm\": {\"num_leaves\": 63}}")
+    parser.add_argument("--params", type=Path, help="JSON settings per model, e.g. {\"lgbm\": {\"num_leaves\": 63, "
+                                                    "\"benign_balance\": 0.5}} (tune mode's best_params.json)")
+    parser.add_argument("--trials", type=int, default=40, help="tune mode: settings to try per model")
+    parser.add_argument("--timeout-hours", type=float, default=None,
+                        help="tune mode: start no trial after this, shared by every model and feature set")
     args = parser.parse_args(argv)
     args.params = json.loads(args.params.read_text()) if args.params else {}
     args.models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -792,10 +900,16 @@ def main(argv: list[str] | None = None) -> None:
     modes = MODES if args.mode == "all" else [args.mode]
     for window in args.windows:
         captures, table = load(args, window)
+        table.sets = np.array([c["set"] for c in captures], dtype=object)[table.capture]
         rows = Rows(table)
         log(f"{len(table):,} windows: {int(table.y.sum()):,} tunnel ({len(table.tracks)} captures), "
             f"{int((~table.y).sum()):,} benign")
         for groups in feature_sets:
+            if args.mode == "tune":
+                from .tune import tune
+
+                tune(captures, table, rows, groups, window, args, len(feature_sets) * len(args.windows))
+                continue
             for mode in modes:
                 run_mode(mode, captures, table, rows, groups, window, allowlist, args)
 
