@@ -44,8 +44,10 @@ ml/data/*.pcap
 ml/data/*.gz
 !ml/data/README.md
 ml/data/cache/
+ml/data/tunnel/
 ml/runs/
 dga_results*.zip
+tunnel_results*.zip
 
 # ─── Downloaded block lists (config/lists/download_feeds.sh) ─────────────────
 config/lists/feeds/

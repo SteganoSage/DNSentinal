@@ -1,9 +1,9 @@
 # ML data: sources, licences and limitations
 
-The DGA dataset is not committed: `python -m ml.dga.data --out ml/data` downloads and
-generates it into `ml/data/` (git-ignored) from pinned sources, so every build is the same.
-`ml/data/dataset_info.json` records what was built. Two small lists the resolver also needs
-are committed under `config/`.
+The datasets are not committed: `python -m ml.dga.data --out ml/data` and `python -m
+ml.tunnel.data --out ml/data/tunnel` download and build them (git-ignored) from pinned
+sources, so every build is the same; each `dataset_info.json` records what was built. Two
+small lists the resolver also needs are committed under `config/`.
 
 ## DGA dataset (`ml/dga/data.py`)
 
@@ -30,6 +30,25 @@ Built 2026-10-18: 899,903 benign names (460,570 stable), 218,532 DGA names in 50
 `ml/dga/dga_domains_full.csv` (chrmor's file, committed earlier) was removed: `data.py`
 downloads the same file at the pinned commit.
 
+## Tunnel dataset (`ml/tunnel/data.py`)
+
+Every capture becomes its DNS queries with their answers' rcode and size (`ml/tunnel/pcap.py`),
+the events the resolver gives the detector: `events.csv.gz`, one row per query, and
+`captures.csv`, one row per capture (its set, tool, record type, tunnel domain, hours, hash).
+
+| Part | Source | Pinned at | Licence | Used for |
+|---|---|---|---|---|
+| Tunnels | [ggyggy666/DNS-Tunnel-Datasets](https://github.com/ggyggy666/DNS-Tunnel-Datasets), the GraphTunnel paper's data: `tunnel/` (dnscat2, dnspot, iodine, DNS-shell, tuns, in each record type they support), `unkownTunnel/` (cobaltstrike, dns2tcp, ozymandns, tcp-over-dns), `crossEndPoint/` (AndIodine) | commit `e3dccb8`; every file's size and git blob SHA-1 in `ml/tunnel/graphtunnel_files.json`, checked after download | none stated; its README asks to cite the dataset and *GraphTunnel: Robust DNS Tunnel Detection Based on DNS Recursive Resolution Graph* | the `known` tools (trained on), the `unknown` and `android` tools (never trained on in `unknown` mode) |
+| Crawl | the same repository's `normal/`: one client resolving Cloudflare's top million domains | as above | as above | benign; mostly single queries per domain |
+| Wildcard | the same repository's `wildcard/`: subdomains of wildcard-DNS domains, enumerated | as above | as above | benign, **test only**: false alerts on traffic shaped like a tunnel |
+| Browsing | [Stratosphere Lab](https://www.stratosphereips.org/datasets-normal) normal captures CTU-Normal-4 (a home network, DNS only), 20-31 (Windows and Kali machines browsing Alexa/Moz top sites for hours, 2017; full captures, of which only DNS is kept) and 32 (DNS only) | file sizes in `data.py`; SHA-256 in `dataset_info.json` (no published hashes) | free to use citing Garcia, S., *Malware Capture Facility Project*, stratosphereips.org | benign: real people's browsing, the false alerts a day that matter |
+| Allowlist | Tranco top 100k of list `64VVX` (as the DGA dataset) | list ID | as Tranco above | false alerts with popular domains skipped, as deployed |
+| Yours | `--local DIR`: `DIR/benign/**` and `DIR/tunnel/<tool>/**` captures | your files' SHA-256 in `dataset_info.json` | yours | E8's lab tunnels and W1 |
+
+The subfolders of the GraphTunnel repository hold the same captures again, split into pcapng
+parts, and are not used (`tunnel/dns2tcp-key/` is `unkownTunnel/dns2tcp-key.pcap`). Every tunnel
+there uses one domain (`ggy666.tk`); no feature names the domain, so a model can't learn it.
+
 ## Committed lists (`config/`)
 
 | File | Source | Licence |
@@ -53,3 +72,13 @@ downloads the same file at the pinned commit.
   different source, not names from later dates; that is the `future` mode's question.
 - **DGArchive** (Fraunhofer FKIE) is the largest source of real DGA names; access is by
   request (CC BY-NC-SA 3.0) and can be added as another source once granted.
+- **Tunnels from one lab.** GraphTunnel captured each tool once per record type, from a few
+  lab machines; their settings beyond the record type aren't published. Slower tunnels are
+  emulated by stretching a capture's clock (the same queries further apart); a tool's own slow
+  mode might also poll differently. Our own lab captures (`--local`, E8) are the check.
+- **Benign traffic is not ours.** The crawl is a script, not a person; the browsing captures are
+  2017 virtual machines visiting top-site lists. E8's false alerts a day on our own devices (W1)
+  is the deployment number. CIC-Bell-DNS-EXF-2021 (DNSExfiltrator) is not used: it is
+  downloaded through a registration form, which a notebook can't fill in.
+- **Upstream bytes are encoded bytes.** "Bytes sent before detection" and T5's capacity count
+  the bytes in the names' subdomains: base32 or hex carries 5/8 or 1/2 of that as data.
