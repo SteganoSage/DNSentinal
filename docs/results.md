@@ -8,8 +8,8 @@ still to run.
 |---|---|---|
 | 1. DGA classifier, on its own | E7, E9 | done |
 | 2. Tunnel detector, on its own | E8 | done |
-| 3. The full pipeline, end to end | E-pipeline: C0 (Unbound) to C5 (everything) | **to run** (the lab is ready) |
-| Supporting | E1 correctness (done), S1 (done); E2, E5+A1, E6, E10, E11 | partly done |
+| 3. The full pipeline, end to end | P1: C0 (Unbound) to C6 (everything) | **done** |
+| Supporting | E1, E2, E5+A1, E6, E10, S1 (done); E12, E11 (to run) | mostly done |
 
 ---
 
@@ -166,31 +166,75 @@ and F11 (delay) in the same folder.
 crawl, and 1 h of wildcard DNS. Without the popular-site allowlist, wildcard DNS drew 191 tunnel
 alerts in an hour (on `google.com`, `facebook.com` and the like); with it, 10. Source: `ml/tunnel/README.md` "Score fusion".
 
-### To run: configurations C0–C5 (the main comparison)
+### The main comparison: configurations C0–C6 (experiment P1)
+
+Seven configurations, the same traffic under each: benign browsing (W2, 50 q/s), DGA malware
+(9 real Netlab families, 40 generated names each then a command server re-resolved every 3 s),
+a real **iodine** tunnel pushing random data to a byte counter at its far end, and a slow
+synthetic tunnel (0.2 TXT q/s). 240 s per run, 3 interleaved repetitions. Source:
+`bench/results/P1/20261101T174153Z/`; run with `python3 bench/run.py bench/configs/P1.yaml`.
 
 | Config | What it is |
 |---|---|
 | C0 | Unbound: a standard resolver, no protection |
-| C1 | DNSentinel, no ML (block lists and policy only) |
-| C2 | + the DGA classifier, monitor mode |
-| C3 | + the DGA classifier, enforce mode |
-| C4 | + the slow path with the hand-written rules, enforce |
-| C5 | everything: DGA + tunnel model + fusion, enforce |
+| C1 | DNSentinel, no ML (access control, rate limiting, block lists, policy) |
+| C2 | + DGA classifier, monitor |
+| C3 | + DGA classifier, enforce |
+| C4 | + slow path, hand-written rules, enforce |
+| C5 | everything: DGA enforce + tunnel model + fusion |
+| C6 | DGA monitor + tunnel model + fusion (the shipped default: the classifier logs, the slow path blocks) |
 
-**Traffic**, the same under every config:
-- benign browsing (W2);
-- DGA malware: real families' names, plus a command server that resolves;
-- tunnels: real iodine carrying a file, plus synthetic tunnels at full rate and 1/10.
+**Table P1a: what gets through** (median of 3 runs, 240 s each)
 
-**Metrics:**
-- attacks detected;
-- time to alert, and time to block;
-- bytes exfiltrated before the block;
-- malicious queries answered;
-- false alerts, and benign queries blocked;
-- latency p50/p95/p99, maximum throughput, CPU and memory.
+| Config | DGA C2 reached | iodine leaked | iodine stopped at | slow tunnel leaked | slow tunnel alert |
+|---|---|---|---|---|---|
+| C0 Unbound | 9/9 families | **31.7 MB** | never | 1200 B | never |
+| C1 no ML | 9/9 | 3.1 MB | never | 1200 B | never |
+| C2 DGA monitor | 9/9 | 3.1 MB | never | 1200 B | never |
+| C3 DGA enforce | **2/9** | 3.1 MB | never | 1200 B | never |
+| C4 + rules | 2/9 | 163 KB | 13 s | 1200 B | **never** |
+| C5 all (enforce) | 2/9 | 168 KB | 11 s | **75 B** | 13 s |
+| C6 all (monitor) | 9/9 seen, **26/45 lookups** | 207 KB | 14 s | 100 B | 18 s |
 
-Table P1 and figures P1–P3 go here when it has run.
+**Table P1b: what it costs** (median of 3 runs; no benign query was blocked and no false alert was
+raised in any configuration)
+
+| Config | Benign p50 / p99 | Resolver CPU / RAM | Analyzer CPU / RAM | Max q/s (<1% loss) |
+|---|---|---|---|---|
+| C0 Unbound | 1.1 / 2.4 ms | 26% / 24 MiB | — | 39,840 |
+| C1 no ML | 0.9 / 2.6 ms | 17% / 175 MiB | — | 15,576 |
+| C3 DGA enforce | 0.9 / 2.6 ms | 17% / 202 MiB | — | 14,167 |
+| C5 all (enforce) | 1.0 / 2.5 ms | 5% / 35 MiB | 4.4% / 50 MiB | 14,290 |
+| C6 all (monitor) | 1.0 / 2.5 ms | 5% / 37 MiB | 4.6% / 50 MiB | 14,645 |
+
+**What the layers add (the report's central story):**
+1. **Rate limiting alone** (C1 vs C0) cuts the iodine tunnel 10×, 31.7 MB → 3.1 MB, with no detector:
+   the per-client token bucket throttles the burst of queries a tunnel needs.
+2. **The DGA classifier in enforce** (C3) blocks the command servers of **7 of 9 families**. The two
+   that slip through are **simda and suppobox** — the pseudo-word and dictionary DGAs a name-only
+   classifier is documented to miss (Part 1); they are the slow path's job, via the NXDOMAIN burst.
+3. **The slow path** (C4, C5) cuts the tunnel another ~20×, 3.1 MB → ~165 KB, and blocks it within
+   11–13 s of it starting.
+4. **The trained model earns its place over the hand-written rules** (C5 vs C4): the slow, stealthy
+   tunnel (`exfil.lab`, 0.2 q/s) is **never caught by the rules** (1200 B leaked) but **is caught by
+   the model**, blocked after 75 B. This is the clearest single argument for the ML tunnel model.
+5. **Fusion blocks the command server even with the classifier only monitoring** (C6): all 9 families'
+   servers resolve at first, but after each client's NXDOMAIN burst fusion blocks the server, so only
+   26 of 45 beacon lookups get through. This is the shipped default — the classifier never blocks a
+   name on its own, yet C2 traffic is still stopped.
+6. **Cost:** benign latency stays ~1 ms p50 and under 3 ms p99 everywhere; **no benign query was ever
+   blocked and no false alert raised**. Recursive resolution plus policy drops peak throughput from
+   Unbound's ~40k q/s to ~15k q/s (a recursive resolver does more work than this forwarding-free
+   baseline). The slow path is cheap: ~5% of one core and 50 MiB for the analyzer. CPU is *lower* in
+   C4–C6 than C1–C3 because blocking the tunnel early stops the resolver doing upstream work for it.
+
+Figures: `bench/plots/P1_what_gets_through.png` (exfiltration and C2 lookups per config),
+`bench/plots/P1_benign_latency_cdf.png` (benign latency CDF per config).
+
+**Caveats for the report:** one laptop, Docker containers, CPU cores not pinned (configurations are
+interleaved so a slow moment hits all alike). iodine runs non-lazy and C0's Unbound has
+QNAME-minimisation off, both so every configuration carries the *same* tunnel rather than an Unbound
+interop quirk (`docs/experiment-log.md`). The "9 families" are a sample of the DGA dataset's 54.
 
 ---
 
@@ -202,15 +246,84 @@ no unexplained mismatch)
 | Name set | Queries | Agreement | Notes |
 |---|---|---|---|
 | W3: Tranco top 10,000 × {A, AAAA} | 20,000 | **100%** | no SERVFAIL on either side |
-| The hierarchy's crafted cases | 33 | **100%** | 1 transient: Unbound timed out once on the 800 ms server, DNSentinel answered in 904 ms |
+| The hierarchy's crafted cases | 33 | **96.97%** | the one "miss" is transient: Unbound timed out once on the deliberately-slow (800 ms) server and agreed on re-check |
 | Policy (block lists, cloaked trackers, rebinding) | 6 | differs by design | DNSentinel answers 0.0.0.0 / `::` or strips the private address |
 
-The crafted cases are CNAME chains of 1–8 hops, five-level and glueless delegations, a lame
-server, a server that drops 0x20, out-of-bailiwick records, a TXT that needs TCP, NXDOMAIN and
-empty non-terminals.
+Overall **99.995%**, with **zero persistent unexplained mismatches** — target met. The crafted cases
+are CNAME chains of 1–8 hops, five-level and glueless delegations, a lame server, a server that
+drops 0x20, out-of-bailiwick records, a TXT that needs TCP, NXDOMAIN and empty non-terminals.
+Source: `bench/results/E1/` (latest run). Table T1 in `bench/tables/T1_correctness.md` is regenerated
+from this raw data.
 
-**Target met.** Cold-cache latency in the lab was 1.9 ms median for DNSentinel against 1.4 ms for
-Unbound (p95 3.0 ms against 2.3 ms); E2 measures this properly. Source: `bench/results/E1/20261101T164840Z/`.
+**E5: cache-poisoning resistance + model A1** (isolated namespace, off-path Kaminsky attack against
+`target.lab`; `lab/attacks/kaminsky.py`, run against the user's own resolver only)
+
+| Config | Defences | Forged packets to poison |
+|---|---|---|
+| Weak | 8-bit transaction ID, fixed known source port | **256** (poisoned: one sweep of the 256 IDs) |
+| Hardened (shipped) | 16-bit random ID + random source port + 0x20 + bailiwick | **resisted 5,000** (not poisoned) |
+
+**Model A1** (the geometric prediction, `bench/drivers/a1_model.py`, figure F6): an off-path
+attacker must match every random field in one race window; with N equally likely combinations the
+expected forged packets to success is N.
+- Weak: N = 2⁸ = **256** — matches the measured 256 exactly.
+- Hardened: N = 2¹⁶ IDs × 28,232 ports × 2⁸ case ≈ **4.7 × 10¹¹** (≈ 2³⁸), about **1.8 billion ×**
+  the weak case. At a sustained 100,000 forged packets/s that is ~55 days of flooding for one name,
+  and it grows 4× for every extra letter in the queried name (more 0x20 case bits). The measured
+  5,000 packets is ~10⁸ short of the expected cost, so "resisted" is the model's prediction too.
+
+Target met (Part B: zero poisonings when randomisation is on). Not run: the finer entropy sweep
+b ∈ {6,8,10,12} with 30 trials each (Part A), and the malicious-authoritative bailiwick case (Part C).
+Source: `bench/plots/F6_poisoning.png`; `docs/experiment-log.md`.
+
+**E6: privacy — what each observer sees** (lab; real packet captures parsed with `ml/tunnel/pcap.py`;
+EVALUATION.md E6)
+
+| Observer | Defence | What it saw | Target |
+|---|---|---|---|
+| Eavesdropper on the client link | plain UDP | the full query name (readable) | exposes → ✓ |
+| | DoT | nothing (encrypted) | hides → ✓ |
+| | DoH | nothing (encrypted) | hides → ✓ |
+| Root server (10.53.2.10) | QNAME min **on** | only `lab` — never the leaf | hides leaf → ✓ |
+| Lab-TLD server (10.53.2.11) | QNAME min **on** | only `example.lab` — never the leaf | hides leaf → ✓ |
+| Root and TLD | QNAME min **off** | the full `<leaf>.sub.example.lab` | exposes → ✓ |
+
+Captured with `tcpdump` at each position and the query names read out with the project's own pcap
+parser. With a random marker label in every test name, a name in a capture can only have come from
+that query. All five targets met. Source: `bench/results/E6/20261101T210224Z/`.
+
+**E2: latency and throughput** (lab, DNSentinel vs Unbound over W2, same hierarchy; EVALUATION.md E2)
+
+| | DNSentinel | Unbound | Target |
+|---|---|---|---|
+| Warm-cache latency p50 | **0.61 ms** | 0.56 ms | < 1 ms → **met** |
+| Warm-cache p95 / p99 | 0.91 / 1.19 ms | 0.83 / 1.07 ms | |
+| Cold-cache latency p50 | **1.28 ms** | 1.21 ms | ≤ 1.5× Unbound → **met** (1.06×) |
+| Cold-cache p95 / p99 | 2.25 / 2.67 ms | 2.34 / 2.97 ms | |
+| Max sustained throughput | **≈ 16,000 q/s** | ≈ 40,000 q/s | ≫ ~100-device need → met |
+
+Warm cache hits are answered in well under a millisecond; cold latency is within 1.06× of Unbound,
+since both walk the same hierarchy from the root. DNSentinel sustains roughly 0.4× Unbound's
+throughput — the cost of recursive resolution plus the policy and DGA fast path — which agrees with
+P1 (~15k q/s) and E9 (43k q/s with ML off). Figures F1 (latency CDFs, cold and warm) and F2
+(throughput vs offered load). Source: `bench/results/E2/20261101T204823Z/`.
+
+*Caveat:* the per-rate throughput sweep is noisy on this single-laptop WSL/Docker setup — achieved q/s
+is non-monotonic at zero loss, i.e. the load generator, not the resolver, is the bottleneck at high
+rates. The max-sustained figures are therefore order-of-magnitude (and consistent across three
+experiments), not a precise saturation curve. A clean sweep needs host networking and longer windows.
+
+**E10: abuse resistance** (lab; EVALUATION.md E10; target: outsiders refused with no upstream query,
+NXNS fan-out bounded by the cap)
+
+| Defence | Measured | Target met |
+|---|---|---|
+| Open-resolver refusal | 10/10 queries from the `outside` network REFUSED; **0** upstream queries caused | ✓ |
+| NXNS amplification cap | a referral advertising **20** nameservers (no glue, unresolvable) is answered SERVFAIL after ≤ **12** upstream queries; a normal name costs 2; hard cap `max_upstream_queries` = 30 | ✓ |
+
+A naive resolver would chase all 20 nameservers at every referral level (the NXNSAttack
+amplification). DNSentinel bounds the work to ≤ 12 upstream queries (≈ 6× a normal lookup, capped
+at 15×) and returns SERVFAIL. Source: `bench/results/E10/20261101T203844Z/`.
 
 **S1: what encrypted DNS costs per access link** (ns-3; a stand-in server, the link isolated)
 
@@ -245,8 +358,23 @@ HTTP/2 as the minimum, and `kdig` and browsers expect it.
   - W2's Zipf exponent is 0.9, an assumption from the literature.
   - The real-internet runs of E1/E2 are left for later.
 
-## To do (these are the user's)
-1. Commit the score-fusion work and the lab (commit blocks in the session).
-2. Freeze the targets before the final runs (EVALUATION.md §9 rule 1): one dated commit.
-3. Optional, only if the report needs the per-model DGA table: a Kaggle run of
-   `python -m ml.dga.pipeline --mode all --models rf,lgbm,xgboost,histgb --features A,B,C,D,E,G`.
+## Still to run (optional, not blocking the report)
+- **E12 blocking effectiveness** — honest version needs a real tracker list + headless browser
+  (the card's Playwright method); the lab can only show the mechanism. Medium effort.
+- **E11 parser fuzzing** — harness builds and runs with clang-19 + libFuzzer; needs ≥ 24 h and a
+  clang-19 toolchain (only clang-18 here, which lacks `<expected>`). Hand-off, not in-session.
+- **Real-internet E1/E2** — the same drivers, on a network with outbound DNS.
+- **Per-model DGA table** — optional Kaggle run:
+  `python -m ml.dga.pipeline --mode all --models rf,lgbm,xgboost,histgb --features A,B,C,D,E,G`.
+
+## Reproducing everything here
+```bash
+lab/lab.sh up                                   # the lab (once; lab/lab.sh build first)
+python3 bench/run.py bench/configs/P1.yaml      # the pipeline comparison (Part 3)
+python3 bench/run.py bench/configs/E1.yaml      # correctness
+python3 bench/run.py bench/configs/E2.yaml      # latency + throughput
+python3 bench/run.py bench/configs/E6.yaml      # privacy
+python3 bench/run.py bench/configs/E10.yaml     # abuse resistance
+python3 lab/attacks/kaminsky.py build-weak/dnsentinel   # E5 poisoning ladder
+~/venvs/dnsentinel-ml/bin/python bench/figures.py       # all tables + figures from raw data
+```
