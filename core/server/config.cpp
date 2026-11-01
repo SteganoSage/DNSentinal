@@ -394,7 +394,8 @@ void read_policy(Section& top, Config& c) {
     policy.finish();
 }
 
-/// telemetry (README §7.10): so far the event stream to the slow path.
+/// telemetry (README §7.10): the event stream to the slow path, the
+/// Prometheus endpoint and the query log.
 void read_telemetry(Section& top, Config& c) {
     Section                       telemetry(top.take("telemetry"), "telemetry");
     Section                       events(telemetry.take("events"), "telemetry.events");
@@ -406,9 +407,26 @@ void read_telemetry(Section& top, Config& c) {
     events.read_uint("max_readers", e.max_readers, 1, 64);
     events.read_bool("commands", e.commands);
     events.finish();
-    for (const char* key : {"prometheus", "query_log"}) {  // still to come
-        if (telemetry.take(key)) c.not_implemented.push_back(telemetry.name(key));
+
+    if (auto node = telemetry.take("prometheus"); node && !node->IsNull()) {
+        Section                        prometheus(node, "telemetry.prometheus");
+        bool                           enabled = true;
+        telemetry::MetricsServerConfig m;
+        prometheus.read_bool("enabled", enabled);
+        read_listen_address(prometheus, "addr", m.address, m.port);
+        prometheus.finish();
+        if (enabled) c.prometheus = m;
     }
+
+    Section                    log(telemetry.take("query_log"), "telemetry.query_log");
+    telemetry::QueryLogConfig& q = c.query_log;
+    log.read_bool("enabled", q.enabled);
+    log.read_string("path", q.path);
+    log.read_uint("retention_days", q.retention_days, 0, 3650);
+    log.read_bool("anonymise_clients", q.anonymise_clients);
+    log.read_uint("ring_buffer_size", q.ring_buffer_size, 16, 1'000'000);
+    read_subnets(log, "exclude", q.exclude);
+    log.finish();
     telemetry.finish();
 }
 

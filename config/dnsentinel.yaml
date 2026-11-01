@@ -97,11 +97,12 @@ telemetry:
     buffer_kb: 4096        # per reader: a reader this far behind loses events; answers never wait
     max_readers: 8
     commands: true         # readers may add and remove dynamic rules (policy.dynamic_rules)
-  prometheus:
+  prometheus:               # GET http://127.0.0.1:9153/metrics; no authentication, so keep it local
     addr: "127.0.0.1:9153"
-  query_log:
+  query_log:                # every answered query as a JSON line, a file per UTC day
     enabled: true
-    path: /var/log/dnsentinel/queries.jsonl
-    retention_days: 7
-    anonymise_clients: false
-    ring_buffer_size: 8192
+    path: logs/queries.jsonl  # gives logs/queries-YYYY-MM-DD.jsonl (relative to where it runs)
+    retention_days: 7       # older day files are removed; 0 keeps everything
+    anonymise_clients: false  # true: a keyed hash ("anon-..."), the key kept beside the log
+    ring_buffer_size: 8192  # lines waiting for the disk; past this they are dropped and counted
+    exclude: []             # clients never logged, e.g. ["10.0.5.0/24"]

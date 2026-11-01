@@ -817,3 +817,25 @@ TEST_F(QueryProcessorTest, NoEventIsBuiltWhenNobodyWantsOne) {
     ASSERT_TRUE(ask(query("www.example.test")).has_value());
     EXPECT_EQ(built, 0);
 }
+
+TEST_F(QueryProcessorTest, CountsEveryAnswerForTheMetrics) {
+    const ListFile block("ads.example.test\n");
+    use_lists({.blocklists = {block.path()}});
+    telemetry::QueryMetrics metrics;
+    processor->count_into(&metrics);  // no on_query: counting needs no event
+
+    ASSERT_TRUE(ask(query("www.example.test")).has_value());
+    ASSERT_TRUE(ask(query("www.example.test")).has_value());  // from the cache
+    ASSERT_TRUE(ask(query("ads.example.test")).has_value());
+    ASSERT_TRUE(ask(query("www.example.test", static_cast<uint16_t>(RRType::TXT))).has_value());
+
+    EXPECT_EQ(metrics.total(), 4u);
+    std::string text;
+    metrics.render(text);
+    EXPECT_NE(text.find(R"(dnsentinel_queries_total{transport="udp",qtype="A",rcode="NOERROR",action="answer"} 2)"),
+              std::string::npos)
+        << text;
+    EXPECT_NE(text.find(R"(qtype="A",rcode="NOERROR",action="block"} 1)"), std::string::npos) << text;
+    EXPECT_NE(text.find(R"(qtype="TXT",)"), std::string::npos) << text;
+    EXPECT_NE(text.find("dnsentinel_query_duration_seconds_count 4\n"), std::string::npos) << text;
+}

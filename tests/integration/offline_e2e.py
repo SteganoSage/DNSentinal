@@ -45,6 +45,7 @@ NOERROR, SERVFAIL, NXDOMAIN, REFUSED = 0, 2, 3, 5
 ROOT_IP, LAB_IP, INFO_IP = "127.0.0.2", "127.0.0.3", "127.0.0.4"
 DEAD_IP = "127.0.0.9"  # delegated to, but nothing listens there
 DAEMON = ("127.0.0.1", 5353)
+METRICS_PORT = 9153
 DOT = ("127.0.0.1", 8853)
 DOH = ("127.0.0.1", 8443)
 
@@ -495,7 +496,8 @@ def run_daemon(binary, config, body):
     daemon = Daemon(binary, config)
     failed_before = len(failures)
     try:
-        check(daemon.wait_for("listening on udp"), "daemon starts listening")
+        # loading the DGA model takes a few seconds in a debug build under a parallel ctest
+        check(daemon.wait_for("listening on udp", timeout=15), "daemon starts listening")
         check(daemon.wait_for("primed the root name servers"), "root priming succeeds")
         body(daemon)
     finally:
@@ -836,6 +838,57 @@ def streaming_events_and_taking_rules(binary, servers, tmp):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
+def logging_and_counting_queries(binary, servers, tmp):
+    """The query log and the Prometheus endpoint (README §7.10)."""
+    logs = os.path.join(tmp, "querylog")
+    telemetry = (f'  prometheus:\n    addr: "127.0.0.1:{METRICS_PORT}"\n'
+                 f"  query_log:\n    enabled: true\n    path: {logs}/queries.jsonl\n")
+
+    def scrape(path="/metrics"):
+        connection = http.client.HTTPConnection("127.0.0.1", METRICS_PORT, timeout=3)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read().decode()
+        connection.close()
+        return response.status, response.getheader("Content-Type"), body
+
+    def value(text, sample):
+        for line in text.splitlines():
+            if line.startswith(sample + " "):
+                return float(line.rsplit(" ", 1)[1])
+        return None
+
+    def body(daemon):
+        check(any(f"metrics http://127.0.0.1:{METRICS_PORT}/metrics" in line for line in daemon.log),
+              "startup log names the metrics endpoint")
+        check(any(f"query log: {logs}/queries-YYYY-MM-DD.jsonl, a file per UTC day, kept 7 days" in line
+                  for line in daemon.log), "...and the query log")
+        ask("www.example.lab")
+        ask("www.example.lab")  # from the cache
+        ask("nothing.example.lab")
+        status, kind, text = scrape()
+        check(status == 200 and kind.startswith("text/plain; version=0.0.4"), "GET /metrics answers in Prometheus' format")
+        answered = 'dnsentinel_queries_total{transport="udp",qtype="A",rcode="NOERROR",action="answer"}'
+        check(value(text, answered) == 2, "...counting queries by transport, type, rcode and action")
+        check(value(text, answered.replace("NOERROR", "NXDOMAIN")) == 1, "...NXDOMAIN apart")
+        check(value(text, "dnsentinel_query_duration_seconds_count") == 3
+              and value(text, 'dnsentinel_query_duration_seconds_bucket{le="+Inf"}') == 3, "...with their latency")
+        check((value(text, "dnsentinel_cache_hits_total") or 0) >= 1
+              and (value(text, "dnsentinel_upstream_queries_total") or 0) >= 1, "...and the cache's and resolver's counters")
+        check(value(text, "dnsentinel_query_log_dropped_total") == 0, "...and the query log's")
+        check(scrape("/")[0] == 404, "other paths are 404")
+
+    log = run_daemon(binary, write_config(tmp, telemetry=telemetry), body)
+    files = sorted(f for f in os.listdir(logs) if f.startswith("queries-")) if os.path.isdir(logs) else []
+    lines = [json.loads(line) for f in files for line in open(os.path.join(logs, f))]
+    check(len(files) == 1 and len(lines) == 3, "the query log has a line per query, in today's file")
+    check([line.get("qname") for line in lines] == ["www.example.lab", "www.example.lab", "nothing.example.lab"]
+          and lines[2].get("rcode") == "NXDOMAIN" and lines[0].get("client") == "127.0.0.1",
+          "...the same lines as the event stream")
+    check(any("query log since startup: 3 lines written, 0 lost because the disk fell behind" in line for line in log),
+          "the daemon sums up the query log at exit")
+
+
 def reexec_in_netns():
     """Run this script again as root of a new user + network namespace."""
     unshare = ["unshare", "--user", "--map-root-user", "--net"]
@@ -955,7 +1008,8 @@ def main():
         for scenario in (resolving_from_the_root, resolving_a_stub_zone,
                          refusing_clients_outside_the_allowed_subnets, rate_limiting_a_flood, blocking_listed_names,
                          serving_stale_during_an_outage, answering_over_tls, answering_over_https,
-                         flagging_generated_names, streaming_events_and_taking_rules, rejecting_a_bad_config):
+                         flagging_generated_names, streaming_events_and_taking_rules, logging_and_counting_queries,
+                         rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
                 scenario(binary, servers, tmp)

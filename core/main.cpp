@@ -1,8 +1,9 @@
 /// @file main.cpp
 /// The dnsentinel daemon: load the config, root hints, certificates and
 /// block lists, start the resolver and the UDP, TCP, DoT and DoH listeners and
-/// the event stream to the slow path, and run the event loop until SIGINT or
-/// SIGTERM. SIGHUP reloads the block lists.
+/// the event stream to the slow path, the query log and the Prometheus
+/// endpoint, and run the event loop until SIGINT or SIGTERM. SIGHUP reloads
+/// the block lists.
 
 #include "dnsentinel/cache/cache.h"
 #include "dnsentinel/net/event_loop.h"
@@ -16,7 +17,10 @@
 #include "dnsentinel/server/query_processor.h"
 #include "dnsentinel/server/rule_commands.h"
 #include "dnsentinel/telemetry/event_stream.h"
+#include "dnsentinel/telemetry/metrics_server.h"
 #include "dnsentinel/telemetry/query_event.h"
+#include "dnsentinel/telemetry/query_log.h"
+#include "dnsentinel/telemetry/query_metrics.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -337,7 +341,9 @@ int main(int argc, char** argv) {
             ", score " + score + "); " + (event.enforced ? "answered as blocked" : "resolved (monitor mode)"));
     });
 #endif
-    resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
+    uint64_t spoof_alerts = 0;
+    resolver.on_spoof_alert([&spoof_alerts](const resolver::SpoofAlert& alert) {
+        ++spoof_alerts;
         char server[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &alert.server, server, sizeof server);
         warn("possible spoofing: " + std::to_string(alert.replies) + " forged-looking replies for " +
@@ -363,13 +369,36 @@ int main(int argc, char** argv) {
             return 1;
         }
         events = std::move(*stream);
-        processor.on_query(
-            [&events](const telemetry::QueryEvent& event) { events->publish(telemetry::to_json(event)); },
-            [&events] { return events->has_readers(); });
         log("event stream on " + config->events.path + " (up to " + std::to_string(config->events.max_readers) +
             " readers" + (config->events.commands ? ", which may change the dynamic rules" : "") +
             "): python -m analyzer.live");
     }
+
+    // ─── The query log (README §7.10) ───────────────────────────────────────
+    std::unique_ptr<telemetry::QueryLog> query_log;
+    if (config->query_log.enabled) {
+        auto opened = telemetry::QueryLog::open(config->query_log);
+        if (!opened) {
+            log("telemetry.query_log: " + opened.error());
+            return 1;
+        }
+        query_log = std::move(*opened);
+        const auto& q = config->query_log;
+        log("query log: " + query_log->file_for("YYYY-MM-DD") + ", a file per UTC day, " +
+            (q.retention_days > 0 ? "kept " + std::to_string(q.retention_days) + " days" : "kept forever") +
+            (q.anonymise_clients ? ", clients anonymised" : "") +
+            (q.exclude.empty() ? "" : ", " + std::to_string(q.exclude.size()) + " subnets never logged"));
+    }
+    if (events || query_log) {
+        processor.on_query(
+            [&events, &query_log](const telemetry::QueryEvent& event) {
+                if (events && events->has_readers()) events->publish(telemetry::to_json(event));
+                if (query_log) query_log->write(event);
+            },
+            [&events, &query_log] { return query_log || events->has_readers(); });
+    }
+    telemetry::QueryMetrics query_metrics;
+    if (config->prometheus) processor.count_into(&query_metrics);
     std::function<void()> expire_rules = [&] {
         if (auto* rules = processor.dynamic_rules()) {
             for (const auto& rule : rules->expire(std::chrono::steady_clock::now())) {
@@ -417,6 +446,89 @@ int main(int argc, char** argv) {
         }
         doh = std::move(*listener);
         listening.push_back("doh https://" + at + config->doh->path);
+    }
+
+    // ─── The Prometheus endpoint (README §7.10) ─────────────────────────────
+    // Each scrape renders everything afresh from the components' counters.
+    const auto                               started = std::chrono::system_clock::now();
+    std::unique_ptr<telemetry::MetricsServer> metrics;
+    if (config->prometheus) {
+        auto render = [&]() {
+            using telemetry::exposition::single;
+            std::string out;
+            out.reserve(8192);
+            query_metrics.render(out);
+            single(out, "dnsentinel_cache_hits_total", "counter", "Answers found in the cache.", cache.hits());
+            single(out, "dnsentinel_cache_misses_total", "counter", "Lookups the cache could not answer.",
+                   cache.misses());
+            single(out, "dnsentinel_cache_entries", "gauge", "Entries in the cache.", uint64_t{cache.size()});
+            const resolver::ResolverStats& r = resolver.stats();
+            single(out, "dnsentinel_upstream_queries_total", "counter", "Queries sent upstream, retries included.",
+                   r.upstream_queries);
+            single(out, "dnsentinel_upstream_minimised_queries_total", "counter",
+                   "Upstream queries sent QNAME-minimised.", r.minimised_queries);
+            single(out, "dnsentinel_minimisation_fallbacks_total", "counter",
+                   "Zones sent the full name because a server mishandled a minimised one.", r.minimisation_fallbacks);
+            single(out, "dnsentinel_stale_answers_total", "counter", "Clients answered with expired data.",
+                   r.stale_answers);
+            single(out, "dnsentinel_prefetches_total", "counter", "Background refreshes of popular entries.",
+                   r.prefetches);
+            single(out, "dnsentinel_spoof_alerts_total", "counter",
+                   "Upstream queries that drew many forged-looking replies (each retried over TCP).", spoof_alerts);
+            const server::Checks& k = processor.checks();
+            single(out, "dnsentinel_rate_limited_total", "counter", "Queries over a client's rate limit.",
+                   k.rate_limit.limited());
+            single(out, "dnsentinel_rrl_dropped_total", "counter", "Responses dropped by response rate limiting.",
+                   k.rrl.dropped());
+            single(out, "dnsentinel_rrl_truncated_total", "counter",
+                   "Responses sent truncated by response rate limiting.", k.rrl.slipped());
+            single(out, "dnsentinel_blocklist_rules", "gauge", "Block list rules in force.", uint64_t{lists.size()});
+            if (const auto* rules = processor.dynamic_rules()) {
+                single(out, "dnsentinel_dynamic_rules", "gauge", "Dynamic rules in force.", uint64_t{rules->size()});
+                single(out, "dnsentinel_dynamic_rules_added_total", "counter", "Dynamic rules added (not renewals).",
+                       rules->added());
+                single(out, "dnsentinel_dynamic_rule_blocks_total", "counter",
+                       "Queries answered under a dynamic rule.", rules->blocked());
+            }
+#ifdef DNSENTINEL_ML
+            if (const auto& d = k.dga) {
+                const ml::DgaStats& s = d->stats();
+                single(out, "dnsentinel_dga_scored_total", "counter",
+                       "New registrable domains the DGA classifier scored.", s.scored);
+                single(out, "dnsentinel_dga_flagged_total", "counter",
+                       "Queries for names the DGA classifier judged generated.", s.flagged);
+                single(out, "dnsentinel_dga_flagged_domains_total", "counter",
+                       "Registrable domains the DGA classifier judged generated.", s.flagged_new);
+            }
+#endif
+            if (events) {
+                const auto& s = events->stats();
+                single(out, "dnsentinel_events_published_total", "counter", "Query events sent to the slow path.",
+                       s.published);
+                single(out, "dnsentinel_events_dropped_total", "counter",
+                       "Query events lost by readers that fell behind.", s.dropped);
+                single(out, "dnsentinel_event_readers", "gauge", "Readers on the event stream.",
+                       uint64_t{events->reader_count()});
+            }
+            if (query_log) {
+                const auto s = query_log->stats();
+                single(out, "dnsentinel_query_log_written_total", "counter", "Lines written to the query log.",
+                       s.written);
+                single(out, "dnsentinel_query_log_dropped_total", "counter",
+                       "Query log lines lost because the disk fell behind.", s.dropped);
+            }
+            single(out, "dnsentinel_start_time_seconds", "gauge", "When the daemon started, in Unix time.",
+                   static_cast<uint64_t>(
+                       std::chrono::duration_cast<std::chrono::seconds>(started.time_since_epoch()).count()));
+            return out;
+        };
+        auto server = telemetry::MetricsServer::create(**loop, *config->prometheus, render);
+        if (!server) {
+            log(server.error());
+            return 1;
+        }
+        metrics = std::move(*server);
+        listening.push_back("metrics http://" + endpoint(config->prometheus->address, metrics->port()) + "/metrics");
     }
 
     // ─── Reloading the lists: on SIGHUP, and when a list file changes ───────
@@ -514,6 +626,12 @@ int main(int argc, char** argv) {
         log("event stream since startup: " + std::to_string(s.readers) + " readers, " + std::to_string(s.published) +
             " events published, " + std::to_string(s.dropped) + " lost by readers that fell behind, " +
             std::to_string(s.commands) + " commands");
+    }
+    if (query_log) {
+        query_log->close();  // so every queued line is counted
+        const auto s = query_log->stats();
+        log("query log since startup: " + std::to_string(s.written) + " lines written, " + std::to_string(s.dropped) +
+            " lost because the disk fell behind, " + std::to_string(s.removed) + " old day files removed");
     }
     log("cache since startup: " + std::to_string(cache.hits()) + " hits, " + std::to_string(cache.misses()) +
         " misses, " + std::to_string(resolver.stats().stale_answers) + " stale answers, " +

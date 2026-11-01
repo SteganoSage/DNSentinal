@@ -23,6 +23,7 @@
 #include "dnsentinel/policy/rebinding.h"
 #include "dnsentinel/security/rrl.h"
 #include "dnsentinel/telemetry/query_event.h"
+#include "dnsentinel/telemetry/query_metrics.h"
 #include "dnsentinel/types.h"
 
 #include <functional>
@@ -105,6 +106,11 @@ public:
         on_query_ = std::move(fn);
         query_wanted_ = std::move(wanted);
     }
+    /// Count every answered query into `metrics` (README §7.10): by
+    /// transport, type, rcode and the check that decided, and its latency.
+    /// Like on_query, before response rate limiting. Must outlive the
+    /// processor; null stops counting.
+    void count_into(telemetry::QueryMetrics* metrics) { metrics_ = metrics; }
 #ifdef DNSENTINEL_ML
     /// Called for every query the DGA classifier flags, before it is answered
     /// (resolved in monitor mode, answered like a blocked name in enforce mode).
@@ -139,6 +145,7 @@ private:
     RebindingFn                  on_rebinding_;
     QueryFn                      on_query_;
     WantedFn                     query_wanted_;
+    telemetry::QueryMetrics*     metrics_ = nullptr;
 #ifdef DNSENTINEL_ML
     DgaFn on_dga_;
 #endif

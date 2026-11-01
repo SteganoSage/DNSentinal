@@ -48,8 +48,9 @@ struct QueryEvent {
     std::optional<double>                 dga;   // the DGA score, if the classifier scored the name
 };
 
-/// The event as one line of JSON, without the newline.
-[[nodiscard]] std::string to_json(const QueryEvent& event);
+/// The event as one line of JSON, without the newline. `client`, if given,
+/// stands in for the address (the query log's anonymised label).
+[[nodiscard]] std::string to_json(const QueryEvent& event, std::string_view client = {});
 
 /// "A", "TXT", "TYPE65399": the spellings ml/tunnel/pcap.py uses.
 [[nodiscard]] std::string type_name(uint16_t qtype);

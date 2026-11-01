@@ -16,6 +16,8 @@
 #include "dnsentinel/security/rrl.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
 #include "dnsentinel/telemetry/event_stream.h"
+#include "dnsentinel/telemetry/metrics_server.h"
+#include "dnsentinel/telemetry/query_log.h"
 
 #include <expected>
 #include <optional>
@@ -48,6 +50,8 @@ struct Config {
     policy::DynamicRulesConfig dynamic_rules;  // policy.dynamic_rules (README §7.6.6); default: on, none yet
     ml::DgaConfig            dga;        // ml.dga, the DGA classifier (plan §7.8.2); default: off
     telemetry::EventStreamConfig events;  // telemetry.events, the event bus (README §6.2); default: off
+    std::optional<telemetry::MetricsServerConfig> prometheus;  // telemetry.prometheus (README §7.10); none: off
+    telemetry::QueryLogConfig                     query_log;   // telemetry.query_log (README §7.10); default: off
 
     /// Features the config turns on (in the file, or by default) that this
     /// build doesn't implement yet ("listen.dot", "policy", ...), so startup

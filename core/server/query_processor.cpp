@@ -118,14 +118,21 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
         };
     }
 
-    // The event for the slow path (README §6.2): built as the answer goes
-    // out, from what the checks below decide. Only if someone wants it.
+    // The event for the slow path (README §6.2) and the query counters
+    // (README §7.10): taken as the answer goes out, from what the checks
+    // below decide. The event only if someone wants it.
     std::shared_ptr<Decision> decision;
-    if (on_query_ && (!query_wanted_ || query_wanted_())) {
+    const bool                want_event = on_query_ && (!query_wanted_ || query_wanted_());
+    if (want_event || metrics_ != nullptr) {
         decision = std::make_shared<Decision>();
-        respond  = [this, decision, client, arrived = Clock::now(), wall = std::chrono::system_clock::now(),
+        respond  = [this, decision, client, want_event, arrived = Clock::now(), wall = std::chrono::system_clock::now(),
                    send = std::move(respond)](const Message& response) {
-            if (!response.questions.empty()) {
+            const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - arrived);
+            if (metrics_ != nullptr) {
+                const uint16_t qtype = response.questions.empty() ? 0 : response.questions.front().qtype;
+                metrics_->record(client.transport, qtype, response.header.rcode, decision->action, latency);
+            }
+            if (want_event && !response.questions.empty()) {
                 telemetry::QueryEvent event;
                 event.time          = wall;
                 event.client        = client.addr;
@@ -134,8 +141,7 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
                 event.rcode         = response.header.rcode;
                 event.answers       = static_cast<uint16_t>(response.answers.size());
                 event.response_size = wire::build(response).size();
-                event.latency_us    = static_cast<uint32_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - arrived).count());
+                event.latency_us    = static_cast<uint32_t>(latency.count());
                 event.action = decision->action;
                 event.rule   = decision->rule;
                 event.dga    = decision->dga;

@@ -121,7 +121,7 @@ std::string name_text(const Name& name) {
 
 }  // namespace
 
-std::string to_json(const QueryEvent& event) {
+std::string to_json(const QueryEvent& event, std::string_view client) {
     const auto micros =
         std::chrono::duration_cast<std::chrono::microseconds>(event.time.time_since_epoch()).count();
     char timestamp[32];
@@ -129,7 +129,7 @@ std::string to_json(const QueryEvent& event) {
                   static_cast<long long>(micros % 1000000));
     std::string out = R"({"type":"query","timestamp":)";
     out += timestamp;
-    out += R"(,"client":)" + json_string(address_text(event.client));
+    out += R"(,"client":)" + (client.empty() ? json_string(address_text(event.client)) : json_string(client));
     out += R"(,"transport":")" + std::string(transport_name(event.transport)) + '"';
     out += R"(,"qname":)" + json_string(name_text(event.question.qname));
     out += R"(,"qtype":")" + type_name(event.question.qtype) + '"';

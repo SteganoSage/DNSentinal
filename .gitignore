@@ -56,6 +56,7 @@ config/lists/feeds/
 *.log
 *.jsonl
 /run/
+/logs/
 
 # ─── Benchmark results (regenerated, keep scripts) ──────────────────────────
 bench/plots/*.png
