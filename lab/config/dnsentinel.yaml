@@ -1,0 +1,49 @@
+# DNSentinel in the lab (lab/README.md). Paths are relative to /dnsentinel, where the lab
+# mounts this checkout read-only; results go to /results (lab/results on the host).
+listen:
+  udp: "0.0.0.0:53"
+  tcp: "0.0.0.0:53"
+  dot:
+    addr: "0.0.0.0:853"
+    cert: lab/state/certs/server.crt
+    key: lab/state/certs/server.key
+  doh:
+    addr: "0.0.0.0:443"
+    path: "/dns-query"
+    cert: lab/state/certs/server.crt
+    key: lab/state/certs/server.key
+
+access:
+  allow: ["10.53.1.0/24", "127.0.0.0/8"]   # lan only: the outside network is refused (E10)
+  deny_action: refuse
+
+rate_limit:
+  exempt: ["10.53.1.10/32"]   # the client: load tests measure the resolver, not the limiter (infected hosts stay limited)
+
+resolver:
+  root_hints: lab/hierarchy/out/root.hints   # the lab root, 10.53.2.10
+  qname_minimisation: true
+  use_0x20: true
+
+policy:
+  blocklists: [lab/config/blocklist.txt]
+  block_response: null_ip
+  dynamic_rules:
+    enabled: true
+
+ml:
+  dga:
+    enabled: true
+    mode: monitor
+    model: models/dga
+    words: config/english_words.txt
+    allowlist: lab/hierarchy/out/popular.txt   # the lab's popular sites (Tranco's top, as built)
+
+telemetry:
+  events:
+    socket: /run/dnsentinel/events.sock       # a volume shared with the analyzer
+  prometheus:
+    addr: "0.0.0.0:9153"
+  query_log:
+    enabled: true
+    path: /results/querylog/queries.jsonl

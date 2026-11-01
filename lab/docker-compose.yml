@@ -1,0 +1,116 @@
+# The lab (lab/README.md): `lab/lab.sh up`, not docker compose directly, so the hierarchy
+# and certificates exist first. Every network is internal: nothing reaches the real internet.
+name: dnsentinel-lab
+
+x-tools: &tools
+  image: dnsentinel-lab/tools
+  volumes:
+    - ..:/dnsentinel:ro
+    - ./results:/results
+    - ../bench/results:/bench-results   # experiment drivers write their raw results here
+  working_dir: /dnsentinel
+  init: true
+
+networks:
+  lan:     { internal: true, ipam: { config: [ { subnet: 10.53.1.0/24 } ] } }
+  wan:     { internal: true, ipam: { config: [ { subnet: 10.53.2.0/24 } ] } }
+  outside: { internal: true, ipam: { config: [ { subnet: 10.53.3.0/24 } ] } }
+
+volumes:
+  events: {}   # DNSentinel's event socket, shared with the analyzer
+
+services:
+  # ─── the hierarchy ────────────────────────────────────────────────────────
+  root:
+    <<: *tools
+    command: nsd -d -c /dnsentinel/lab/hierarchy/out/root.conf
+    networks: { wan: { ipv4_address: 10.53.2.10 } }
+  tld:
+    <<: *tools
+    command: nsd -d -c /dnsentinel/lab/hierarchy/out/tld.conf
+    networks: { wan: { ipv4_address: 10.53.2.11 } }
+  auth:
+    <<: *tools
+    command: nsd -d -c /dnsentinel/lab/hierarchy/out/auth.conf
+    networks: { wan: { ipv4_address: 10.53.2.20 } }
+  quirks:
+    <<: *tools
+    cap_add: [NET_ADMIN]   # the deep chain's five more addresses
+    command: >
+      sh -c "for i in 1 2 3 4 5; do ip addr add 10.53.2.3$$i/24 dev eth0; done &&
+             exec python3 lab/servers/quirks.py"
+    networks: { wan: { ipv4_address: 10.53.2.30 } }
+  iodined:
+    <<: *tools
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    command: iodined -f -c -l 10.53.2.40 -P labsecret 172.30.0.1/27 tunnel.lab
+    networks: { wan: { ipv4_address: 10.53.2.40 } }
+
+  # ─── the resolvers ────────────────────────────────────────────────────────
+  dnsentinel:
+    image: dnsentinel-lab/dnsentinel
+    # the experiments switch config and binary (bench/run.py): DNSENTINEL_CONFIG, DNSENTINEL_BIN (dnsentinel-weak)
+    entrypoint: ["${DNSENTINEL_BIN:-dnsentinel}"]
+    command: ["-c", "${DNSENTINEL_CONFIG:-/dnsentinel/lab/config/dnsentinel.yaml}"]
+    cap_add: [NET_ADMIN]   # tc netem link profiles
+    volumes:
+      - ..:/dnsentinel:ro
+      - ./results:/results
+      - events:/run/dnsentinel
+    depends_on: [root, tld, auth, quirks]
+    networks:
+      lan: { ipv4_address: 10.53.1.2 }
+      wan: { ipv4_address: 10.53.2.2 }
+      outside: { ipv4_address: 10.53.3.2 }
+  analyzer:
+    image: dnsentinel-lab/analyzer
+    # ANALYZER_JUDGE: "--model models/tunnel" (the trained model) or "" (the hand-written rules)
+    entrypoint: ["sh", "-c", "exec python -m analyzer.live --socket /run/dnsentinel/events.sock $$ANALYZER_JUDGE
+                 --enforce --rule-ttl 300 --allowlist lab/hierarchy/out/popular.txt --alerts $$ANALYZER_ALERTS"]
+    environment:
+      ANALYZER_JUDGE: "${ANALYZER_JUDGE---model models/tunnel}"
+      ANALYZER_ALERTS: "${ANALYZER_ALERTS:-/results/alerts.jsonl}"
+    volumes:
+      - ..:/dnsentinel:ro
+      - ./results:/results
+      - events:/run/dnsentinel
+    depends_on: [dnsentinel]
+    network_mode: none     # it only talks to the resolver's socket
+  unbound:
+    <<: *tools
+    command: unbound -d -c /dnsentinel/lab/config/unbound.conf
+    depends_on: [root, tld, auth, quirks]
+    networks:
+      lan: { ipv4_address: 10.53.1.3 }
+      wan: { ipv4_address: 10.53.2.3 }
+
+  # ─── the people ───────────────────────────────────────────────────────────
+  client:
+    <<: *tools
+    cap_add: [NET_ADMIN]
+    command: sleep infinity
+    networks: { lan: { ipv4_address: 10.53.1.10 } }
+  infected:
+    <<: *tools
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]   # the iodine client
+    command: sleep infinity
+    networks: { lan: { ipv4_address: 10.53.1.20 } }
+  infected2:  # DGA malware (the pipeline experiment)
+    <<: *tools
+    command: sleep infinity
+    networks: { lan: { ipv4_address: 10.53.1.21 } }
+  infected3:  # a slow tunnel (the pipeline experiment)
+    <<: *tools
+    command: sleep infinity
+    networks: { lan: { ipv4_address: 10.53.1.22 } }
+  attacker:   # off-path, on the "internet" side: forges answers from the TLD's address (E5)
+    <<: *tools
+    cap_add: [NET_ADMIN, NET_RAW]
+    command: sleep infinity
+    networks: { wan: { ipv4_address: 10.53.2.66 } }
+  outsider:   # not in DNSentinel's allowed subnets (E10)
+    <<: *tools
+    command: sleep infinity
+    networks: { outside: { ipv4_address: 10.53.3.66 } }

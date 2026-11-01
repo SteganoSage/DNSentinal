@@ -1,0 +1,12 @@
+experiment: P1
+module: pipeline
+title: The full pipeline end to end, configurations C0 (Unbound) to C6 (docs/results.md Part 3)
+params:
+  configs: [C0, C1, C2, C3, C4, C5, C6]
+  reps: 3                 # interleaved: rep 1 of every configuration, then rep 2, ...
+  seconds: 240            # traffic per run: 9 DGA families x 25 s, and the tunnels alongside
+  benign_rate: 50         # benign queries a second (W2)
+  slow_rate: 0.2          # the slow tunnel's queries a second
+  sweep: [2000, 5000, 10000, 20000, 40000]   # dnsperf rates; stops past 1% loss
+  sweep_seconds: 5
+  seed: 1

@@ -1,0 +1,18 @@
+# The lab's images (lab/images/) build from the repository root: send them the sources only.
+build/
+build-*/
+cmake-build-*/
+*.zip
+ml/data/
+ml/runs/
+bench/results/
+logs/
+.git/
+**/__pycache__/
+**/*.pyc
+.venv/
+venv/
+dashboard/
+docs/
+certs/*.key
+certs/*.pem

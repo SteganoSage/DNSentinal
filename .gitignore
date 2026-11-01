@@ -63,6 +63,7 @@ bench/plots/*.png
 bench/plots/*.pdf
 bench/plots/*.svg
 bench/results/
+bench/tables/
 
 # ─── IDE / editor ────────────────────────────────────────────────────────────
 .vscode/
@@ -80,3 +81,8 @@ Thumbs.db
 tests/fuzz/corpus/
 tests/fuzz/crashes/
 tests/fuzz/artifacts/
+
+# ─── The lab (lab/lab.sh build) ──────────────────────────────────────────────
+lab/hierarchy/out/
+lab/state/
+lab/results/

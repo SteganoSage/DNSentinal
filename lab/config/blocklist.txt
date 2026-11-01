@@ -1,0 +1,3 @@
+# The lab's block list (E12): an ad host, and a tracker that sites cloak behind their own names.
+ads.example.lab
+tracker.lab

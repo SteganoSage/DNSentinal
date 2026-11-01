@@ -1,0 +1,9 @@
+experiment: E1
+module: e1
+title: Correctness against a production resolver (lab hierarchy; Unbound as the baseline)
+params:
+  popular: 10000          # W3: Tranco's top names, as the lab serves them
+  types: [A, AAAA]
+  rate: 80                # query pairs a second: under DNSentinel's per-client limit (100/s)
+  cold: true              # restart both resolvers first
+  seed: 1

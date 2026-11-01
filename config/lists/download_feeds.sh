@@ -13,7 +13,8 @@ mkdir -p "$feeds"
 sources=(
     "ads      https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"  # MIT
     "trackers https://v.firebog.net/hosts/Easyprivacy.txt"                       # EasyPrivacy, GPLv3 / CC BY-SA
-    "malware  https://urlhaus.abuse.ch/downloads/hostfile/"                      # abuse.ch URLhaus, CC0
+    # abuse.ch URLhaus, CC0. Its own hosts file is gone (410 since 2026); malware-filter's is the same data
+    "malware  https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-hosts.txt"
     # Not a block list: the popular sites ml.dga never scores. Tranco list 64VVX, the one the
     # DGA model was trained against (ml/DATA.md); free for research, cite Le Pochat et al. 2019.
     "tranco_top100k https://tranco-list.eu/download/64VVX/100000"
