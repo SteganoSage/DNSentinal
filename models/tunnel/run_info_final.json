@@ -1,0 +1,199 @@
+{
+ "mode": "final",
+ "tag": "main",
+ "features": [
+  "V",
+  "N",
+  "R",
+  "D"
+ ],
+ "window": 60.0,
+ "step": 10.0,
+ "models": [
+  "lgbm"
+ ],
+ "fpr": 0.0001,
+ "train_slowdowns": [
+  1,
+  2,
+  10
+ ],
+ "test_slowdowns": [
+  1,
+  2,
+  10,
+  100,
+  1000,
+  10000
+ ],
+ "within": 600.0,
+ "fraction": 1.0,
+ "alert_after": 2,
+ "calibrate": "per-set",
+ "final_model": "lgbm",
+ "splits": [
+  {
+   "name": "final",
+   "train": 1110456,
+   "calibration": 84894,
+   "test": 0,
+   "test_tunnel": 0
+  }
+ ],
+ "params": {
+  "rf": {
+   "n_estimators": 300,
+   "max_depth": 10,
+   "min_samples_leaf": 4,
+   "max_features": "log2",
+   "max_samples": 0.860933,
+   "class_weight": null,
+   "benign_balance": 0.75
+  },
+  "lgbm": {
+   "n_estimators": 600,
+   "learning_rate": 0.128073,
+   "num_leaves": 104,
+   "min_child_samples": 62,
+   "subsample": 0.654255,
+   "colsample_bytree": 0.398287,
+   "reg_lambda": 0.001136,
+   "benign_balance": 1.0
+  },
+  "xgboost": {
+   "n_estimators": 100,
+   "learning_rate": 0.193371,
+   "max_leaves": 168,
+   "min_child_weight": 3.196629,
+   "subsample": 0.507037,
+   "colsample_bytree": 0.395726,
+   "reg_lambda": 1.3245,
+   "benign_balance": 1.0
+  },
+  "source": {
+   "how": "python -m ml.tunnel.pipeline --mode tune --models rf,lgbm,xgboost --trials 40 --timeout-hours 9 --features V,N,R V,N,R,D (Kaggle, 4 CPUs, 2026-10-31)",
+   "use_with": "--features V,N,R,D",
+   "objective": "left-out known tool recall at 0.01% FPR on each benign set, mean of full and 1/10 rate",
+   "tuned": {
+    "rf": 0.99948,
+    "lgbm": 0.99894,
+    "xgboost": 0.99924
+   },
+   "defaults": {
+    "rf": 0.99902,
+    "lgbm": 0.74638,
+    "xgboost": 0.80002
+   }
+  }
+ },
+ "seconds": 37.9,
+ "dataset": {
+  "built": "2026-10-31T18:49:43+00:00",
+  "seconds": 725.1,
+  "sources": {
+   "graphtunnel": {
+    "repository": "ggyggy666/DNS-Tunnel-Datasets",
+    "commit": "e3dccb8a9481cc984592bcc6a018a376dc8e5fac"
+   },
+   "korving": {
+    "repository": "Korving-F/dns-tunnel-dataset",
+    "commit": "bdc4486751f5e87fa6100b17dd57fc001743b43c"
+   },
+   "stratosphere": {
+    "url": "https://mcfp.felk.cvut.cz/publicDatasets/",
+    "browsing": "all"
+   },
+   "allowlist": {
+    "url": "https://tranco-list.eu/download/64VVX/100000",
+    "domains": 100000
+   },
+   "local": null
+  },
+  "captures": 255,
+  "queries": 2944047,
+  "sets": {
+   "android": {
+    "label": "tunnel",
+    "captures": 5,
+    "queries": 66345,
+    "hours": 6.383,
+    "tools": [
+     "andiodine"
+    ]
+   },
+   "browsing": {
+    "label": "benign",
+    "captures": 14,
+    "queries": 301400,
+    "hours": 39.709,
+    "tools": []
+   },
+   "crawl": {
+    "label": "benign",
+    "captures": 68,
+    "queries": 1006244,
+    "hours": 24.424,
+    "tools": []
+   },
+   "known": {
+    "label": "tunnel",
+    "captures": 117,
+    "queries": 800272,
+    "hours": 17.6,
+    "tools": [
+     "dns-shell",
+     "dnscat2",
+     "dnspot",
+     "iodine",
+     "tuns"
+    ]
+   },
+   "unknown": {
+    "label": "tunnel",
+    "captures": 38,
+    "queries": 396750,
+    "hours": 14.073,
+    "tools": [
+     "cobaltstrike",
+     "dns2tcp",
+     "ozymandns",
+     "tcp-over-dns"
+    ]
+   },
+   "wildcard": {
+    "label": "benign",
+    "captures": 13,
+    "queries": 373036,
+    "hours": 1.006,
+    "tools": []
+   }
+  },
+  "packets": {
+   "packets": 15846868,
+   "dns": 7235588,
+   "queries": 3733708,
+   "responses": 3501880,
+   "matched": 3485127,
+   "tcp_dns": 2733,
+   "fragments": 0,
+   "malformed": 0
+  },
+  "events_sha256": "883d3909e674b6daf3f24d6b4b942095b6431f76f40f31659c995eaf3e1cee1c"
+ },
+ "environment": {
+  "host": "DCodingArsenal",
+  "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "cpus": 16,
+  "gpu": "",
+  "versions": {
+   "python": "3.12.3",
+   "numpy": "2.1.3",
+   "sklearn": "1.6.1",
+   "lightgbm": "4.6.0"
+  },
+  "git_commit": "8a9199787739d8ce829f3f653e349d8094f2e6c6"
+ },
+ "headline": {
+  "threshold": 0.003009825322562228
+ }
+}

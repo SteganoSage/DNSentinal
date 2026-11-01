@@ -1,0 +1,86 @@
+{
+ "model": "tunnel_lgbm.txt",
+ "kind": "lgbm",
+ "features": [
+  "query_count",
+  "active_seconds",
+  "mean_interval",
+  "interval_cv",
+  "unique_subdomain_count",
+  "unique_subdomain_ratio",
+  "mean_subdomain_length",
+  "max_subdomain_length",
+  "mean_label_length",
+  "max_label_length",
+  "mean_subdomain_labels",
+  "mean_subdomain_entropy",
+  "pooled_entropy",
+  "distinct_characters",
+  "digit_ratio",
+  "unusual_character_ratio",
+  "data_type_ratio",
+  "mean_response_size",
+  "max_response_size",
+  "nxdomain_ratio",
+  "unique_subdomain_bytes",
+  "long_label_ratio",
+  "hex_ratio",
+  "length_cv"
+ ],
+ "groups": [
+  "V",
+  "N",
+  "R",
+  "D"
+ ],
+ "threshold": 0.003009825322562228,
+ "target_fpr": 0.0001,
+ "window_seconds": 60.0,
+ "step_seconds": 10.0,
+ "alert_after": 2,
+ "alert_gap": 600.0,
+ "calibrate": "per-set",
+ "train_slowdowns": [
+  1,
+  2,
+  10
+ ],
+ "trained_on": {
+  "tunnel_windows": 154541,
+  "benign_windows": 955915,
+  "captures": 236,
+  "tools": [
+   "andiodine",
+   "cobaltstrike",
+   "dns-shell",
+   "dns2tcp",
+   "dnscat2",
+   "dnspot",
+   "iodine",
+   "ozymandns",
+   "tcp-over-dns",
+   "tuns"
+  ]
+ },
+ "dataset_sha256": "883d3909e674b6daf3f24d6b4b942095b6431f76f40f31659c995eaf3e1cee1c",
+ "params": {
+  "n_estimators": 600,
+  "learning_rate": 0.128073,
+  "num_leaves": 104,
+  "min_child_samples": 62,
+  "subsample": 0.654255,
+  "subsample_freq": 1,
+  "reg_lambda": 0.001136,
+  "random_state": 42,
+  "n_jobs": 4,
+  "verbose": -1,
+  "colsample_bytree": 0.398287
+ },
+ "benign_balance": 1.0,
+ "versions": {
+  "python": "3.12.3",
+  "numpy": "2.1.3",
+  "sklearn": "1.6.1",
+  "lightgbm": "4.6.0"
+ }
+}

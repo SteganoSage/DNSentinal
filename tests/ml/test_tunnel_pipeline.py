@@ -72,6 +72,14 @@ class Pipeline(unittest.TestCase):
         self.assertTrue(all(r["verdict"]["label"] in ("high", "low") for r in results))
         self.assertEqual(results[-1]["verdict"]["label"], "high")
 
+        from ml.tunnel import export  # what models/tunnel ships: the same verdicts, without the pickle
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            export.main([str(base / "final"), str(self.root / "shipped"), "--data", str(self.root / "data"),
+                         "--edge-windows", "500"])
+        shipped = [r for r in analyze(events, model=self.root / "shipped") if r["signal"] == "tunnel"]
+        self.assertEqual([(r["verdict"], r["alert"]) for r in shipped], [(r["verdict"], r["alert"]) for r in results])
+
         from ml.tunnel import leaderboard
 
         with contextlib.redirect_stdout(io.StringIO()), mock.patch("sys.argv", ["leaderboard", str(runs)]):

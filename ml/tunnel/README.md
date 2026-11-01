@@ -185,6 +185,44 @@ to 1/10000, `V,N,R` and `V,N,R,D`; 48 min):
   threshold, and DNS-shell, in that fold, was missed. Each set now holds back at least 1/FPR
   (10,000) windows, up to half its captures.
 
+**Final runs** (2026-11-01, Kaggle, 39 min each). These are the tuned settings of `params/`, with `V,N,R` and with `V,N,R,D`. The last two columns are without D; the others are with it.
+
+| | RF | LightGBM | XGBoost | RF without D | LightGBM without D |
+|---|---|---|---|---|---|
+| Unseen tools (`unknown`, mean recall per tool) | 0.965 | 0.966 | 0.967 | 0.954 | 0.966 |
+| Unseen-tool captures caught | 42/43 | 42/43 | 42/43 | 42/43 | 42/43 |
+| Left-out known tool (`tool`) | **0.999** | **0.999** | 0.992 | 0.805 | 0.922 |
+| Known-tool captures caught at 1/100 (1/1000) | 117 (98) | 117 (101) | 117 (101) | 117 (97) | 116 (100) |
+| Browsing alerts in 39.7 h (`cv`; allowlisted) | 7 (1) | 6 (1) | 8 (1) | 7 (1) | 6 (1) |
+| Wildcard DNS alerts a day, allowlisted | 215 | 262 | 239 | 215 | 262 |
+
+**D is kept.** Without it, two models miss DNS-shell when it is left out of training:
+- the forest flags 35 of its 644 windows;
+- LightGBM flags 451 of 644.
+
+With D, both flag all but one window.
+
+**LightGBM is the final model.** Taking the rules above in order:
+1. **Unseen tools: a tie.** The window-recall intervals overlap (0.986-0.992). The one capture missed is a dns2tcp capture one window long, and alerts need two windows.
+2. **Left-out known tool: XGBoost drops out.** It flags 2,353 of iodine's 2,446 windows, interval 0.955-0.969, against the forest's 0.996-1.000.
+3. **Forest vs LightGBM: a tie.**
+   - McNemar's test on `cv` favours the forest, 22 windows to 5 (p = 0.002), but the recall intervals overlap: 0.99953-1 vs 0.99875-0.99984. So by rule 4 it doesn't count.
+   - Browsing alerts are 7 vs 6, and rates 98 vs 101 captures at 1/1000.
+4. **Tie-break: the smaller, faster model.** That is LightGBM:
+   - LightGBM: a 1.0 MB text model, 0.16 ms per window in the analyzer;
+   - the forest: 1.7 MB and 0.33 ms as exported JSON. scikit-learn's own call takes 23 ms for one window.
+
+The forest is the runner-up. It needs no ML library once exported, and it raises fewer false alerts on wildcard DNS.
+
+What remains weak:
+- **Cobalt Strike:** 0.82-0.84 of its windows, for every model.
+- **Wildcard DNS:** 215-262 false alerts a day even with the allowlist. It is never trained on; it is what score fusion (README §7.8.5) has to settle.
+- **Slow rates:** at 1/1000 and below, two windows come too late for 14-18% of captures. A single window still catches 99%.
+
+The shipped model is in `models/tunnel` (its README). The final mode trains only the model asked for, and Kaggle's run asked for the forest. So LightGBM's final model was trained locally:
+- with the same command, commit and library versions;
+- after that setup rebuilt Kaggle's forest with identical trees (the threshold differed by 1e-16, from the order the threads added scores).
+
 ## Tuning
 
 ```bash
@@ -223,15 +261,16 @@ asks the question tuned on, so it flatters the tuned settings).
 ## In the analyzer
 
 ```bash
-python -m analyzer.tunnel_analyzer events.jsonl --model ml/runs/tunnel/main/w60-fVNR/final
+python -m analyzer.tunnel_analyzer events.jsonl --model models/tunnel
+python -m ml.tunnel.export <out>/main/w60-f<groups>/final models/tunnel   # ship a new final model
 ```
 
-reads `model.json` (features, threshold, window, step, alert rule) and the model it names
-(`tunnel_rf.pkl`, pickled: load only models trained here, with the library versions the card
-records; or `tunnel_lgbm.txt`) and gives every window a verdict: `high` above the threshold,
-with the rules' reasons as the explanation. `"alert": true` marks the windows that complete two
-consecutive `high` ones of a client and domain. Without `--model` the hand-written rules judge
-alone.
+The analyzer reads `model.json` (features, threshold, window, step, alert rule) and the model it names, and gives every window a verdict: `high` above the threshold, with the rules' reasons as the explanation. `"alert": true` marks the windows that complete two consecutive `high` ones of a client and domain. Without `--model` the hand-written rules judge alone.
+
+The model can be in three forms:
+- **`tunnel_lgbm.txt`:** LightGBM's text model, shipped as it is.
+- **`tunnel_rf.pkl`:** the pickled random forest the final mode writes. It needs the scikit-learn it was made with, and runs code when it is loaded.
+- **`tunnel_rf.json`:** that forest exported by `ml.tunnel.export`. The trees are plain JSON, scored with no library, bit for bit as scikit-learn scores them. The export checks this on windows sitting on every split threshold and, with `--data`, on real windows. It must be run with the scikit-learn `model.json` records.
 
 ## Your own captures
 
