@@ -56,6 +56,19 @@ def config_file(name: str, spec: dict) -> str:
     return "/dnsentinel/" + str(path.relative_to(REPO))
 
 
+def unbound_file() -> str:
+    """Unbound for C0: its config, with QNAME minimisation off. With it on, iodine stalls through Unbound
+    (6 KiB in 30 s against 4.3 MiB without): an interop quirk, not a defence (docs/experiment-log.md)."""
+    text = (LAB / "config" / "unbound.conf").read_text().replace("qname-minimisation: yes", "qname-minimisation: no")
+    path = LAB / "state" / "configs" / "unbound-C0.conf"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return "/dnsentinel/" + str(path.relative_to(REPO))
+
+
+CLEAN = 'pkill -x iodine; pkill -x nc; pkill -f "^python3 /dnsentinel/bench/drivers"; true'  # never matches this sh
+
+
 def percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -99,12 +112,11 @@ def one_run(lab, name: str, spec: dict, rep: int, out: Path, params: dict) -> di
     seconds = float(params.get("seconds", 240))
 
     # the resolvers, fresh: cold caches, no rules left from the last run
-    for host in ("infected", "infected2", "infected3", "client"):
-        lab.exec(host, "sh", "-c", "pkill -f iodine; pkill -f nc; pkill -f bench/drivers; true", check=False)
-    lab.exec("iodined", "sh", "-c", "pkill -f sink.py; true", check=False)
+    for host in ("infected", "infected2", "infected3", "client", "iodined"):
+        lab.exec(host, "sh", "-c", CLEAN, check=False)
     alerts_inside = f"/results/runs/{out.name}-{name}-r{rep}.jsonl"
     if spec["resolver"] == "unbound":
-        lab.restart("unbound")
+        lab.recreate("unbound", {"UNBOUND_CONFIG": unbound_file()})
         lab.stop("analyzer")
     else:
         lab.recreate("dnsentinel", {"DNSENTINEL_CONFIG": config_file(name, spec)})
@@ -120,7 +132,8 @@ def one_run(lab, name: str, spec: dict, rep: int, out: Path, params: dict) -> di
     # the traffic, all at once
     started = time.time()
     lab.detach("iodined", "python3", f"{DRIVERS}/sink.py", "--listen", "172.30.0.1", "--out", str(inside / "sink.csv"))
-    lab.detach("infected", "sh", "-c", f"exec iodine -f -r -P labsecret {server} tunnel.lab > {inside}/iodine.log 2>&1")
+    # lazy mode off (-L0): with it on, iodine stalls through Unbound; off, every configuration gets the same tunnel
+    lab.detach("infected", "sh", "-c", f"exec iodine -f -r -L0 -P labsecret {server} tunnel.lab > {inside}/iodine.log 2>&1")
     lab.detach("client", "python3", f"{DRIVERS}/latency.py", "--server", server, "--names",
                str(Path("/bench-results") / out.relative_to(RESULTS) / "w2.txt"), "--rate", str(params.get("benign_rate", 50)),
                "--out", str(inside / "benign.csv"))
@@ -156,8 +169,8 @@ def one_run(lab, name: str, spec: dict, rep: int, out: Path, params: dict) -> di
         wait_file(run / path, 120)
     stop.set()
     sampler.join()
-    lab.exec("infected", "sh", "-c", "pkill -f 'nc -N'; pkill iodine; true", check=False)
-    lab.exec("iodined", "sh", "-c", "pkill -TERM -f sink.py; true", check=False)
+    lab.exec("infected", "sh", "-c", CLEAN, check=False)
+    lab.exec("iodined", "sh", "-c", CLEAN, check=False)  # SIGTERM: the sink writes its last row
     time.sleep(1)
     with open(run / "stats.csv", "w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=["t", "container", "cpu", "mem_mib"])
@@ -265,4 +278,5 @@ def run(lab, params: dict, out: Path) -> dict:
     # leave the lab as it was: the default config, the full slow path
     lab.recreate("dnsentinel", {})
     lab.recreate("analyzer", {})
+    lab.recreate("unbound", {})
     return {"configs": {name: {"label": CONFIGS[name]["label"], "runs": runs} for name, runs in results.items()}}

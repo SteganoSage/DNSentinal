@@ -1,0 +1,14 @@
+# DNSentinel as a plain recursive resolver against the REAL internet root (real-internet E1/E2).
+# No lab, no ML, no blocklists: a clean resolver to compare with Unbound. Needs outbound DNS.
+listen:
+  udp: "0.0.0.0:53"
+  tcp: "0.0.0.0:53"
+access:
+  allow: ["172.16.0.0/12", "127.0.0.0/8"]   # the docker bridge + localhost
+  deny_action: refuse
+resolver:
+  root_hints: config/named.root             # the real IANA root servers
+  qname_minimisation: true
+  use_0x20: true
+cache:
+  max_memory_mb: 256

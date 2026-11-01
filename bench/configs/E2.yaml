@@ -1,0 +1,11 @@
+experiment: E2
+module: e2
+title: Latency and throughput, DNSentinel vs Unbound (lab; W2; EVALUATION.md E2)
+params:
+  queries: 5000          # distinct-ish W2 names resolved per phase
+  reps: 3                # cold/warm repetitions (each restarts the resolver)
+  cold_rate: 100         # gentle, so cold latency measures resolution not queueing
+  warm_rate: 200
+  sweep: [1000, 2000, 5000, 10000, 20000, 30000, 40000, 50000]
+  sweep_seconds: 8
+  seed: 1

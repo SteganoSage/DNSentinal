@@ -1,0 +1,8 @@
+experiment: E10
+module: e10
+title: Abuse resistance — open-resolver refusal and NXNS amplification cap (lab; EVALUATION.md E10)
+params:
+  trials: 10
+  cap: 30                # resolver.max_upstream_queries (default)
+  fanout: 20             # nameservers each nxns.lab referral advertises (lab/servers/quirks.py)
+  seed: 1

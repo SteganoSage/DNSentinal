@@ -79,7 +79,7 @@ services:
     network_mode: none     # it only talks to the resolver's socket
   unbound:
     <<: *tools
-    command: unbound -d -c /dnsentinel/lab/config/unbound.conf
+    command: unbound -d -c ${UNBOUND_CONFIG:-/dnsentinel/lab/config/unbound.conf}   # P1's C0 switches it
     depends_on: [root, tld, auth, quirks]
     networks:
       lan: { ipv4_address: 10.53.1.3 }

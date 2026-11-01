@@ -147,7 +147,65 @@ def p1(run: Path) -> None:
     print(f"  {PLOTS.relative_to(REPO)}/P1_what_gets_through.png, P1_benign_latency_cdf.png")
 
 
-MAKERS = {"E1": e1, "P1": p1}
+def e2(run: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    s = json.loads((run / "summary.json").read_text())["resolvers"]
+    colour = {"dnsentinel": "#4c72b0", "unbound": "#c44e52"}
+    rows = []
+    for name, entry in s.items():
+        for phase in ("cold", "warm"):
+            p = entry[phase]
+            rows.append([name, phase, p["queries"], p["p50_ms"], p["p95_ms"], p["p99_ms"], p["mean_ms"]])
+        rows.append([name, "max q/s <1% loss", "", entry.get("max_qps_under_1pct_loss"), "", "", ""])
+    write_table("E2_latency_throughput", ["Resolver", "Phase", "Queries", "p50 ms / q/s", "p95 ms", "p99 ms",
+                                          "mean ms"], rows, "Table E2. Latency (cold/warm) and max throughput")
+
+    # F1: latency CDFs (cold and warm), DNSentinel vs Unbound
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for ax, phase in zip(axes, ("cold", "warm")):
+        for name, entry in s.items():
+            lat = []
+            for path in sorted(run.glob(f"{name}-{phase}-r*.csv")):
+                lat += [float(r["latency_ms"]) for r in csv.DictReader(open(path)) if r["rcode"] != "TIMEOUT"]
+            if lat:
+                lat.sort()
+                ax.plot(lat, [i / len(lat) for i in range(len(lat))], label=name, color=colour.get(name))
+        ax.set_xscale("log")
+        ax.set_xlabel("latency (ms, log)")
+        ax.set_ylabel("fraction of queries")
+        ax.set_title(f"{phase} cache")
+        ax.grid(alpha=0.3, which="both")
+        ax.legend()
+    fig.suptitle("F1: query latency CDF, DNSentinel vs Unbound (lab)")
+    fig.tight_layout()
+    fig.savefig(PLOTS / "F1_latency_cdf.png", dpi=150)
+    plt.close(fig)
+
+    # F2: throughput — offered rate vs achieved qps, with the 1% loss point
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    for name, entry in s.items():
+        rates = [r["rate"] for r in entry["sweep"]]
+        qps = [r["qps"] for r in entry["sweep"]]
+        ax.plot(rates, qps, "o-", label=name, color=colour.get(name))
+        if entry.get("max_qps_under_1pct_loss"):
+            ax.axhline(entry["max_qps_under_1pct_loss"], color=colour.get(name), ls=":", lw=1)
+    ax.plot([0, max(max(r["rate"] for r in e["sweep"]) for e in s.values())],
+            [0, max(max(r["rate"] for r in e["sweep"]) for e in s.values())], "k--", lw=0.7, label="offered = achieved")
+    ax.set_xlabel("offered rate (queries/s)")
+    ax.set_ylabel("achieved queries/s")
+    ax.set_title("F2: throughput vs offered load (warm cache)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(PLOTS / "F2_throughput.png", dpi=150)
+    plt.close(fig)
+    print(f"  {PLOTS.relative_to(REPO)}/F1_latency_cdf.png, F2_throughput.png")
+
+
+MAKERS = {"E1": e1, "E2": e2, "P1": p1}
 
 
 def main() -> int:

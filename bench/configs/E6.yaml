@@ -1,0 +1,6 @@
+experiment: E6
+module: e6
+title: Privacy — what each observer sees (lab; DoT/DoH on the client link, QNAME minimisation upstream)
+params:
+  window: 12             # seconds of packet capture per observer
+  seed: 1

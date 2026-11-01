@@ -1,0 +1,27 @@
+# Real-internet E1/E2: DNSentinel vs Unbound resolving from the real root. A normal (NOT internal)
+# network, so the containers reach the internet when the host does.  lab/realnet.sh up|e1|e2|down
+name: dnsentinel-realnet
+networks:
+  net: {}
+services:
+  dnsentinel:
+    image: dnsentinel-lab/dnsentinel
+    command: ["-c", "/dnsentinel/config/dnsentinel-realnet.yaml"]
+    volumes: [ "..:/dnsentinel:ro", "./results:/results" ]
+    working_dir: /dnsentinel
+    networks: [net]
+    init: true
+  unbound:
+    image: dnsentinel-lab/tools
+    command: unbound -d -c /dnsentinel/lab/config/unbound-realnet.conf
+    volumes: [ "..:/dnsentinel:ro" ]
+    working_dir: /dnsentinel
+    networks: [net]
+    init: true
+  client:
+    image: dnsentinel-lab/tools
+    command: sleep infinity
+    volumes: [ "..:/dnsentinel:ro", "./results:/results", "../bench/results:/bench-results" ]
+    working_dir: /dnsentinel
+    networks: [net]
+    init: true
