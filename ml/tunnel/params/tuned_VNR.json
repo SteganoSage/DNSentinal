@@ -1,0 +1,46 @@
+{
+ "rf": {
+  "n_estimators": 250,
+  "max_depth": 23,
+  "min_samples_leaf": 3,
+  "max_features": "sqrt",
+  "max_samples": 0.785965,
+  "class_weight": null,
+  "benign_balance": 0.0
+ },
+ "lgbm": {
+  "n_estimators": 400,
+  "learning_rate": 0.034721,
+  "num_leaves": 105,
+  "min_child_samples": 19,
+  "subsample": 0.774228,
+  "colsample_bytree": 0.380653,
+  "reg_lambda": 0.004066,
+  "benign_balance": 1.0
+ },
+ "xgboost": {
+  "n_estimators": 400,
+  "learning_rate": 0.070751,
+  "max_leaves": 78,
+  "min_child_weight": 0.389067,
+  "subsample": 0.603717,
+  "colsample_bytree": 0.31663,
+  "reg_lambda": 0.190673,
+  "benign_balance": 1.0
+ },
+ "source": {
+  "how": "python -m ml.tunnel.pipeline --mode tune --models rf,lgbm,xgboost --trials 40 --timeout-hours 9 --features V,N,R V,N,R,D (Kaggle, 4 CPUs, 2026-10-31)",
+  "use_with": "--features V,N,R",
+  "objective": "left-out known tool recall at 0.01% FPR on each benign set, mean of full and 1/10 rate",
+  "tuned": {
+   "rf": 0.99924,
+   "lgbm": 0.99948,
+   "xgboost": 0.99956
+  },
+  "defaults": {
+   "rf": 0.94684,
+   "lgbm": 0.76102,
+   "xgboost": 0.79828
+  }
+ }
+}

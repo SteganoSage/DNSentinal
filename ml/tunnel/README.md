@@ -195,6 +195,22 @@ python -m ml.tunnel.pipeline --mode all --params <out>/main/w60-f<groups>/tune/b
 
 The settings chosen go to `ml/tunnel/params/`, as the DGA model's do, for the notebook's `PARAMS`.
 
+**First tuning run** (2026-10-31, Kaggle, 4 CPUs, 9 h: up to 40 trials per model and feature set):
+
+| Objective (left-out known tool, 0.01% FPR per benign set) | RF | LightGBM | XGBoost |
+|---|---|---|---|
+| `V,N,R`, defaults -> tuned | 0.947 -> 0.9992 | 0.761 -> 0.9995 | 0.798 -> 0.9996 |
+| `V,N,R,D`, defaults -> tuned | 0.999 -> 0.9995 | 0.746 -> 0.9989 | 0.800 -> 0.9992 |
+
+What tuning fixed is the boosting libraries' blind spot: with the defaults they flagged 0.2-4% of
+DNS-shell's windows; every tuned one chose `colsample_bytree` 0.32-0.40, each tree seeing about a
+third of the features, so none leans on the unique-subdomain ratio alone (DNS-shell asks every name
+twice). They also chose `benign_balance` 1 (the forest 0 or 0.75). Tuned, every model is at
+0.999-0.9996: the question tuned on can no longer tell them apart, so the full runs decide, on
+what tuning never saw: tools never trained on (`unknown`), then false alerts on real browsing.
+`params/tuned_VNR.json` and `params/tuned_VNRD.json` hold each feature set's settings (use each with
+its `--features`).
+
 Each trial asks `tool` mode's question of the training data only (`tune.py`): it trains once
 per known tool without it, sets the threshold on a held-out part of the benign training
 captures (0.01% of each set's windows), and scores the left-out tool at full speed and at 1/10.
