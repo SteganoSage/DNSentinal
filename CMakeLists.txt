@@ -229,6 +229,14 @@ if(DNSENTINEL_ENABLE_TESTS)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/offline_e2e.py
                          $<TARGET_FILE:dnsentinel>)
         set_tests_properties(offline_e2e PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        # The whole loop: a tunnel through the daemon, judged by analyzer/live.py from the
+        # event stream, blocked by the rule it asks for. The hand-written rules judge here (no
+        # ML libraries needed); with the shipped model, run it with the venv (TEST_COMMANDS).
+        add_test(NAME tunnel_e2e
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/tunnel_e2e.py
+                         $<TARGET_FILE:dnsentinel> --rules-only
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tunnel_e2e PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         # The ML pipelines' and the analyzer's Python tests; the ones that need
         # scikit-learn or LightGBM skip themselves where those aren't installed.
         add_test(NAME ml_python
