@@ -74,6 +74,8 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_EQ(c->dga.mode, ml::DgaMode::Monitor);
     EXPECT_EQ(c->dga.model, "models/dga");
     EXPECT_EQ(c->dga.allowlist, "config/lists/feeds/tranco_top100k.txt");
+    EXPECT_EQ(c->dga.provider_suffixes,
+              (std::vector<std::string>{"cloudfront.net", "cloudapp.net", "global.ssl.fastly.net"}));
     EXPECT_TRUE(c->resolver.use_0x20);
     EXPECT_FALSE(lists(*c, "resolver.use_0x20"));  // implemented (plan §5.2)
     EXPECT_FALSE(lists(*c, "access"));             // implemented (plan §5.5)
@@ -206,6 +208,7 @@ TEST(Config, ParsesTheDgaClassifier) {
     auto c = parse_config("");
     ASSERT_TRUE(c.has_value()) << c.error();
     EXPECT_FALSE(c->dga.enabled);  // off unless asked for: it needs the model files
+    EXPECT_EQ(c->dga.provider_suffixes.size(), 3u);  // the CDNs measured on real browsing, by default
     c = parse_config(
         "ml:\n"
         "  dga:\n"
@@ -215,6 +218,7 @@ TEST(Config, ParsesTheDgaClassifier) {
         "    words: w.txt\n"
         "    allowlist: top.csv\n"
         "    threshold: 0.99\n"
+        "    provider_suffixes: [CDN.Example., edge.example.net]\n"
         "    cache_size: 10\n");
     ASSERT_TRUE(c.has_value()) << c.error();
     EXPECT_TRUE(c->dga.enabled);
@@ -224,7 +228,15 @@ TEST(Config, ParsesTheDgaClassifier) {
     EXPECT_EQ(c->dga.allowlist, "top.csv");
     EXPECT_DOUBLE_EQ(c->dga.threshold, 0.99);
     EXPECT_EQ(c->dga.cache_size, 10u);
+    EXPECT_EQ(c->dga.provider_suffixes, (std::vector<std::string>{"cdn.example", "edge.example.net"}));
     EXPECT_FALSE(lists(*c, "ml"));
+    for (const char* bad : {"ml:\n  dga: { provider_suffixes: cloudfront.net }\n",
+                            "ml:\n  dga: { provider_suffixes: [\"*.cloudfront.net\"] }\n",
+                            "ml:\n  dga: { provider_suffixes: [\"\"] }\n"}) {
+        auto refused = parse_config(bad);
+        ASSERT_FALSE(refused.has_value()) << bad;
+        EXPECT_NE(refused.error().find("ml.dga.provider_suffixes"), std::string::npos) << refused.error();
+    }
 }
 
 TEST(Config, AccessDefaultsToLocalhostOnly) {

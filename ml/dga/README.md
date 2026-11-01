@@ -170,15 +170,37 @@ ml:
     model: models/dga
     words: config/english_words.txt
     allowlist: config/lists/feeds/tranco_top100k.txt  # from config/lists/download_feeds.sh
+    provider_suffixes: [cloudfront.net, cloudapp.net, global.ssl.fastly.net]  # labels a CDN assigns: never scored
     threshold: 0           # 0: the model's own (0.9558)
     cache_size: 100000     # verdicts, one per registrable domain
 ```
 
-It runs after the block and allow lists, on names neither mentions; it skips special-use names
-(`.arpa`, `.local`, `.test`, ...), single labels and the Tranco top 100k (the popular sites the
-training kept apart), and scores each registrable domain once. A flagged domain is logged the
+It runs after the block and allow lists, on names neither mentions, and scores each registrable
+domain once. It skips:
+- special-use names (`.arpa`, `.local`, `.test`, ...);
+- single labels;
+- the Tranco top 100k (the popular sites the training kept apart);
+- names under `provider_suffixes`. A flagged domain is logged the
 first time it is seen; in enforce mode its names get the blocked answer (`policy.block_response`)
 without going upstream. The daemon sums up at exit: names checked, scored, cached, flagged.
+
+**On real traffic.** The training benign names are Tranco domains. The first look at real
+browsing came from the tunnel dataset: 39.7 h of Stratosphere browsing, and a client resolving
+Cloudflare's top 1M (2026-11-01).
+
+- **The split.** It uses the Public Suffix List's private section too, so a name under a
+  dynamic-DNS provider (`x7k2.ddns.net`) is its own registrable domain and gets scored. The same
+  rule makes every CloudFront distribution its own domain, and those labels are assigned at
+  random: `d1bxh8uas1mnw7.cloudfront.net`. Of the 3,204 browsing domains scored, 534 (16.7%) were
+  flagged, and 533 of those were under `cloudfront.net` (529), `cloudapp.net` and
+  `global.ssl.fastly.net`.
+- **The fix.** `provider_suffixes` lists those three, and names under them aren't scored. That
+  leaves **1 of 2,671** flagged (0.04%): `wedfrwd.co`. Dynamic-DNS names stay scored: the
+  registrant chooses their label, and `ddns.net` or `duckdns.org` are as popular as the CDNs,
+  so popularity can't tell the two apart.
+- **The long tail.** Among the crawl's 855k domains beyond the top 100k, 1.1% are flagged.
+  Many of them look like junk registrations (`qljxpf.fun`, `tuovkbjl.cfd`). It is the 0.1% of
+  training's Tranco calibration, worse in the long tail.
 
 Cost (experiment E9, `bench/README.md`): scoring a first-seen name takes 40.8 µs median in the
 resolver (target: 50 µs), a name seen before 0.34 µs; with the verdict cache the daemon answers

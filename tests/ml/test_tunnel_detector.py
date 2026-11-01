@@ -197,5 +197,23 @@ class NxdomainBursts(unittest.TestCase):
         self.assertFalse(bursts[-1].alert)
 
 
+class QuietClients(unittest.TestCase):
+    def test_a_burst_is_reported_after_the_client_goes_quiet_then_the_client_is_forgotten(self):
+        from analyzer.detectors.tunnel import DnsEvent, NxdomainBurstDetector
+
+        detector = NxdomainBurstDetector(60, 10, min_count=10, min_ratio=0.5)
+        for i in range(20):
+            self.assertEqual(detector.add(DnsEvent(1000.0 + i, "10.0.0.9", f"x{i}.example.com", rcode="NXDOMAIN")), [])
+        self.assertTrue(detector.active("10.0.0.9", 1020.0))
+        self.assertFalse(detector.active("10.0.0.9", 1005.0))  # only 6 failures so far
+        self.assertFalse(detector.active("10.0.0.2", 1020.0))  # never seen
+        bursts = detector.flush(1200.0)
+        self.assertTrue(bursts[0].alert)
+        self.assertEqual((bursts[0].window_end, bursts[0].nxdomain_count), (1060.0, 20))
+        self.assertEqual(bursts[-1].window_end, 1070.0)  # the last window still holding a query
+        self.assertEqual(detector.flush(1300.0), [])
+        self.assertNotIn("10.0.0.9", detector._next_emit)  # forgotten
+
+
 if __name__ == "__main__":
     unittest.main()

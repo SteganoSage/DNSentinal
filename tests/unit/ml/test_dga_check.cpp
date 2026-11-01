@@ -82,6 +82,28 @@ TEST_F(DgaCheckTest, SkipsWhatNoDgaRegisters) {
     EXPECT_EQ(check.stats().scored, 0u);
 }
 
+TEST_F(DgaCheckTest, NamesAProviderAssignsAreNeverScored) {
+    auto check = make();  // the default provider_suffixes
+    for (const char* assigned : {"d1bxh8uas1mnw7.cloudfront.net", "media.d34jkiyv49ze1u.cloudfront.net",
+                                 "apimgmthsyunynflqnvcmjmezyu8ogcd1g43fad9cmo5gtar6z.cloudapp.net",
+                                 "7q1z79gxsi.global.ssl.fastly.net"}) {
+        EXPECT_FALSE(check.check(name(assigned))) << assigned;
+    }
+    EXPECT_EQ(check.stats().skipped, 4u);
+    EXPECT_EQ(check.stats().scored, 0u);
+    // a generated name under dynamic DNS is the registrant's choice: scored as before
+    auto dynamic = check.check(name("www.mdexmtiwmjia.ddns.net"));
+    ASSERT_TRUE(dynamic);
+    EXPECT_EQ(dynamic->verdict.registrable, "mdexmtiwmjia.ddns.net");
+
+    DgaConfig none;
+    none.provider_suffixes.clear();
+    auto every = make({}, none);
+    auto cdn   = every.check(name("d1bxh8uas1mnw7.cloudfront.net"));
+    ASSERT_TRUE(cdn);  // what happened before the list: CloudFront flagged as generated
+    EXPECT_TRUE(cdn->verdict.dga);
+}
+
 TEST_F(DgaCheckTest, PopularSitesAreNeverScored) {
     auto check = make({"mdexmtiwmjia.info"});  // pretend it is popular
     EXPECT_FALSE(check.check(name("mail.mdexmtiwmjia.info")));

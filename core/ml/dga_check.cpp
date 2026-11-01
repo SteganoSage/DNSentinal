@@ -54,6 +54,7 @@ std::expected<StringSet, std::string> DgaCheck::read_allowlist(const std::string
 DgaCheck::DgaCheck(DgaClassifier model, StringSet allowlist, const DgaConfig& config)
     : model_(std::move(model)),
       allowlist_(std::move(allowlist)),
+      providers_(config.provider_suffixes.begin(), config.provider_suffixes.end()),
       mode_(config.mode),
       verdicts_(config.cache_size),
       names_(config.cache_size) {
@@ -100,6 +101,11 @@ std::optional<DgaResult> DgaCheck::check(const Name& qname) {
 
     const auto name = model_.split(text);
     if (!name) {
+        ++stats_.skipped;
+        names_.insert(std::move(text), Outcome{Outcome::Kind::Skipped, {}});
+        return std::nullopt;
+    }
+    if (providers_.contains(name->suffix)) {  // d1bxh8uas1mnw7.cloudfront.net: the provider's name, random by design
         ++stats_.skipped;
         names_.insert(std::move(text), Outcome{Outcome::Kind::Skipped, {}});
         return std::nullopt;

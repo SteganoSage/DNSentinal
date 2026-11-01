@@ -381,6 +381,10 @@ class SlidingWindowDetector:
         self._pending[key] = None
         return emitted
 
+    def keys(self):
+        """The (client, domain) pairs a later window may still be about."""
+        return self._keys.keys()
+
     def flush(self, now: float | None = None) -> list[TunnelWindow]:
         """Judge the pending keys if `now` (default: the end of input) is past their window's end."""
         if self._end is None or (now is not None and now <= self._end):
@@ -481,4 +485,42 @@ class NxdomainBurstDetector:
             ))
             next_emit += self.step_seconds
         self._next_emit[event.client_id] = next_emit
+        return emitted
+
+    def active(self, client: str, end: float) -> bool:
+        """Was `client` in a burst over the window ending at `end`? (Only windows the queue still holds.)"""
+        queue = self._events.get(client)
+        if not queue:
+            return False
+        inside = [e for e in queue if end - self.window_seconds <= e.timestamp <= end]
+        nxdomain_count = sum(_is_nxdomain(e.rcode) for e in inside)
+        return nxdomain_count >= self.min_count and nxdomain_count / len(inside) >= self.min_ratio
+
+    def flush(self, now: float) -> list[NxdomainBurst]:
+        """The windows that ended while a client sent nothing more (call every second or so).
+
+        Malware that finds its server goes quiet: without this, its burst would be
+        reported only at its next query. A client whose last query has left the
+        window is forgotten.
+        """
+        emitted: list[NxdomainBurst] = []
+        for client in list(self._next_emit):
+            queue, next_emit = self._events[client], self._next_emit[client]
+            while next_emit <= now:
+                inside = [e for e in queue if next_emit - self.window_seconds <= e.timestamp <= next_emit]
+                if not inside:
+                    break
+                nxdomain_count = sum(_is_nxdomain(e.rcode) for e in inside)
+                ratio = nxdomain_count / len(inside)
+                emitted.append(NxdomainBurst(
+                    client_id=client, window_end=next_emit, query_count=len(inside), nxdomain_count=nxdomain_count,
+                    nxdomain_ratio=ratio, nxdomain_rate_per_second=nxdomain_count / self.window_seconds,
+                    alert=nxdomain_count >= self.min_count and ratio >= self.min_ratio,
+                ))
+                next_emit += self.step_seconds
+            self._next_emit[client] = next_emit
+            while queue and queue[0].timestamp < next_emit - self.window_seconds:
+                queue.popleft()
+            if not queue:
+                del self._events[client], self._next_emit[client]
         return emitted

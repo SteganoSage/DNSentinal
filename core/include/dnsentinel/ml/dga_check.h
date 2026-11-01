@@ -4,7 +4,8 @@
 /// are worth scoring, the verdict cache, and what it all counted.
 ///
 /// Not scored: special-use names (.arpa, .local, .test, ... nothing a DGA
-/// registers), single labels (search-list noise), names no host has, and
+/// registers), single labels (search-list noise), names no host has, names
+/// a hosting provider assigns (provider_suffixes: random by design), and
 /// popular sites (the allowlist). Verdicts are kept per registrable domain,
 /// so mail.x7kq2.biz and www.x7kq2.biz cost one scoring; and each query
 /// name's outcome (verdict, popular or not scored) is kept too, so asking
@@ -30,7 +31,7 @@ namespace dnsentinel::ml {
 
 struct DgaStats {
     uint64_t queries     = 0;  // query names looked at
-    uint64_t skipped     = 0;  // special-use, single-label or not a host name
+    uint64_t skipped     = 0;  // special-use, single-label, not a host name, or provider-assigned
     uint64_t allowlisted = 0;  // a popular site
     uint64_t scored      = 0;  // new registrable domains the model scored
     uint64_t cache_hits  = 0;  // verdicts reused
@@ -126,6 +127,7 @@ private:
 
     DgaClassifier    model_;
     StringSet        allowlist_;
+    StringSet        providers_;  // public suffixes whose next label a provider assigns
     DgaMode          mode_;
     DgaStats         stats_;
     Lru<DgaVerdict>  verdicts_;  // by registrable domain

@@ -709,6 +709,8 @@ Start with a simple, explainable rule-based fusion (weighted sum with thresholds
 
 Operating mode is configurable: **monitor-only** (alert, never block) vs **enforce**. Thresholds are chosen from the ROC curve for a target false-positive rate, not accuracy.
 
+*As built* (`analyzer/fusion.py`, `analyzer/README.md`): each signal keeps its own threshold, set for a false-positive rate, and no averaging. Two cases are high: the tunnel model's alert, and a DGA-flagged domain that resolved while its client was in an NXDOMAIN burst (DGA malware finding its command server). NXDOMAIN bursts alone are reported, never blocked; every DGA-flagged name is reported by the resolver itself. The measurements, and the rules left out, are in `ml/tunnel/README.md`, "Score fusion".
+
 #### 7.8.6 Evaluation methodology (how we avoid fooling ourselves)
 
 - **No random split alone.** We also split **by DGA family** (leave-family-out): train on some families, test on unseen ones. That is the real-world question.

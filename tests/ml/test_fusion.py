@@ -1,25 +1,41 @@
+"""Score fusion (analyzer/fusion.py): the decision table, row by row."""
+
 import unittest
 
-from analyzer.fusion import combine_scores, nxdomain_signal_score
+from analyzer.fusion import FusionPolicy, Signals, fuse
+
+POLICY = FusionPolicy(dga_threshold=0.95)
 
 
-class FusionTests(unittest.TestCase):
-    def test_nxdomain_score_requires_both_volume_and_ratio(self):
-        self.assertEqual(nxdomain_signal_score(2, 1.0, 60, 10), 0.2)
-        self.assertEqual(nxdomain_signal_score(10, 0.5, 60, 10), 0.5)
+def risk(**signals):
+    result = fuse(Signals(**signals), POLICY)
+    return result.level, result.kind
 
-    def test_combined_score_is_weighted_and_explainable(self):
-        verdict = combine_scores(1.0, 0.75, 0.5)
-        self.assertAlmostEqual(verdict.score, 0.8)
-        self.assertEqual(verdict.label, "medium")
-        self.assertEqual(
-            verdict.reasons,
-            ("DGA-like domain activity", "tunnel-like query behavior"),
-        )
 
-    def test_invalid_signal_is_rejected(self):
-        with self.assertRaises(ValueError):
-            combine_scores(1.1, 0.0, 0.0)
+class Fusion(unittest.TestCase):
+    def test_a_tunnel_alert_is_high_on_its_own(self):
+        self.assertEqual(risk(tunnel_alert=True), ("high", "tunnel"))  # not diluted by the signals that are quiet
+        self.assertEqual(risk(tunnel_score=0.99), ("low", ""))  # one high window: the alert rule decides, not fusion
+
+    def test_a_flagged_domain_that_resolves_in_a_burst_is_the_command_server(self):
+        self.assertEqual(risk(dga=0.97, resolved=True, burst=True), ("high", "dga_c2"))
+        self.assertEqual(risk(dga=0.97, resolved=True), ("low", ""))  # the resolver reports every flagged name itself
+        self.assertEqual(risk(dga=0.97, burst=True), ("low", ""))  # failed: one of the many tries, the burst alert's
+        self.assertEqual(risk(dga=0.9, resolved=True, burst=True), ("low", ""))  # below the classifier's threshold
+        self.assertEqual(risk(resolved=True, burst=True), ("low", ""))  # never scored: a popular site
+        self.assertEqual(risk(burst=True), ("low", ""))  # client-wide: reported as a burst, not per domain
+
+    def test_the_verdict_explains_itself(self):
+        c2 = fuse(Signals(dga=0.99, resolved=True, burst=True), POLICY)
+        self.assertEqual(c2.reasons[0], "a generated-looking domain (DGA score 0.990) that resolved")
+        self.assertIn("likely the live command server", c2.reasons[1])
+        self.assertEqual(c2.as_dict()["signals"], {"tunnel_alert": False, "tunnel_score": None, "dga": 0.99,
+                                                   "burst": True, "resolved": True})
+
+    def test_a_bad_threshold_is_refused(self):
+        for bad in (0.0, 1.0, 1.5):
+            with self.assertRaises(ValueError):
+                FusionPolicy(dga_threshold=bad)
 
 
 if __name__ == "__main__":

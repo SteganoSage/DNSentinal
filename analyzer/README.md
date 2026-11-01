@@ -13,7 +13,7 @@ The resolver publishes every answered query on a Unix socket (`telemetry.events`
 ```bash
 build/dnsentinel -c config/dnsentinel.yaml                                  # the resolver
 python -m analyzer.live                                                     # monitor: alerts only
-python -m analyzer.live --model ml/runs/tunnel/main/w60-fVNRD/final --enforce   # alerts become block rules
+python -m analyzer.live --model models/tunnel --enforce                      # high risk becomes block rules
 ```
 
 Each event is one JSON line, in the form the tunnel model was trained on (names in the
@@ -29,7 +29,27 @@ behind a block. Events wait in a buffer per reader: a reader that falls 4 MB beh
 (and is then sent `{"type":"dropped","count":N}`) rather than slowing an answer. Nothing is
 built when nobody is reading.
 
-In enforce mode a tunnel alert (the model's consecutive `high` windows) becomes a **dynamic
+**Score fusion** (`analyzer/fusion.py`, README §7.8.5) turns the signals into one risk per client and
+registrable domain. Each signal already has its own threshold, set for a false-positive rate, so
+they are not averaged: an average would dilute one certain signal. Two cases are **high**:
+
+- **A tunnel:** the model's consecutive `high` windows (`"alert": "tunnel"`).
+- **DGA malware's command server:** a domain the resolver's DGA classifier flagged, which
+  *resolved*, while its client was in an NXDOMAIN burst over the same 60 s
+  (`"alert": "dga_c2"`). Of the many generated names malware tries, most fail; the one that
+  answers is the live server.
+
+  This works with `ml.dga.mode: monitor` too: the resolver lets flagged names through,
+  and fusion blocks just the server, for just that client. It needs the resolver built with ML,
+  since the `dga` score comes from the events.
+
+Each alert carries the risk and the signals behind it: `"risk": {"level": "high", "kind": "dga_c2",
+"reasons": [...], "signals": {"tunnel_alert": false, "dga": 0.997, "burst": true, "resolved": true}}`.
+NXDOMAIN bursts alone are reported client-wide (`"alert": "nxdomain_burst"`, never blocked).
+Every DGA-flagged name is already reported by the resolver (its log, and the event's `dga`).
+Rules that were measured and left out are listed in `ml/tunnel/README.md`, "Score fusion".
+
+In enforce mode a high risk becomes a **dynamic
 rule** (README §7.6.6): that domain and everything below it, for that client only, answered
 NXDOMAIN for `--rule-ttl` seconds (1 h), renewed while the alerts go on and left to expire when
 they stop. The rules live in the resolver's own table, checked before the block lists; an

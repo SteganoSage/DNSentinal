@@ -17,6 +17,10 @@ The checks:
 - the other client is never alerted on, and still resolves tunnel.lab names;
 - /metrics and the query log record the blocking.
 
+With a binary built with ML, the daemon also runs the DGA classifier in monitor mode. A third
+client (127.0.0.12) then behaves like DGA malware: 20 generated .info names that don't exist,
+then one that does. Score fusion blocks that one, its command server, for that client only.
+
 The shipped model needs the libraries of ml/requirements.txt (LightGBM); --rules-only
 needs none: the hand-written rules judge alone, as without a model. Exit status:
 0 if every check passed, 1 if one failed, 77 if it can't run here.
@@ -41,7 +45,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import offline_e2e as lab  # noqa: E402  the fake servers, the daemon runner, the checks
 
-TUNNEL_CLIENT, OTHER_CLIENT = "127.0.0.10", "127.0.0.11"
+TUNNEL_CLIENT, OTHER_CLIENT, DGA_CLIENT = "127.0.0.10", "127.0.0.11", "127.0.0.12"
+COMMAND_SERVER = "mdexmtiwmjia.info"  # offline_e2e's .info zone has it: a sisron DGA name, scored 0.997
 TUNNEL_DOMAIN = "tunnel.lab"
 METRICS = 9153
 NXDOMAIN = 3
@@ -153,7 +158,14 @@ def main():
         logs = os.path.join(tmp, "querylog")
         telemetry = (f"  events:\n    socket: {sock}\n  prometheus:\n    addr: \"127.0.0.1:{METRICS}\"\n"
                      f"  query_log:\n    enabled: true\n    path: {logs}/queries.jsonl\n")
-        daemon = lab.Daemon(binary, lab.write_config(tmp, telemetry=telemetry))
+        dga = (f"  dga:\n    enabled: true\n    mode: monitor\n    model: {ROOT}/models/dga\n"
+               f"    words: {ROOT}/config/english_words.txt\n")
+        config = lab.write_config(tmp, telemetry=telemetry, ml=dga)
+        with_dga = lab.built_with_ml(binary, config)
+        if not with_dga:
+            print("  skip  the DGA command-server case: the binary was built without DNSENTINEL_ENABLE_ML")
+            config = lab.write_config(tmp, telemetry=telemetry)
+        daemon = lab.Daemon(binary, config)
         analyzer = None
         try:
             check(daemon.wait_for("listening on udp", timeout=15) and daemon.wait_for("primed the root name servers"),
@@ -207,9 +219,38 @@ def main():
             check(not any(a.get("client") == OTHER_CLIENT for _, a in analyzer.alerts),
                   "the other client is never alerted on")
 
+            if with_dga:
+                dga_rng = random.Random(7)
+                tries = ["".join(dga_rng.choice("bcdfghjklmnpqrstvwxz") for _ in range(12)) + ".info" for _ in range(20)]
+                failed = [ask_from(DGA_CLIENT, name) for name in tries]
+                check(all(r is not None and r.rcode == NXDOMAIN for r in failed),
+                      "a DGA client's 20 generated names don't exist (NXDOMAIN)")
+                found = ask_from(DGA_CLIENT, f"www.{COMMAND_SERVER}")
+                sent_at = time.monotonic()
+                check(found is not None and found.rcode == lab.NOERROR and found.answers,
+                      "...then one resolves: its command server (the resolver only monitors DGA names)")
+                c2 = None
+                while time.monotonic() - sent_at < 25 and c2 is None:
+                    c2 = next((a for _, a in analyzer.alerts if a.get("alert") == "dga_c2"), None)
+                    time.sleep(0.2)
+                check(c2 is not None and (c2["client"], c2["domain"], c2["action"]) == (DGA_CLIENT, COMMAND_SERVER, "block"),
+                      f"fusion blocks the command server for that client, {time.monotonic() - sent_at:.0f} s after it "
+                      "resolved (flagged, resolved, in an NXDOMAIN burst)" if c2 else "fusion blocks the command server")
+                check(daemon.wait_for(f"dynamic rule added, rule 2: {COMMAND_SERVER} and below for {DGA_CLIENT}/32 "
+                                      "(dga_c2, score 0.997"), "the daemon adds the rule for that client")
+                again = ask_from(DGA_CLIENT, f"www.{COMMAND_SERVER}")
+                check(again is not None and again.rcode == NXDOMAIN, "the command server no longer resolves for it")
+                others = ask_from(OTHER_CLIENT, f"www.{COMMAND_SERVER}")
+                check(others is not None and others.rcode == lab.NOERROR and others.answers,
+                      "...but still does for others (monitor mode)")
+                check([a["domain"] for _, a in analyzer.alerts if a.get("alert") == "dga_c2"] == [COMMAND_SERVER],
+                      "none of the names that failed is blocked")
+
+            rules = 2 if with_dga else 1
             text = scrape()
-            check(value(text, "dnsentinel_dynamic_rules") == 1 and value(text, "dnsentinel_dynamic_rules_added_total") == 1,
-                  "/metrics: one dynamic rule in force")
+            check(value(text, "dnsentinel_dynamic_rules") == rules
+                  and value(text, "dnsentinel_dynamic_rules_added_total") == rules,
+                  f"/metrics: {rules} dynamic rule{'s' if rules > 1 else ''} in force")
             check(value(text, 'dnsentinel_queries_total{transport="udp",qtype="TXT",rcode="NXDOMAIN",'
                               'action="dynamic_rule"}') >= 5, "/metrics: the queries it answered")
         finally:

@@ -3,12 +3,16 @@
 import io
 import json
 import os
+import random
 import socket
 import tempfile
 import threading
 import unittest
 
+from analyzer.fusion import FusionPolicy
 from analyzer.live import LiveAnalyzer, Stream, run
+
+FUSION = FusionPolicy(dga_threshold=0.95)
 
 
 def query(t, qname, client="192.168.1.23", qtype="TXT", rcode="NOERROR", size=250, action="answer"):
@@ -78,6 +82,80 @@ class Decisions(unittest.TestCase):
         self.assertEqual(len(bursts), 1)
         self.assertEqual(bursts[0]["client_id"], "192.168.1.23")
         self.assertEqual(commands, [])  # client-wide, not about one domain: no rule
+
+
+def dga_query(t, qname, score, rcode="NOERROR", answers=1, client="192.168.1.23"):
+    return {**query(t, qname, client, qtype="A", rcode=rcode, size=90), "answers": answers, "dga": score}
+
+
+def tries_then_server(start=1000.0, client="192.168.1.23"):
+    """DGA malware: 20 generated names that don't exist, then the one that answers. Then it goes quiet."""
+    rng = random.Random(5)
+    tries = [dga_query(start + i * 0.5, "".join(rng.choice("bcdfghjklmnpqrstvwxz") for _ in range(12)) + ".info",
+                       0.98, rcode="NXDOMAIN", answers=0, client=client) for i in range(20)]
+    return tries + [dga_query(start + 10.5, "www.kqzvbnrtyxwe.info", 0.99, client=client)]
+
+
+class FusedDecisions(unittest.TestCase):
+    feed_all = Decisions.feed_all
+
+    def test_the_command_server_found_in_a_burst_is_blocked_for_that_client(self):
+        analyzer = LiveAnalyzer(enforce=True, rule_ttl=600, clock=lambda: 0.0, fusion=FUSION)
+        alerts, commands = self.feed_all(analyzer, tries_then_server())
+        c2 = [a for a in alerts if a["alert"] == "dga_c2"]
+        self.assertEqual(len(c2), 1)
+        self.assertEqual((c2[0]["domain"], c2[0]["action"], c2[0]["score"]), ("kqzvbnrtyxwe.info", "block", 0.99))
+        self.assertTrue(c2[0]["risk"]["signals"]["burst"] and c2[0]["risk"]["signals"]["resolved"])
+        self.assertIn("likely the live command server", c2[0]["reasons"][-1])
+        self.assertEqual(commands, [{"op": "add_rule", "domain": "kqzvbnrtyxwe.info", "client": "192.168.1.23",
+                                     "ttl": 600, "reason": "dga_c2", "score": 0.99, "source": "analyzer.live"}])
+        # the client went quiet: its burst is still reported, once its window ends
+        later, _ = analyzer.tick(now=1100.0)
+        self.assertEqual([a["alert"] for a in later], ["nxdomain_burst"])
+        self.assertEqual((analyzer.counts["dga_c2_alerts"], analyzer.counts["burst_alerts"]), (1, 1))
+
+    def test_monitor_mode_reports_the_command_server(self):
+        analyzer = LiveAnalyzer(clock=lambda: 0.0, fusion=FUSION)
+        alerts, commands = self.feed_all(analyzer, tries_then_server())
+        self.assertEqual([a["action"] for a in alerts if a["alert"] == "dga_c2"], ["alert"])
+        self.assertEqual(commands, [])
+
+    def test_a_flagged_domain_that_resolves_without_a_burst_raises_nothing_here(self):
+        analyzer = LiveAnalyzer(enforce=True, clock=lambda: 0.0, fusion=FUSION)
+        records = [dga_query(1000.0 + 20 * i, "www.kqzvbnrtyxwe.info", 0.99) for i in range(5)]
+        self.assertEqual(self.feed_all(analyzer, records), ([], []))  # the resolver reports every flagged name itself
+
+    def test_a_random_looking_domain_doesnt_hurry_the_tunnel_alert(self):
+        def first_alert(score):
+            analyzer = LiveAnalyzer(clock=lambda: 0.0, fusion=FUSION)
+            records = [{**r, "dga": score} if score is not None else r for r in tunnel()]
+            alerts, _ = self.feed_all(analyzer, records)
+            return [a for a in alerts if a["alert"] == "tunnel"][0]["window_end"]
+
+        self.assertEqual(first_alert(0.99), first_alert(None))  # the alert rule's two windows, either way
+
+
+class PopularSites(unittest.TestCase):
+    feed_all = Decisions.feed_all
+
+    def test_popular_sites_and_cdn_names_are_never_alerted_on(self):
+        from analyzer.live import read_allowlist
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "top.csv")
+            with open(path, "w") as f:
+                f.write("# rank,domain\n1,google.com\n2,Tunnel.Example.\n")
+            allow = read_allowlist(__import__("pathlib").Path(path))
+        self.assertEqual(allow, {"google.com", "tunnel.example"})
+        analyzer = LiveAnalyzer(enforce=True, clock=lambda: 0.0, allowlist=allow)
+        self.assertEqual(self.feed_all(analyzer, tunnel()), ([], []))  # wildcard DNS under a popular site
+        self.assertGreater(analyzer.counts["popular_windows"], 0)
+        cdn = [{**r, "qname": r["qname"].replace("t.tunnel.example", "d1bxh8uas1mnw7.cloudfront.net")}
+               for r in tunnel()]
+        self.assertEqual(self.feed_all(LiveAnalyzer(enforce=True, clock=lambda: 0.0), cdn), ([], []))
+        dynamic = [{**r, "qname": r["qname"].replace("t.tunnel.example", "x7k2.ddns.net")} for r in tunnel()]
+        alerts, _ = self.feed_all(LiveAnalyzer(clock=lambda: 0.0, allowlist=frozenset({"ddns.net"})), dynamic)
+        self.assertEqual({a["domain"] for a in alerts if a["alert"] == "tunnel"}, {"x7k2.ddns.net"})  # still judged
 
 
 class AgainstAResolver(unittest.TestCase):

@@ -88,6 +88,7 @@ ml:
     model: models/dga      # the model ml/dga trained (ml/dga/README.md)
     words: config/english_words.txt
     allowlist: config/lists/feeds/tranco_top100k.txt  # popular sites, never scored (download_feeds.sh)
+    provider_suffixes: [cloudfront.net, cloudapp.net, global.ssl.fastly.net]  # labels a CDN assigns: random by design, never scored
     threshold: 0           # 0: the model's own, flagging 0.1% of benign names in training
     cache_size: 100000     # verdicts kept, one per registrable domain
 

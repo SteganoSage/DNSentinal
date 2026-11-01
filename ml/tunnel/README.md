@@ -272,6 +272,53 @@ The model can be in three forms:
 - **`tunnel_rf.pkl`:** the pickled random forest the final mode writes. It needs the scikit-learn it was made with, and runs code when it is loaded.
 - **`tunnel_rf.json`:** that forest exported by `ml.tunnel.export`. The trees are plain JSON, scored with no library, bit for bit as scikit-learn scores them. The export checks this on windows sitting on every split threshold and, with `--data`, on real windows. It must be run with the scikit-learn `model.json` records.
 
+## Score fusion
+
+`analyzer/fusion.py` combines, in the live analyzer, what the slow path knows about a client and
+a registrable domain. Each signal has its own threshold, set for a false-positive rate, so they
+are not averaged. Two cases are high: blocked for that client in enforce mode, alerted on either way.
+- **The tunnel model's alert.**
+- **A DGA-flagged domain that resolved while its client was in an NXDOMAIN burst over the same
+  60 s.** This is DGA malware finding its command server.
+
+Measured by replaying the dataset's benign captures through `analyzer.live` (2026-11-01). The
+replay used the shipped model, with DGA scores from `ml.dga.scorer`, as the resolver gives them:
+
+| | Browsing, 39.7 h | Crawl of Cloudflare's top 1M, 24.4 h | Wildcard DNS, 1.0 h |
+|---|---|---|---|
+| Command-server alerts (DGA-flagged, resolved, in a burst) | 0 | 0 | 0 |
+| Tunnel alert episodes, live, without the popular-site allowlist | | | 191 |
+| ...with it (`--allowlist`, the resolver's Tranco top 100k) | | | 10 (~240 a day) |
+
+The model was trained on the browsing and crawl captures, so their tunnel alerts measure nothing
+and are left out. Wildcard DNS it never saw.
+
+**The allowlist.** Without it, the live analyzer alerted on wildcard DNS under `google.com`,
+`facebook.com`, `netflix.net` and the like. In enforce mode it would have blocked them for
+that client. The evaluation's allowlisted figures assumed popular sites are never alerted on,
+and now they aren't.
+
+**The DGA fix.** Before the provider suffixes went into the resolver (`ml/dga/README.md`, "On real
+traffic"), browsing had 534 DGA-flagged domains, nearly all CloudFront distributions. With them,
+it has 1.
+
+The 10 wildcard episodes left are on more CDN-assigned names (Azure Front Door, `apps.fbsbx.com`,
+Fastly). Their suffixes were not added: wildcard is a held-out test set, and listing its own
+domains would only tune on it.
+
+**Measured and left out:**
+- **A tunnel alert after one high window, when the domain looks random (DGA score at least 0.5).**
+  It would catch nothing sooner: no tunnel domain in the dataset scores even 0.5
+  (`example.attack` 0.21, `ggy666.tk` 0.08). Attackers pick readable names, so the rule would
+  only add false alerts.
+- **An alert for every DGA-flagged domain that resolved.** It repeats what the resolver
+  reports itself for each flagged name. On the crawl that would be about 8,000 a day.
+
+End to end (`tests/integration/tunnel_e2e.py`, with the daemon's DGA classifier in monitor mode):
+a client tries 20 generated `.info` names that don't exist, then one that does. That one is
+blocked for that client 4-10 s after it resolved (at the next 10 s window end), still resolves for other clients, and none of
+the 20 gets a rule.
+
 ## Your own captures
 
 E8 also wants tunnels made in our lab (iodine and dnscat2 through DNSentinel, at set rates) and

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dnsentinel::ml {
 
@@ -23,6 +24,14 @@ struct DgaConfig {
     /// model's benign training names were kept apart from). "Rank,domain"
     /// or one domain per line. Empty: every name is scored.
     std::string allowlist;
+    /// Public suffixes whose next label the provider assigns, random by design
+    /// (CloudFront's d1bxh8uas1mnw7.cloudfront.net): names under them are never
+    /// scored. In the Public Suffix List's private section each such name is its
+    /// own registrable domain. The classifier keeps that section so that generated
+    /// names under dynamic DNS (x7k2.ddns.net), which whoever registers them
+    /// chooses, are still scored. On real browsing (the tunnel dataset's 39.7 h),
+    /// 533 of the 534 domains flagged were under these three.
+    std::vector<std::string> provider_suffixes = {"cloudfront.net", "cloudapp.net", "global.ssl.fastly.net"};
     double      threshold  = 0;       // flag scores above this; 0: the model's own (0.1% FPR in training)
     size_t      cache_size = 100000;  // verdicts kept, one per registrable domain; 0: no cache
 };

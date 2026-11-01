@@ -10,6 +10,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <cstring>
@@ -337,6 +338,20 @@ void read_ml(Section& top, Config& c) {
     dga.read_string("model", d.model);
     dga.read_string("words", d.words);
     dga.read_string("allowlist", d.allowlist);
+    if (auto node = dga.take("provider_suffixes")) {
+        if (!node->IsSequence()) fail(*node, "ml.dga.provider_suffixes must be a list, like [cloudfront.net]");
+        d.provider_suffixes.clear();
+        for (const auto& item : *node) {
+            std::string suffix = scalar_or_empty(item);
+            std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (suffix.ends_with('.')) suffix.pop_back();
+            if (suffix.empty() || suffix.starts_with('.') || suffix.find_first_of(" /\\*") != std::string::npos) {
+                fail(item, "ml.dga.provider_suffixes: not a domain suffix: '" + scalar_or_empty(item) + "'");
+            }
+            d.provider_suffixes.push_back(std::move(suffix));
+        }
+    }
     if (auto node = dga.take("threshold")) {
         const std::string text  = scalar_or_empty(*node);
         double            value = -1;
