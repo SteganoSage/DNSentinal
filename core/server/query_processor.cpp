@@ -1,6 +1,7 @@
 /// @file server/query_processor.cpp
-/// Query checks, the block lists and the DGA classifier, then resolution,
-/// then the checks on the answer: the CNAME chain and rebinding protection.
+/// Query checks, the dynamic rules, the block lists and the DGA classifier,
+/// then resolution, then the checks on the answer: the CNAME chain and
+/// rebinding protection. Each answer can be reported as an event.
 
 #include "dnsentinel/server/query_processor.h"
 
@@ -10,7 +11,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 
 namespace dnsentinel::server {
@@ -41,11 +45,18 @@ std::optional<RCode> reject_reason(const Message& query) {
     return std::nullopt;
 }
 
+/// What decided a query's answer, for its event: filled in as the checks run.
+struct Decision {
+    telemetry::Action     action = telemetry::Action::Answer;
+    std::string           rule;
+    std::optional<double> dga;
+};
+
 /// Turn `response`, fresh from make_response(query), into the answer for a
 /// blocked name (README §7.6.2): an address that goes nowhere, or NXDOMAIN,
 /// either way with a short TTL.
-Message blocked(Message response, const policy::ListsConfig& lists) {
-    if (lists.response == policy::BlockResponse::NxDomain) {
+Message blocked(Message response, policy::BlockResponse how, uint32_t ttl) {
+    if (how == policy::BlockResponse::NxDomain) {
         response.header.rcode = static_cast<uint8_t>(RCode::NXDomain);
         return response;
     }
@@ -53,7 +64,7 @@ Message blocked(Message response, const policy::ListsConfig& lists) {
     const Question& q = response.questions.front();
     RR              rr;
     rr.name  = q.qname;
-    rr.ttl   = lists.block_ttl;
+    rr.ttl   = ttl;
     rr.trust = TrustRank::Answer;
     if (q.qtype == static_cast<uint16_t>(RRType::A)) {
         rr.type  = RRType::A;
@@ -65,6 +76,21 @@ Message blocked(Message response, const policy::ListsConfig& lists) {
         response.answers.push_back(std::move(rr));
     }  // any other type: no records (NODATA)
     return response;
+}
+
+Message blocked(Message response, const policy::ListsConfig& lists) {
+    return blocked(std::move(response), lists.response, lists.block_ttl);
+}
+
+/// A dynamic rule, for the event: "tunnel-domain.example for 192.168.1.23/32 (tunnel, 0.97, rule 7)".
+std::string describe(const policy::DynamicRule& rule) {
+    std::string domain = rule.domain.to_string();
+    if (domain.size() > 1) domain.pop_back();
+    char score[32];
+    std::snprintf(score, sizeof score, "%.2f", rule.score);
+    return domain + " for " + (rule.client ? rule.client->to_string() : std::string("everyone")) + " (" +
+           (rule.reason.empty() ? "no reason given" : rule.reason) + ", " + score + ", rule " +
+           std::to_string(rule.id) + ")";
 }
 
 }  // namespace
@@ -92,10 +118,43 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
         };
     }
 
+    // The event for the slow path (README §6.2): built as the answer goes
+    // out, from what the checks below decide. Only if someone wants it.
+    std::shared_ptr<Decision> decision;
+    if (on_query_ && (!query_wanted_ || query_wanted_())) {
+        decision = std::make_shared<Decision>();
+        respond  = [this, decision, client, arrived = Clock::now(), wall = std::chrono::system_clock::now(),
+                   send = std::move(respond)](const Message& response) {
+            if (!response.questions.empty()) {
+                telemetry::QueryEvent event;
+                event.time          = wall;
+                event.client        = client.addr;
+                event.transport     = client.transport;
+                event.question      = response.questions.front();
+                event.rcode         = response.header.rcode;
+                event.answers       = static_cast<uint16_t>(response.answers.size());
+                event.response_size = wire::build(response).size();
+                event.latency_us    = static_cast<uint32_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - arrived).count());
+                event.action = decision->action;
+                event.rule   = decision->rule;
+                event.dga    = decision->dga;
+                on_query_(event);
+            }
+            send(response);
+        };
+    }
+    auto decide = [&decision](telemetry::Action action, std::string rule = {}) {
+        if (!decision) return;
+        decision->action = action;
+        decision->rule   = std::move(rule);
+    };
+
     // Access control first (plan §5.5): outsiders cost us nothing further,
     // and never cause an upstream query.
     if (!checks_.access.allows(client.addr)) {
         if (checks_.access.deny_action() == policy::DenyAction::Refuse) {
+            decide(telemetry::Action::Refused);
             respond(wire::make_response(query, RCode::Refused));
         }
         return;
@@ -103,11 +162,13 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
     // Then the client's own rate limit (plan §5.9).
     if (!checks_.rate_limit.allow(client.addr, Clock::now())) {
         if (checks_.rate_limit.config().action == policy::DenyAction::Refuse) {
+            decide(telemetry::Action::RateLimited);
             respond(wire::make_response(query, RCode::Refused));
         }
         return;
     }
     if (auto rcode = reject_reason(query)) {
+        decide(telemetry::Action::Rejected);
         respond(wire::make_response(query, *rcode));
         return;
     }
@@ -115,7 +176,17 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
     // without a single upstream query; an allowed one is never blocked.
     const Question& question = query.questions.front();
     auto            match    = lists_.lookup(question.qname);
+    // Before them, the slow path's dynamic rules (README §7.6.6); but an
+    // allowlisted name was vouched for by a person, and no verdict overrides that.
+    if (checks_.dynamic && !(match.matched && match.action == policy::ListAction::Allow)) {
+        if (const auto* rule = checks_.dynamic->match(question.qname, client.addr, Clock::now())) {
+            decide(telemetry::Action::Dynamic, describe(*rule));
+            respond(blocked(wire::make_response(query), checks_.dynamic->config().response, lists_.config().block_ttl));
+            return;
+        }
+    }
     if (match.matched && match.action == policy::ListAction::Block) {
+        decide(telemetry::Action::Block, match.rule + " (" + match.source + ")");
         report(question, {question.qname}, std::move(match));
         respond(blocked(wire::make_response(query), lists_.config()));
         return;
@@ -124,10 +195,13 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
     // The DGA classifier (plan §7.8.2), for names the lists say nothing
     // about: an allowlisted name was vouched for, a blocked one is answered.
     if (checks_.dga && !match.matched) {
-        if (auto result = checks_.dga->check(question.qname); result && result->verdict.dga) {
+        auto result = checks_.dga->check(question.qname);
+        if (result && decision) decision->dga = result->verdict.score;
+        if (result && result->verdict.dga) {
             const bool enforce = checks_.dga->mode() == ml::DgaMode::Enforce;
             if (on_dga_) on_dga_(DgaEvent{question, result->verdict, result->cached, enforce});
             if (enforce) {
+                decide(telemetry::Action::Dga, result->verdict.registrable);
                 respond(blocked(wire::make_response(query), lists_.config()));
                 return;
             }
@@ -138,7 +212,8 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
     // allowlisted name is exempt: whatever it aliases was vouched for too.
     const bool check_chain = lists_.config().check_cname_chain && !match.matched;
 
-    resolver_.resolve(question, [this, check_chain, response = wire::make_response(query), respond = std::move(respond)](
+    resolver_.resolve(question, [this, check_chain, decision, response = wire::make_response(query),
+                                 respond = std::move(respond)](
                                     std::expected<resolver::ResolveResult, resolver::ResolveError> result) mutable {
         if (!result) {
             response.header.rcode = static_cast<uint8_t>(RCode::ServFail);
@@ -148,6 +223,10 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
         const Question& asked = response.questions.front();
         if (check_chain) {
             if (auto cloaked = policy::find_cloaked(asked.qname, result->response.answers, lists_.trie())) {
+                if (decision) {
+                    decision->action = telemetry::Action::CnameBlock;
+                    decision->rule   = cloaked->match.rule + " (" + cloaked->match.source + ")";
+                }
                 report(asked, std::move(cloaked->chain), std::move(cloaked->match));
                 respond(blocked(std::move(response), lists_.config()));
                 return;
@@ -162,6 +241,7 @@ void QueryProcessor::handle(Message query, const net::ClientInfo& client, net::R
             });
             if (on_rebinding_) on_rebinding_(RebindingEvent{asked, std::move(removed), emptied});
             if (emptied) {  // the name pointed only inside the network
+                if (decision) decision->action = telemetry::Action::Rebinding;
                 response.header.rcode = static_cast<uint8_t>(RCode::NXDomain);
                 respond(response);
                 return;

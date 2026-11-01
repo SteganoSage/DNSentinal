@@ -374,7 +374,42 @@ void read_policy(Section& top, Config& c) {
 
     policy.read_bool("check_cname_chain", lists.check_cname_chain);
     read_rebinding(policy, c);
+
+    Section                     dynamic(policy.take("dynamic_rules"), "policy.dynamic_rules");
+    policy::DynamicRulesConfig& d = c.dynamic_rules;
+    dynamic.read_bool("enabled", d.enabled);
+    dynamic.read_uint("max_rules", d.max_rules, 1, 10'000'000);
+    dynamic.read_uint("max_ttl", d.max_ttl, 1, 30 * 86400);
+    if (auto response = dynamic.take("response")) {
+        const std::string r = scalar_or_empty(*response);
+        if (r == "null_ip") {
+            d.response = policy::BlockResponse::NullIp;
+        } else if (r == "nxdomain") {
+            d.response = policy::BlockResponse::NxDomain;
+        } else {
+            fail(*response, dynamic.name("response") + " must be 'null_ip' or 'nxdomain'");
+        }
+    }
+    dynamic.finish();
     policy.finish();
+}
+
+/// telemetry (README §7.10): so far the event stream to the slow path.
+void read_telemetry(Section& top, Config& c) {
+    Section                       telemetry(top.take("telemetry"), "telemetry");
+    Section                       events(telemetry.take("events"), "telemetry.events");
+    telemetry::EventStreamConfig& e = c.events;
+    events.read_string("socket", e.path);
+    size_t buffer_kb = e.buffer_bytes / 1024;
+    events.read_uint("buffer_kb", buffer_kb, 16, 1024 * 1024);
+    e.buffer_bytes = buffer_kb * 1024;
+    events.read_uint("max_readers", e.max_readers, 1, 64);
+    events.read_bool("commands", e.commands);
+    events.finish();
+    for (const char* key : {"prometheus", "query_log"}) {  // still to come
+        if (telemetry.take(key)) c.not_implemented.push_back(telemetry.name(key));
+    }
+    telemetry.finish();
 }
 
 Config parse(const YAML::Node& document) {
@@ -456,11 +491,7 @@ Config parse(const YAML::Node& document) {
     read_rate_limit(top, c);
     read_policy(top, c);
     read_ml(top, c);
-
-    // Sections for modules still to come (plan §7).
-    for (const char* key : {"telemetry"}) {
-        if (top.take(key)) c.not_implemented.push_back(key);
-    }
+    read_telemetry(top, c);
     top.finish();
     return c;
 }

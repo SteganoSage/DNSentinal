@@ -144,6 +144,20 @@ class Windows(unittest.TestCase):
         self.assertEqual(tunnel[-1]["verdict"]["label"], "high")
         self.assertTrue(tunnel[-1]["alert"])
 
+    def test_analyzer_reads_a_saved_event_stream(self):
+        lines = [json.dumps({"type": "query", "timestamp": 1000 + i, "client": "10.0.0.5", "transport": "udp",
+                             "qname": f"{'ab12cd34' * 4}{i}.t.example", "qtype": "TXT", "rcode": "NOERROR",
+                             "answers": 1, "response_size": 250, "latency_us": 900, "action": "answer"})
+                 for i in range(60)]
+        lines.insert(10, json.dumps({"type": "dropped", "count": 3}))
+        lines.insert(20, json.dumps({"type": "reply", "op": "ping", "ok": True}))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stream.jsonl"
+            path.write_text("\n".join(lines) + "\n")
+            tunnel = [r for r in analyze(path) if r["signal"] == "tunnel"]
+        self.assertEqual(tunnel[-1]["client_id"], "10.0.0.5")
+        self.assertTrue(tunnel[-1]["alert"])
+
     def test_an_alert_needs_consecutive_high_windows(self):
         from analyzer.detectors.tunnel import TunnelVerdict, TunnelWindow
         from analyzer.tunnel_analyzer import AlertRule

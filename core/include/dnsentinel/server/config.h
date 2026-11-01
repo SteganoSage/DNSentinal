@@ -10,10 +10,12 @@
 #include "dnsentinel/net/udp_listener.h"
 #include "dnsentinel/policy/acl.h"
 #include "dnsentinel/policy/blocklists.h"
+#include "dnsentinel/policy/dynamic_rules.h"
 #include "dnsentinel/policy/rate_limiter.h"
 #include "dnsentinel/policy/rebinding.h"
 #include "dnsentinel/security/rrl.h"
 #include "dnsentinel/resolver/recursive_resolver.h"
+#include "dnsentinel/telemetry/event_stream.h"
 
 #include <expected>
 #include <optional>
@@ -43,7 +45,9 @@ struct Config {
     security::RrlConfig      rrl;         // default: off
     policy::ListsConfig      lists;   // default: no lists, nothing blocked
     policy::RebindingConfig  rebinding;  // default: on; stub zones are always exempt
+    policy::DynamicRulesConfig dynamic_rules;  // policy.dynamic_rules (README §7.6.6); default: on, none yet
     ml::DgaConfig            dga;        // ml.dga, the DGA classifier (plan §7.8.2); default: off
+    telemetry::EventStreamConfig events;  // telemetry.events, the event bus (README §6.2); default: off
 
     /// Features the config turns on (in the file, or by default) that this
     /// build doesn't implement yet ("listen.dot", "policy", ...), so startup

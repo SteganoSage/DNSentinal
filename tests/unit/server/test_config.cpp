@@ -48,7 +48,16 @@ TEST(Config, LoadsTheRepoConfig) {
     EXPECT_FALSE(lists(*c, "cache.prefetch"));
     EXPECT_TRUE(c->cache.serve_stale);
     EXPECT_EQ(c->cache.stale_answer_after_ms, 1800u);
-    EXPECT_TRUE(lists(*c, "telemetry"));
+    EXPECT_FALSE(lists(*c, "telemetry"));
+    EXPECT_FALSE(lists(*c, "telemetry.events"));  // the event bus is implemented (README §6.2)
+    EXPECT_TRUE(lists(*c, "telemetry.prometheus"));
+    EXPECT_TRUE(lists(*c, "telemetry.query_log"));
+    EXPECT_EQ(c->events.path, "/tmp/dnsentinel/events.sock");
+    EXPECT_EQ(c->events.buffer_bytes, size_t{4096} * 1024);
+    EXPECT_TRUE(c->events.commands);
+    EXPECT_TRUE(c->dynamic_rules.enabled);
+    EXPECT_EQ(c->dynamic_rules.max_ttl, 86400u);
+    EXPECT_EQ(c->dynamic_rules.response, policy::BlockResponse::NxDomain);
     EXPECT_FALSE(lists(*c, "ml"));  // the DGA classifier is implemented (plan §7.8.2)
     EXPECT_TRUE(c->dga.enabled);
     EXPECT_EQ(c->dga.mode, ml::DgaMode::Monitor);
@@ -230,6 +239,34 @@ TEST(Config, EmptyConfigKeepsDefaults) {
     EXPECT_EQ(c->resolver.edns_buffer, 1232);
     EXPECT_EQ(c->resolver.max_upstream_queries, 30u);
     EXPECT_TRUE(c->resolver.stub_zones.empty());
+}
+
+TEST(Config, DynamicRulesAndEventStream) {
+    auto c = parse_config(
+        "policy:\n"
+        "  dynamic_rules: { enabled: false, max_rules: 5, max_ttl: 60, response: null_ip }\n"
+        "telemetry:\n"
+        "  events: { socket: /tmp/x/events.sock, buffer_kb: 64, max_readers: 2, commands: false }\n");
+    ASSERT_TRUE(c.has_value()) << c.error();
+    EXPECT_FALSE(c->dynamic_rules.enabled);
+    EXPECT_EQ(c->dynamic_rules.max_rules, 5u);
+    EXPECT_EQ(c->dynamic_rules.max_ttl, 60u);
+    EXPECT_EQ(c->dynamic_rules.response, policy::BlockResponse::NullIp);
+    EXPECT_EQ(c->events.path, "/tmp/x/events.sock");
+    EXPECT_EQ(c->events.buffer_bytes, size_t{64} * 1024);
+    EXPECT_EQ(c->events.max_readers, 2u);
+    EXPECT_FALSE(c->events.commands);
+    EXPECT_TRUE(c->not_implemented.empty());
+
+    auto bad = parse_config("policy:\n  dynamic_rules: { response: drop }\n");
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_NE(bad.error().find("policy.dynamic_rules.response"), std::string::npos) << bad.error();
+    bad = parse_config("telemetry:\n  events: { socket: /tmp/s, buffer_kb: 1 }\n");
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_NE(bad.error().find("telemetry.events.buffer_kb"), std::string::npos) << bad.error();
+    bad = parse_config("telemetry:\n  events: { sockets: /tmp/s }\n");
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_NE(bad.error().find("telemetry.events.sockets"), std::string::npos) << bad.error();
 }
 
 TEST(Config, OnlyFeaturesThatAreOnAreReportedMissing) {

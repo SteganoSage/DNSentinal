@@ -2,13 +2,15 @@
 /// @file server/query_processor.h
 /// The fast path (plan §1): every well-formed query from every transport
 /// comes through here. Stages so far: access control, the per-client rate
-/// limit, rejecting queries we can't answer, the block and allow lists,
+/// limit, rejecting queries we can't answer, the slow path's dynamic rules
+/// (README §7.6.6), the block and allow lists,
 /// the DGA classifier (plan §7.8.2, on names the lists don't mention),
 /// resolution (the resolver answers from the cache when it can), checking
 /// the answer's CNAME chain against the lists, then removing private
 /// addresses from answers for public names (rebinding protection). Every
 /// UDP response, whatever produced it, passes response rate limiting on
-/// its way out. ML slots in as it lands.
+/// its way out. Every answer can be reported as a telemetry::QueryEvent,
+/// the event bus to the slow path (README §6.2).
 
 #ifdef DNSENTINEL_ML
 #include "dnsentinel/ml/dga_check.h"
@@ -16,9 +18,11 @@
 #include "dnsentinel/net/query_handler.h"
 #include "dnsentinel/policy/acl.h"
 #include "dnsentinel/policy/blocklists.h"
+#include "dnsentinel/policy/dynamic_rules.h"
 #include "dnsentinel/policy/rate_limiter.h"
 #include "dnsentinel/policy/rebinding.h"
 #include "dnsentinel/security/rrl.h"
+#include "dnsentinel/telemetry/query_event.h"
 #include "dnsentinel/types.h"
 
 #include <functional>
@@ -68,6 +72,7 @@ struct Checks {
     policy::RateLimiter           rate_limit;  // queries per client (§5.9)
     policy::RebindingFilter       rebinding;   // private addresses in answers (§5.8)
     security::ResponseRateLimiter rrl;         // identical UDP responses per client network (§5.9)
+    std::optional<policy::DynamicRules> dynamic{};  // the slow path's time-limited rules (README §7.6.6); none: off
 #ifdef DNSENTINEL_ML
     std::optional<ml::DgaCheck> dga{};  // the DGA classifier (§7.8.2); none: off
 #endif
@@ -77,6 +82,8 @@ class QueryProcessor {
 public:
     using BlockFn     = std::function<void(const BlockEvent&)>;
     using RebindingFn = std::function<void(const RebindingEvent&)>;
+    using QueryFn     = std::function<void(const telemetry::QueryEvent&)>;
+    using WantedFn    = std::function<bool()>;
 #ifdef DNSENTINEL_ML
     using DgaFn = std::function<void(const DgaEvent&)>;
 #endif
@@ -90,6 +97,14 @@ public:
     void on_block(BlockFn fn) { on_block_ = std::move(fn); }
     /// Called whenever rebinding protection changes an answer, before it is sent.
     void on_rebinding(RebindingFn fn) { on_rebinding_ = std::move(fn); }
+    /// Called for every answered query, with how it was answered and which
+    /// check decided, just before the answer goes out (and before response
+    /// rate limiting). `wanted`, if given, is asked first for each query: no
+    /// event is built when it says no (nobody reading the event stream).
+    void on_query(QueryFn fn, WantedFn wanted = {}) {
+        on_query_ = std::move(fn);
+        query_wanted_ = std::move(wanted);
+    }
 #ifdef DNSENTINEL_ML
     /// Called for every query the DGA classifier flags, before it is answered
     /// (resolved in monitor mode, answered like a blocked name in enforce mode).
@@ -98,6 +113,9 @@ public:
 
     /// The checks, for their counters.
     [[nodiscard]] const Checks& checks() const { return checks_; }
+
+    /// The dynamic rules, for the slow path to change (server/rule_commands.h); none if off.
+    [[nodiscard]] policy::DynamicRules* dynamic_rules() { return checks_.dynamic ? &*checks_.dynamic : nullptr; }
 
     /// A net::QueryHandler. A client outside the allowed subnets gets
     /// REFUSED, or nothing (DenyAction::Drop), before anything else happens;
@@ -119,6 +137,8 @@ private:
     Checks                       checks_;
     BlockFn                      on_block_;
     RebindingFn                  on_rebinding_;
+    QueryFn                      on_query_;
+    WantedFn                     query_wanted_;
 #ifdef DNSENTINEL_ML
     DgaFn on_dga_;
 #endif

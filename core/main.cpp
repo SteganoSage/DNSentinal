@@ -1,7 +1,8 @@
 /// @file main.cpp
 /// The dnsentinel daemon: load the config, root hints, certificates and
-/// block lists, start the resolver and the UDP, TCP, DoT and DoH listeners, and
-/// run the event loop until SIGINT or SIGTERM. SIGHUP reloads the block lists.
+/// block lists, start the resolver and the UDP, TCP, DoT and DoH listeners and
+/// the event stream to the slow path, and run the event loop until SIGINT or
+/// SIGTERM. SIGHUP reloads the block lists.
 
 #include "dnsentinel/cache/cache.h"
 #include "dnsentinel/net/event_loop.h"
@@ -13,6 +14,9 @@
 #include "dnsentinel/resolver/root_hints.h"
 #include "dnsentinel/server/config.h"
 #include "dnsentinel/server/query_processor.h"
+#include "dnsentinel/server/rule_commands.h"
+#include "dnsentinel/telemetry/event_stream.h"
+#include "dnsentinel/telemetry/query_event.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -140,6 +144,18 @@ struct LimitCounts {
                " responses dropped and " + std::to_string(rrl_truncated) + " truncated by RRL";
     }
 };
+
+/// A dynamic rule, for the log.
+std::string describe_rule(const policy::DynamicRule& rule) {
+    std::string domain = rule.domain.to_string();
+    if (domain.size() > 1) domain.pop_back();
+    char score[32];
+    std::snprintf(score, sizeof score, "%.3f", rule.score);
+    return "rule " + std::to_string(rule.id) + ": " + domain + " and below for " +
+           (rule.client ? rule.client->to_string() : std::string("every client")) + " (" +
+           (rule.reason.empty() ? "no reason given" : rule.reason) + ", score " + score +
+           (rule.source.empty() ? "" : ", from " + rule.source) + ")";
+}
 
 void log_lists(const policy::LoadReport& report) {
     for (const auto& file : report.files) {
@@ -286,6 +302,16 @@ int main(int argc, char** argv) {
 #ifdef DNSENTINEL_ML
     checks.dga = std::move(dga);
 #endif
+    if (config->dynamic_rules.enabled) {
+        const auto& d = config->dynamic_rules;
+        checks.dynamic.emplace(d);
+        log("dynamic rules on: up to " + std::to_string(d.max_rules) + ", each for at most " +
+            std::to_string(d.max_ttl) + " s; names under one are answered " +
+            (d.response == policy::BlockResponse::NxDomain ? "NXDOMAIN" : "0.0.0.0 / ::") +
+            (config->events.path.empty() || !config->events.commands
+                 ? " (none can be added: telemetry.events with commands is off)"
+                 : " (the slow path adds them through telemetry.events)"));
+    }
     server::QueryProcessor processor(resolver, lists, std::move(checks));
     processor.on_block([](const server::BlockEvent& block) {
         // Names blocked by their own list entry are too many to log here (the
@@ -318,6 +344,42 @@ int main(int argc, char** argv) {
              alert.question.qname.to_string() + " (type " + std::to_string(alert.question.qtype) +
              ") from " + server + "; asking it again over TCP");
     });
+
+    // ─── The event stream to the slow path, and its way back (README §6.2) ──
+    server::RuleCommands commands(processor.dynamic_rules());
+    commands.on_change([](const policy::DynamicRule& rule, bool renewed) {
+        log(std::string(renewed ? "dynamic rule renewed, " : "dynamic rule added, ") + describe_rule(rule) + ", for " +
+            std::to_string(std::chrono::ceil<std::chrono::seconds>(rule.expires - std::chrono::steady_clock::now())
+                               .count()) +
+            " s");
+    });
+    std::unique_ptr<telemetry::EventStream> events;
+    if (!config->events.path.empty()) {
+        auto stream = telemetry::EventStream::create(**loop, config->events, [&commands](std::string_view line) {
+            return commands.handle(line, std::chrono::steady_clock::now());
+        });
+        if (!stream) {
+            log("telemetry.events: " + stream.error());
+            return 1;
+        }
+        events = std::move(*stream);
+        processor.on_query(
+            [&events](const telemetry::QueryEvent& event) { events->publish(telemetry::to_json(event)); },
+            [&events] { return events->has_readers(); });
+        log("event stream on " + config->events.path + " (up to " + std::to_string(config->events.max_readers) +
+            " readers" + (config->events.commands ? ", which may change the dynamic rules" : "") +
+            "): python -m analyzer.live");
+    }
+    std::function<void()> expire_rules = [&] {
+        if (auto* rules = processor.dynamic_rules()) {
+            for (const auto& rule : rules->expire(std::chrono::steady_clock::now())) {
+                log("dynamic rule expired, " + describe_rule(rule) + "; " + std::to_string(rule.hits) +
+                    " queries answered under it");
+            }
+        }
+        (*loop)->add_timer(std::chrono::seconds(10), expire_rules);
+    };
+    (*loop)->add_timer(std::chrono::seconds(10), expire_rules);
 
     auto handler = [&processor](Message query, const net::ClientInfo& client, net::Responder respond) {
         processor.handle(std::move(query), client, std::move(respond));
@@ -442,6 +504,17 @@ int main(int argc, char** argv) {
             std::to_string(s.flagged_new) + " domains)");
     }
 #endif
+    if (const auto* rules = processor.dynamic_rules(); rules && rules->added() > 0) {
+        log("dynamic rules since startup: " + std::to_string(rules->added()) + " added, " +
+            std::to_string(rules->blocked()) + " queries answered under them, " + std::to_string(rules->size()) +
+            " still in force");
+    }
+    if (events) {
+        const auto& s = events->stats();
+        log("event stream since startup: " + std::to_string(s.readers) + " readers, " + std::to_string(s.published) +
+            " events published, " + std::to_string(s.dropped) + " lost by readers that fell behind, " +
+            std::to_string(s.commands) + " commands");
+    }
     log("cache since startup: " + std::to_string(cache.hits()) + " hits, " + std::to_string(cache.misses()) +
         " misses, " + std::to_string(resolver.stats().stale_answers) + " stale answers, " +
         std::to_string(resolver.stats().prefetches) + " prefetches");

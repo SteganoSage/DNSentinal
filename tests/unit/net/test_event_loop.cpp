@@ -67,6 +67,7 @@ bool run_with_timeout(EventLoop& loop, Clock::duration timeout) {
 TEST(EventLoop, TimersFireInDeadlineOrder) {
     auto loop = make_loop();
     std::vector<int> order;
+    const auto start = Clock::now();  // before the timers: their delays run from when they were added
     loop->add_timer(30ms, [&] {
         order.push_back(4);
         loop->stop();
@@ -75,7 +76,6 @@ TEST(EventLoop, TimersFireInDeadlineOrder) {
     loop->add_timer(20ms, [&] { order.push_back(3); });
     loop->add_timer(10ms, [&] { order.push_back(2); });  // same delay: after the first
 
-    const auto start = Clock::now();
     EXPECT_FALSE(run_with_timeout(*loop, 2s));
     EXPECT_EQ(order, (std::vector<int>{1, 2, 3, 4}));
     EXPECT_GE(Clock::now() - start, 30ms);
