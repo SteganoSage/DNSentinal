@@ -1,7 +1,9 @@
 /// @file main.cpp
 /// The dnsentinel daemon: load the config, root hints, certificates and
-/// block lists, start the resolver and the UDP, TCP, DoT and DoH listeners, and
-/// run the event loop until SIGINT or SIGTERM. SIGHUP reloads the block lists.
+/// block lists, start the resolver and the UDP, TCP, DoT and DoH listeners and
+/// the event stream to the slow path, the query log and the Prometheus
+/// endpoint, and run the event loop until SIGINT or SIGTERM. SIGHUP reloads
+/// the block lists.
 
 #include "dnsentinel/cache/cache.h"
 #include "dnsentinel/net/event_loop.h"
@@ -13,6 +15,12 @@
 #include "dnsentinel/resolver/root_hints.h"
 #include "dnsentinel/server/config.h"
 #include "dnsentinel/server/query_processor.h"
+#include "dnsentinel/server/rule_commands.h"
+#include "dnsentinel/telemetry/event_stream.h"
+#include "dnsentinel/telemetry/metrics_server.h"
+#include "dnsentinel/telemetry/query_event.h"
+#include "dnsentinel/telemetry/query_log.h"
+#include "dnsentinel/telemetry/query_metrics.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -140,6 +148,18 @@ struct LimitCounts {
                " responses dropped and " + std::to_string(rrl_truncated) + " truncated by RRL";
     }
 };
+
+/// A dynamic rule, for the log.
+std::string describe_rule(const policy::DynamicRule& rule) {
+    std::string domain = rule.domain.to_string();
+    if (domain.size() > 1) domain.pop_back();
+    char score[32];
+    std::snprintf(score, sizeof score, "%.3f", rule.score);
+    return "rule " + std::to_string(rule.id) + ": " + domain + " and below for " +
+           (rule.client ? rule.client->to_string() : std::string("every client")) + " (" +
+           (rule.reason.empty() ? "no reason given" : rule.reason) + ", score " + score +
+           (rule.source.empty() ? "" : ", from " + rule.source) + ")";
+}
 
 void log_lists(const policy::LoadReport& report) {
     for (const auto& file : report.files) {
@@ -286,6 +306,16 @@ int main(int argc, char** argv) {
 #ifdef DNSENTINEL_ML
     checks.dga = std::move(dga);
 #endif
+    if (config->dynamic_rules.enabled) {
+        const auto& d = config->dynamic_rules;
+        checks.dynamic.emplace(d);
+        log("dynamic rules on: up to " + std::to_string(d.max_rules) + ", each for at most " +
+            std::to_string(d.max_ttl) + " s; names under one are answered " +
+            (d.response == policy::BlockResponse::NxDomain ? "NXDOMAIN" : "0.0.0.0 / ::") +
+            (config->events.path.empty() || !config->events.commands
+                 ? " (none can be added: telemetry.events with commands is off)"
+                 : " (the slow path adds them through telemetry.events)"));
+    }
     server::QueryProcessor processor(resolver, lists, std::move(checks));
     processor.on_block([](const server::BlockEvent& block) {
         // Names blocked by their own list entry are too many to log here (the
@@ -311,13 +341,74 @@ int main(int argc, char** argv) {
             ", score " + score + "); " + (event.enforced ? "answered as blocked" : "resolved (monitor mode)"));
     });
 #endif
-    resolver.on_spoof_alert([](const resolver::SpoofAlert& alert) {
+    uint64_t spoof_alerts = 0;
+    resolver.on_spoof_alert([&spoof_alerts](const resolver::SpoofAlert& alert) {
+        ++spoof_alerts;
         char server[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &alert.server, server, sizeof server);
         warn("possible spoofing: " + std::to_string(alert.replies) + " forged-looking replies for " +
              alert.question.qname.to_string() + " (type " + std::to_string(alert.question.qtype) +
              ") from " + server + "; asking it again over TCP");
     });
+
+    // ─── The event stream to the slow path, and its way back (README §6.2) ──
+    server::RuleCommands commands(processor.dynamic_rules());
+    commands.on_change([](const policy::DynamicRule& rule, bool renewed) {
+        log(std::string(renewed ? "dynamic rule renewed, " : "dynamic rule added, ") + describe_rule(rule) + ", for " +
+            std::to_string(std::chrono::ceil<std::chrono::seconds>(rule.expires - std::chrono::steady_clock::now())
+                               .count()) +
+            " s");
+    });
+    std::unique_ptr<telemetry::EventStream> events;
+    if (!config->events.path.empty()) {
+        auto stream = telemetry::EventStream::create(**loop, config->events, [&commands](std::string_view line) {
+            return commands.handle(line, std::chrono::steady_clock::now());
+        });
+        if (!stream) {
+            log("telemetry.events: " + stream.error());
+            return 1;
+        }
+        events = std::move(*stream);
+        log("event stream on " + config->events.path + " (up to " + std::to_string(config->events.max_readers) +
+            " readers" + (config->events.commands ? ", which may change the dynamic rules" : "") +
+            "): python -m analyzer.live");
+    }
+
+    // ─── The query log (README §7.10) ───────────────────────────────────────
+    std::unique_ptr<telemetry::QueryLog> query_log;
+    if (config->query_log.enabled) {
+        auto opened = telemetry::QueryLog::open(config->query_log);
+        if (!opened) {
+            log("telemetry.query_log: " + opened.error());
+            return 1;
+        }
+        query_log = std::move(*opened);
+        const auto& q = config->query_log;
+        log("query log: " + query_log->file_for("YYYY-MM-DD") + ", a file per UTC day, " +
+            (q.retention_days > 0 ? "kept " + std::to_string(q.retention_days) + " days" : "kept forever") +
+            (q.anonymise_clients ? ", clients anonymised" : "") +
+            (q.exclude.empty() ? "" : ", " + std::to_string(q.exclude.size()) + " subnets never logged"));
+    }
+    if (events || query_log) {
+        processor.on_query(
+            [&events, &query_log](const telemetry::QueryEvent& event) {
+                if (events && events->has_readers()) events->publish(telemetry::to_json(event));
+                if (query_log) query_log->write(event);
+            },
+            [&events, &query_log] { return query_log || events->has_readers(); });
+    }
+    telemetry::QueryMetrics query_metrics;
+    if (config->prometheus) processor.count_into(&query_metrics);
+    std::function<void()> expire_rules = [&] {
+        if (auto* rules = processor.dynamic_rules()) {
+            for (const auto& rule : rules->expire(std::chrono::steady_clock::now())) {
+                log("dynamic rule expired, " + describe_rule(rule) + "; " + std::to_string(rule.hits) +
+                    " queries answered under it");
+            }
+        }
+        (*loop)->add_timer(std::chrono::seconds(10), expire_rules);
+    };
+    (*loop)->add_timer(std::chrono::seconds(10), expire_rules);
 
     auto handler = [&processor](Message query, const net::ClientInfo& client, net::Responder respond) {
         processor.handle(std::move(query), client, std::move(respond));
@@ -355,6 +446,89 @@ int main(int argc, char** argv) {
         }
         doh = std::move(*listener);
         listening.push_back("doh https://" + at + config->doh->path);
+    }
+
+    // ─── The Prometheus endpoint (README §7.10) ─────────────────────────────
+    // Each scrape renders everything afresh from the components' counters.
+    const auto                               started = std::chrono::system_clock::now();
+    std::unique_ptr<telemetry::MetricsServer> metrics;
+    if (config->prometheus) {
+        auto render = [&]() {
+            using telemetry::exposition::single;
+            std::string out;
+            out.reserve(8192);
+            query_metrics.render(out);
+            single(out, "dnsentinel_cache_hits_total", "counter", "Answers found in the cache.", cache.hits());
+            single(out, "dnsentinel_cache_misses_total", "counter", "Lookups the cache could not answer.",
+                   cache.misses());
+            single(out, "dnsentinel_cache_entries", "gauge", "Entries in the cache.", uint64_t{cache.size()});
+            const resolver::ResolverStats& r = resolver.stats();
+            single(out, "dnsentinel_upstream_queries_total", "counter", "Queries sent upstream, retries included.",
+                   r.upstream_queries);
+            single(out, "dnsentinel_upstream_minimised_queries_total", "counter",
+                   "Upstream queries sent QNAME-minimised.", r.minimised_queries);
+            single(out, "dnsentinel_minimisation_fallbacks_total", "counter",
+                   "Zones sent the full name because a server mishandled a minimised one.", r.minimisation_fallbacks);
+            single(out, "dnsentinel_stale_answers_total", "counter", "Clients answered with expired data.",
+                   r.stale_answers);
+            single(out, "dnsentinel_prefetches_total", "counter", "Background refreshes of popular entries.",
+                   r.prefetches);
+            single(out, "dnsentinel_spoof_alerts_total", "counter",
+                   "Upstream queries that drew many forged-looking replies (each retried over TCP).", spoof_alerts);
+            const server::Checks& k = processor.checks();
+            single(out, "dnsentinel_rate_limited_total", "counter", "Queries over a client's rate limit.",
+                   k.rate_limit.limited());
+            single(out, "dnsentinel_rrl_dropped_total", "counter", "Responses dropped by response rate limiting.",
+                   k.rrl.dropped());
+            single(out, "dnsentinel_rrl_truncated_total", "counter",
+                   "Responses sent truncated by response rate limiting.", k.rrl.slipped());
+            single(out, "dnsentinel_blocklist_rules", "gauge", "Block list rules in force.", uint64_t{lists.size()});
+            if (const auto* rules = processor.dynamic_rules()) {
+                single(out, "dnsentinel_dynamic_rules", "gauge", "Dynamic rules in force.", uint64_t{rules->size()});
+                single(out, "dnsentinel_dynamic_rules_added_total", "counter", "Dynamic rules added (not renewals).",
+                       rules->added());
+                single(out, "dnsentinel_dynamic_rule_blocks_total", "counter",
+                       "Queries answered under a dynamic rule.", rules->blocked());
+            }
+#ifdef DNSENTINEL_ML
+            if (const auto& d = k.dga) {
+                const ml::DgaStats& s = d->stats();
+                single(out, "dnsentinel_dga_scored_total", "counter",
+                       "New registrable domains the DGA classifier scored.", s.scored);
+                single(out, "dnsentinel_dga_flagged_total", "counter",
+                       "Queries for names the DGA classifier judged generated.", s.flagged);
+                single(out, "dnsentinel_dga_flagged_domains_total", "counter",
+                       "Registrable domains the DGA classifier judged generated.", s.flagged_new);
+            }
+#endif
+            if (events) {
+                const auto& s = events->stats();
+                single(out, "dnsentinel_events_published_total", "counter", "Query events sent to the slow path.",
+                       s.published);
+                single(out, "dnsentinel_events_dropped_total", "counter",
+                       "Query events lost by readers that fell behind.", s.dropped);
+                single(out, "dnsentinel_event_readers", "gauge", "Readers on the event stream.",
+                       uint64_t{events->reader_count()});
+            }
+            if (query_log) {
+                const auto s = query_log->stats();
+                single(out, "dnsentinel_query_log_written_total", "counter", "Lines written to the query log.",
+                       s.written);
+                single(out, "dnsentinel_query_log_dropped_total", "counter",
+                       "Query log lines lost because the disk fell behind.", s.dropped);
+            }
+            single(out, "dnsentinel_start_time_seconds", "gauge", "When the daemon started, in Unix time.",
+                   static_cast<uint64_t>(
+                       std::chrono::duration_cast<std::chrono::seconds>(started.time_since_epoch()).count()));
+            return out;
+        };
+        auto server = telemetry::MetricsServer::create(**loop, *config->prometheus, render);
+        if (!server) {
+            log(server.error());
+            return 1;
+        }
+        metrics = std::move(*server);
+        listening.push_back("metrics http://" + endpoint(config->prometheus->address, metrics->port()) + "/metrics");
     }
 
     // ─── Reloading the lists: on SIGHUP, and when a list file changes ───────
@@ -442,6 +616,23 @@ int main(int argc, char** argv) {
             std::to_string(s.flagged_new) + " domains)");
     }
 #endif
+    if (const auto* rules = processor.dynamic_rules(); rules && rules->added() > 0) {
+        log("dynamic rules since startup: " + std::to_string(rules->added()) + " added, " +
+            std::to_string(rules->blocked()) + " queries answered under them, " + std::to_string(rules->size()) +
+            " still in force");
+    }
+    if (events) {
+        const auto& s = events->stats();
+        log("event stream since startup: " + std::to_string(s.readers) + " readers, " + std::to_string(s.published) +
+            " events published, " + std::to_string(s.dropped) + " lost by readers that fell behind, " +
+            std::to_string(s.commands) + " commands");
+    }
+    if (query_log) {
+        query_log->close();  // so every queued line is counted
+        const auto s = query_log->stats();
+        log("query log since startup: " + std::to_string(s.written) + " lines written, " + std::to_string(s.dropped) +
+            " lost because the disk fell behind, " + std::to_string(s.removed) + " old day files removed");
+    }
     log("cache since startup: " + std::to_string(cache.hits()) + " hits, " + std::to_string(cache.misses()) +
         " misses, " + std::to_string(resolver.stats().stale_answers) + " stale answers, " +
         std::to_string(resolver.stats().prefetches) + " prefetches");

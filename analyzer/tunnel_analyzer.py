@@ -83,7 +83,10 @@ def analyze(
             if not line.strip():
                 continue
             try:
-                event = DnsEvent.from_mapping(json.loads(line))
+                record = json.loads(line)
+                if isinstance(record, dict) and record.get("type", "query") != "query":
+                    continue  # a saved event stream also holds replies and dropped-event notices
+                event = DnsEvent.from_mapping(record)
             except (ValueError, json.JSONDecodeError) as error:
                 raise ValueError(f"{path}:{line_number}: invalid DNS event: {error}") from error
             for burst in nxdomain_detector.add(event):

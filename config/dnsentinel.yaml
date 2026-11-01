@@ -62,6 +62,11 @@ policy:
   rebinding_protection:    # plan §5.8: public names may not resolve to private addresses
     enabled: true
     exempt: [home.arpa, internal, localhost, local, lan, home]  # local names (and below); stub zones are added
+  dynamic_rules:           # README §7.6.6: time-limited rules from the slow path (analyzer/live.py); never the lists
+    enabled: true
+    max_rules: 10000       # more are refused
+    max_ttl: 86400         # seconds; a rule asked for longer gets this
+    response: nxdomain     # what names under a rule get: nxdomain (malware verdicts) | null_ip
 
 rate_limit:                # plan §5.9
   per_client:              # token bucket per client IP
@@ -87,11 +92,17 @@ ml:
     cache_size: 100000     # verdicts kept, one per registrable domain
 
 telemetry:
-  prometheus:
+  events:                  # README §6.2: every answered query, one JSON line, to the slow path
+    socket: /tmp/dnsentinel/events.sock  # a Unix socket, mode 0600 (its directory is made 0700 if missing)
+    buffer_kb: 4096        # per reader: a reader this far behind loses events; answers never wait
+    max_readers: 8
+    commands: true         # readers may add and remove dynamic rules (policy.dynamic_rules)
+  prometheus:               # GET http://127.0.0.1:9153/metrics; no authentication, so keep it local
     addr: "127.0.0.1:9153"
-  query_log:
+  query_log:                # every answered query as a JSON line, a file per UTC day
     enabled: true
-    path: /var/log/dnsentinel/queries.jsonl
-    retention_days: 7
-    anonymise_clients: false
-    ring_buffer_size: 8192
+    path: logs/queries.jsonl  # gives logs/queries-YYYY-MM-DD.jsonl (relative to where it runs)
+    retention_days: 7       # older day files are removed; 0 keeps everything
+    anonymise_clients: false  # true: a keyed hash ("anon-..."), the key kept beside the log
+    ring_buffer_size: 8192  # lines waiting for the disk; past this they are dropped and counted
+    exclude: []             # clients never logged, e.g. ["10.0.5.0/24"]

@@ -835,6 +835,36 @@ Events go to a ring buffer → a collector process → SQLite (or a time-series 
 - **Alerts:** every ML alert with score, contributing features ("unique subdomains: 412/min, mean entropy 4.8 bits/char"), and one-click allowlist/block.
 - **Security:** spoofing attempts detected, RRL activity, rebinding blocks.
 
+#### As built (`core/telemetry/`, `telemetry:` in `config/dnsentinel.yaml`)
+
+**Query log.** One line per answered query, the same JSON the event stream sends (§6.2), so the dashboard, the tunnel detector and trace W1 all read one format:
+
+```json
+{"type":"query","timestamp":1793534108.988485,"client":"127.0.0.1","transport":"udp","qname":"www.example.com","qtype":"A","rcode":"NOERROR","answers":1,"response_size":60,"latency_us":184,"action":"answer"}
+```
+
+`action` is what decided the answer: `answer`, `block`, `cname_block`, `dynamic_rule`, `dga`, `refused`, `rate_limited`, `rejected` or `rebinding`. Blocks add `"rule"` (the rule and its list), and names the DGA classifier scored add `"dga"` (the score). `path: logs/queries.jsonl` writes `logs/queries-YYYY-MM-DD.jsonl`, one file per UTC day, and day files older than `retention_days` are removed. A thread of its own does the writing, so a slow disk never delays an answer: past `ring_buffer_size` waiting lines, new ones are dropped and counted. For privacy, `anonymise_clients: true` replaces each address with `anon-` and 12 hex digits (HMAC-SHA256 under a key kept in `.anonymise-key` beside the log, mode 0600), so a device keeps its label across restarts. `exclude: [subnets]` keeps clients out of the log entirely; it doesn't affect the event stream.
+
+**Metrics.** `GET http://127.0.0.1:9153/metrics` (`telemetry.prometheus.addr`; no authentication, so it stays on localhost unless told otherwise):
+
+| Metric | Type | Labels / meaning |
+|---|---|---|
+| `dnsentinel_queries_total` | counter | `transport` (udp/tcp/dot/doh), `qtype` (13 common types, else `other`), `rcode`, `action` (as in the log) |
+| `dnsentinel_query_duration_seconds` | histogram | Query in to answer out; buckets 100 µs to 5 s |
+| `dnsentinel_cache_hits_total`, `_misses_total`, `dnsentinel_cache_entries` | counter, gauge | The answer cache |
+| `dnsentinel_upstream_queries_total`, `_minimised_queries_total`, `dnsentinel_minimisation_fallbacks_total` | counter | Queries to authoritative servers, retries included |
+| `dnsentinel_stale_answers_total`, `dnsentinel_prefetches_total` | counter | Serve-stale and prefetch (§7.4) |
+| `dnsentinel_spoof_alerts_total` | counter | Upstream queries that drew many forged-looking replies |
+| `dnsentinel_rate_limited_total`, `dnsentinel_rrl_dropped_total`, `dnsentinel_rrl_truncated_total` | counter | Per-client limit and RRL |
+| `dnsentinel_blocklist_rules`, `dnsentinel_dynamic_rules` | gauge | Rules in force |
+| `dnsentinel_dynamic_rules_added_total`, `dnsentinel_dynamic_rule_blocks_total` | counter | Rules from the slow path, and the queries they answered |
+| `dnsentinel_dga_scored_total`, `_flagged_total`, `_flagged_domains_total` | counter | Only with `ml.dga` on |
+| `dnsentinel_events_published_total`, `_dropped_total`, `dnsentinel_event_readers` | counter, gauge | Only with `telemetry.events` on |
+| `dnsentinel_query_log_written_total`, `_dropped_total` | counter | Only with the query log on |
+| `dnsentinel_start_time_seconds` | gauge | Unix time the daemon started |
+
+Queries/s, the cache hit ratio, p50/p99 latency and the share blocked (the Overview view) all come from these, e.g. `histogram_quantile(0.99, rate(dnsentinel_query_duration_seconds_bucket[1m]))`.
+
 ---
 
 ## 8. The Life of a Query (End-to-End Walkthrough)

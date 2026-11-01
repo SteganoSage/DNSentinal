@@ -100,17 +100,22 @@ add_library(dnsentinel_core STATIC
     core/policy/blocklist_trie.cpp
     core/policy/blocklists.cpp
     core/policy/cname_check.cpp
+    core/policy/dynamic_rules.cpp
     core/policy/rebinding.cpp
     core/policy/rate_limiter.cpp
 
-    # Telemetry
-    # core/telemetry/event_bus.cpp
-    # core/telemetry/metrics.cpp
-    # core/telemetry/query_log.cpp
+    # Telemetry: the event stream to the slow path (README §6.2), the query
+    # log and the Prometheus endpoint (README §7.10)
+    core/telemetry/event_stream.cpp
+    core/telemetry/metrics_server.cpp
+    core/telemetry/query_event.cpp
+    core/telemetry/query_log.cpp
+    core/telemetry/query_metrics.cpp
 
-    # Server: config loading, the query pipeline
+    # Server: config loading, the query pipeline, the slow path's commands
     core/server/config.cpp
     core/server/query_processor.cpp
+    core/server/rule_commands.cpp
 )
 
 target_include_directories(dnsentinel_core PUBLIC
@@ -189,11 +194,16 @@ if(DNSENTINEL_ENABLE_TESTS)
         tests/unit/security/test_bailiwick.cpp
         tests/unit/server/test_config.cpp
         tests/unit/server/test_query_processor.cpp
+        tests/unit/server/test_rule_commands.cpp
+        tests/unit/telemetry/test_event_stream.cpp
+        tests/unit/telemetry/test_metrics.cpp
+        tests/unit/telemetry/test_query_log.cpp
         tests/unit/security/test_zero_x20.cpp
         tests/unit/policy/test_acl.cpp
         tests/unit/policy/test_blocklist_trie.cpp
         tests/unit/policy/test_blocklists.cpp
         tests/unit/policy/test_cname_check.cpp
+        tests/unit/policy/test_dynamic_rules.cpp
         tests/unit/policy/test_rebinding.cpp
         tests/unit/policy/test_rate_limiter.cpp
         tests/unit/security/test_rrl.cpp
@@ -218,7 +228,7 @@ if(DNSENTINEL_ENABLE_TESTS)
         add_test(NAME offline_e2e
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/offline_e2e.py
                          $<TARGET_FILE:dnsentinel>)
-        set_tests_properties(offline_e2e PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        set_tests_properties(offline_e2e PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
         # The ML pipelines' and the analyzer's Python tests; the ones that need
         # scikit-learn or LightGBM skip themselves where those aren't installed.
         add_test(NAME ml_python

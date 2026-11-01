@@ -60,6 +60,20 @@ protected:
             Checks{AccessControl(access), RateLimiter(rate_limit), RebindingFilter(rebinding), ResponseRateLimiter(rrl)});
     }
 
+    /// A processor with the slow path's dynamic rules on (README §7.6.6).
+    void use_dynamic_rules(DynamicRulesConfig config = {}) {
+        Checks checks{AccessControl(access), RateLimiter(rate_limit), RebindingFilter(rebinding), ResponseRateLimiter(rrl)};
+        checks.dynamic.emplace(config);
+        processor = std::make_unique<QueryProcessor>(*resolver, *lists, std::move(checks));
+    }
+
+    void add_rule(std::string_view domain, std::optional<Subnet> client = std::nullopt) {
+        ASSERT_NE(processor->dynamic_rules(), nullptr);
+        auto added = processor->dynamic_rules()->add(name(domain), std::move(client), 60, "tunnel", 0.97, "test",
+                                                     std::chrono::steady_clock::now());
+        ASSERT_TRUE(added.has_value()) << added.error();
+    }
+
 #ifdef DNSENTINEL_ML
     /// A processor that also runs the shipped DGA classifier.
     void use_dga(ml::DgaMode mode) {
@@ -721,3 +735,107 @@ TEST_F(QueryProcessorTest, AllowlistedNamesSkipTheDgaCheck) {
     EXPECT_EQ(processor->checks().dga->stats().queries, 0u);  // not even looked at
 }
 #endif
+
+TEST_F(QueryProcessorTest, DynamicRulesAnswerBeforeAnythingGoesUpstream) {
+    use_dynamic_rules();
+    add_rule("example.test", parse_subnet("127.0.0.1").value());
+    auto r = ask(query("x.WWW.example.test"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::NXDomain));  // README §7.6.2: NXDOMAIN for verdicts
+    EXPECT_TRUE(r->answers.empty());
+    EXPECT_EQ(auth->queries, 0);
+    EXPECT_EQ(processor->dynamic_rules()->blocked(), 1u);
+
+    r = ask(query("www.example.test"), "127.0.0.2");  // another client: not its rule
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.0.2.1")});
+}
+
+TEST_F(QueryProcessorTest, DynamicRulesCanAnswerWithTheNullAddress) {
+    use_dynamic_rules({.response = BlockResponse::NullIp});
+    add_rule("www.example.test");
+    auto r = ask(query("www.example.test"));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("0.0.0.0")});
+}
+
+TEST_F(QueryProcessorTest, AnAllowlistedNameOutranksADynamicRule) {
+    const ListFile allow("www.example.test\n");
+    use_lists({.allowlists = {allow.path()}});
+    use_dynamic_rules();
+    add_rule("example.test");
+    auto r = ask(query("www.example.test"));  // vouched for by a person: no verdict overrides that
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->answers.size(), 1u);
+    EXPECT_EQ(r->answers[0].rdata, RData{ipv4("192.0.2.1")});
+    r = ask(query("mail.example.test"));  // the rest of the zone is still under the rule
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->header.rcode, static_cast<uint8_t>(RCode::NXDomain));
+}
+
+TEST_F(QueryProcessorTest, EveryAnswerIsReportedWithWhatDecidedIt) {
+    const ListFile block("ads.example.test\n");
+    use_lists({.blocklists = {block.path()}});
+    access.allow.push_back(parse_subnet("192.0.2.0/24").value());
+    use_dynamic_rules();
+    add_rule("tunnel.example.test");
+    std::vector<telemetry::QueryEvent> events;
+    processor->on_query([&](const telemetry::QueryEvent& e) { events.push_back(e); });
+
+    auto answered = ask(query("WWW.example.test"), "192.0.2.50");
+    ASSERT_TRUE(answered.has_value());
+    ASSERT_TRUE(ask(query("ads.example.test")).has_value());
+    ASSERT_TRUE(ask(query("abcd.tunnel.example.test", static_cast<uint16_t>(RRType::TXT))).has_value());
+    ASSERT_TRUE(ask(query("www.example.test"), "10.9.9.9").has_value());  // outside the allowed subnets
+    ASSERT_TRUE(ask(query("example.test", 252)).has_value());              // a zone transfer
+
+    ASSERT_EQ(events.size(), 5u);
+    EXPECT_EQ(events[0].action, telemetry::Action::Answer);
+    EXPECT_EQ(telemetry::address_text(events[0].client), "192.0.2.50");
+    EXPECT_EQ(events[0].question.qname, name("www.example.test"));
+    EXPECT_EQ(events[0].question.qtype, 1);
+    EXPECT_EQ(events[0].rcode, 0);
+    EXPECT_EQ(events[0].answers, 1u);
+    EXPECT_EQ(events[0].response_size, wire::build(*answered).size());
+    EXPECT_GT(events[0].latency_us, 0u);
+    EXPECT_EQ(events[1].action, telemetry::Action::Block);
+    EXPECT_NE(events[1].rule.find("ads.example.test."), std::string::npos) << events[1].rule;
+    EXPECT_EQ(events[2].action, telemetry::Action::Dynamic);
+    EXPECT_EQ(events[2].rcode, static_cast<uint8_t>(RCode::NXDomain));
+    EXPECT_NE(events[2].rule.find("tunnel.example.test for everyone (tunnel, 0.97"), std::string::npos)
+        << events[2].rule;
+    EXPECT_EQ(events[3].action, telemetry::Action::Refused);
+    EXPECT_EQ(events[4].action, telemetry::Action::Rejected);
+    EXPECT_NE(telemetry::to_json(events[2]).find(R"("qtype":"TXT")"), std::string::npos);
+}
+
+TEST_F(QueryProcessorTest, NoEventIsBuiltWhenNobodyWantsOne) {
+    int built = 0;
+    processor->on_query([&](const telemetry::QueryEvent&) { ++built; }, [] { return false; });
+    ASSERT_TRUE(ask(query("www.example.test")).has_value());
+    EXPECT_EQ(built, 0);
+}
+
+TEST_F(QueryProcessorTest, CountsEveryAnswerForTheMetrics) {
+    const ListFile block("ads.example.test\n");
+    use_lists({.blocklists = {block.path()}});
+    telemetry::QueryMetrics metrics;
+    processor->count_into(&metrics);  // no on_query: counting needs no event
+
+    ASSERT_TRUE(ask(query("www.example.test")).has_value());
+    ASSERT_TRUE(ask(query("www.example.test")).has_value());  // from the cache
+    ASSERT_TRUE(ask(query("ads.example.test")).has_value());
+    ASSERT_TRUE(ask(query("www.example.test", static_cast<uint16_t>(RRType::TXT))).has_value());
+
+    EXPECT_EQ(metrics.total(), 4u);
+    std::string text;
+    metrics.render(text);
+    EXPECT_NE(text.find(R"(dnsentinel_queries_total{transport="udp",qtype="A",rcode="NOERROR",action="answer"} 2)"),
+              std::string::npos)
+        << text;
+    EXPECT_NE(text.find(R"(qtype="A",rcode="NOERROR",action="block"} 1)"), std::string::npos) << text;
+    EXPECT_NE(text.find(R"(qtype="TXT",)"), std::string::npos) << text;
+    EXPECT_NE(text.find("dnsentinel_query_duration_seconds_count 4\n"), std::string::npos) << text;
+}

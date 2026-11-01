@@ -20,6 +20,7 @@ skipped.
 
 import base64
 import http.client
+import json
 import os
 import queue
 import selectors
@@ -44,6 +45,7 @@ NOERROR, SERVFAIL, NXDOMAIN, REFUSED = 0, 2, 3, 5
 ROOT_IP, LAB_IP, INFO_IP = "127.0.0.2", "127.0.0.3", "127.0.0.4"
 DEAD_IP = "127.0.0.9"  # delegated to, but nothing listens there
 DAEMON = ("127.0.0.1", 5353)
+METRICS_PORT = 9153
 DOT = ("127.0.0.1", 8853)
 DOH = ("127.0.0.1", 8443)
 
@@ -441,7 +443,7 @@ class Daemon:
 
 
 def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None, dot=None, doh=None, cache=None,
-                 ml=None):
+                 ml=None, telemetry=None):
     """access: (allowed subnets, deny action), or None for the default (localhost).
     policy, rate_limit: those sections' settings (indented YAML), or None for none.
     dot, doh: (cert, key) for a DoT listener on DOT or a DoH one on DOH, or None for none."""
@@ -450,7 +452,7 @@ def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None
         f.write(f".  NS  a.root-servers.test.\na.root-servers.test.  A  {ROOT_IP}\n")
     name = ("stub" if stub_zone else f"access-{access[1]}" if access else "policy" if policy
             else f"rate-{abs(hash(rate_limit))}" if rate_limit else "dot" if dot else "doh" if doh else "cache" if cache
-            else f"ml-{abs(hash(ml))}" if ml else "root")
+            else f"ml-{abs(hash(ml))}" if ml else "telemetry" if telemetry else "root")
     path = os.path.join(tmp, name + ".yaml")
     with open(path, "w") as f:
         f.write(f'listen:\n  udp: "{DAEMON[0]}:{DAEMON[1]}"\n')
@@ -472,6 +474,8 @@ def write_config(tmp, stub_zone=False, access=None, policy=None, rate_limit=None
             f.write("cache:\n" + cache)
         if ml:
             f.write("ml:\n" + ml)
+        if telemetry:
+            f.write("telemetry:\n" + telemetry)
     return path
 
 
@@ -492,7 +496,8 @@ def run_daemon(binary, config, body):
     daemon = Daemon(binary, config)
     failed_before = len(failures)
     try:
-        check(daemon.wait_for("listening on udp"), "daemon starts listening")
+        # loading the DGA model takes a few seconds in a debug build under a parallel ctest
+        check(daemon.wait_for("listening on udp", timeout=15), "daemon starts listening")
         check(daemon.wait_for("primed the root name servers"), "root priming succeeds")
         body(daemon)
     finally:
@@ -769,7 +774,119 @@ def blocking_listed_names(binary, servers, tmp):
     run_daemon(binary, write_config(tmp, policy=policy), body)
 
 
+def streaming_events_and_taking_rules(binary, servers, tmp):
+    """The event bus to the slow path, and its way back to the policy engine (README §6.2, §7.6.6)."""
+    path = os.path.join(tmp, "run", "events.sock")
+    telemetry = f"  events:\n    socket: {path}\n"
+
+    def body(daemon):
+        check(any(f"event stream on {path}" in line for line in daemon.log), "startup log names the event socket")
+        reader = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        reader.connect(path)
+        reader.settimeout(3)
+        buffer = b""
+
+        def next_line():
+            nonlocal buffer
+            while b"\n" not in buffer:
+                buffer += reader.recv(65536)
+            line, buffer = buffer.split(b"\n", 1)
+            return json.loads(line)
+
+        def command(obj):
+            reader.sendall((json.dumps(obj) + "\n").encode())
+            return next_line()
+
+        r = ask("www.example.lab")
+        check(r.answers == [("www.example.lab.", A, "192.0.2.1")], "a query is answered as usual")
+        event = next_line()
+        check(event.get("type") == "query" and event.get("qname") == "www.example.lab" and event.get("qtype") == "A"
+              and event.get("rcode") == "NOERROR" and event.get("answers") == 1 and event.get("client") == "127.0.0.1"
+              and event.get("action") == "answer" and event.get("response_size", 0) > 0,
+              "...and its event reaches the reader: name, type, rcode, answers, size, client, what decided")
+
+        reply = command({"op": "add_rule", "domain": "example.lab", "client": "127.0.0.1", "ttl": 60,
+                         "reason": "tunnel", "score": 0.99, "source": "e2e"})
+        check(reply.get("ok") and reply.get("id") == 1 and reply.get("ttl") == 60, "the reader can add a dynamic rule")
+        check(daemon.wait_for("dynamic rule added, rule 1: example.lab and below for 127.0.0.1/32 "
+                              "(tunnel, score 0.990, from e2e), for 60 s"), "...which the daemon logs")
+        before = len(servers.seen)
+        r = ask("data1234.www.example.lab")
+        check(r.rcode == NXDOMAIN and not r.answers, "a name under it gets NXDOMAIN")
+        check(len(servers.seen) == before, "...without any upstream query")
+        event = next_line()
+        check(event.get("action") == "dynamic_rule" and "example.lab for 127.0.0.1/32 (tunnel" in event.get("rule", ""),
+              "...and its event says which rule answered")
+        rules = command({"op": "list_rules"})
+        check(rules.get("ok") and [rule.get("domain") for rule in rules.get("rules", [])] == ["example.lab"]
+              and rules["rules"][0].get("hits") == 1, "list_rules shows it, with its hit")
+        check(command({"op": "remove_rule", "id": 1}).get("ok"), "the reader can remove it")
+        r = ask("www.example.lab")
+        check(r.answers == [("www.example.lab.", A, "192.0.2.1")], "...and the name resolves again")
+        next_line()
+        check(command({"op": "drop_everything"}).get("ok") is False, "an unknown command is refused")
+        reader.close()
+
+    log = run_daemon(binary, write_config(tmp, telemetry=telemetry), body)
+    check(any("dynamic rules since startup: 1 added, 1 queries answered under them, 0 still in force" in line
+              for line in log), "the daemon sums up the rules at exit")
+    check(any("event stream since startup: 1 readers, 3 events published, 0 lost by readers that fell behind, "
+              "4 commands" in line for line in log), "...and the event stream")
+    check(not os.path.exists(path), "...and removes its socket")
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
+
+
+def logging_and_counting_queries(binary, servers, tmp):
+    """The query log and the Prometheus endpoint (README §7.10)."""
+    logs = os.path.join(tmp, "querylog")
+    telemetry = (f'  prometheus:\n    addr: "127.0.0.1:{METRICS_PORT}"\n'
+                 f"  query_log:\n    enabled: true\n    path: {logs}/queries.jsonl\n")
+
+    def scrape(path="/metrics"):
+        connection = http.client.HTTPConnection("127.0.0.1", METRICS_PORT, timeout=3)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read().decode()
+        connection.close()
+        return response.status, response.getheader("Content-Type"), body
+
+    def value(text, sample):
+        for line in text.splitlines():
+            if line.startswith(sample + " "):
+                return float(line.rsplit(" ", 1)[1])
+        return None
+
+    def body(daemon):
+        check(any(f"metrics http://127.0.0.1:{METRICS_PORT}/metrics" in line for line in daemon.log),
+              "startup log names the metrics endpoint")
+        check(any(f"query log: {logs}/queries-YYYY-MM-DD.jsonl, a file per UTC day, kept 7 days" in line
+                  for line in daemon.log), "...and the query log")
+        ask("www.example.lab")
+        ask("www.example.lab")  # from the cache
+        ask("nothing.example.lab")
+        status, kind, text = scrape()
+        check(status == 200 and kind.startswith("text/plain; version=0.0.4"), "GET /metrics answers in Prometheus' format")
+        answered = 'dnsentinel_queries_total{transport="udp",qtype="A",rcode="NOERROR",action="answer"}'
+        check(value(text, answered) == 2, "...counting queries by transport, type, rcode and action")
+        check(value(text, answered.replace("NOERROR", "NXDOMAIN")) == 1, "...NXDOMAIN apart")
+        check(value(text, "dnsentinel_query_duration_seconds_count") == 3
+              and value(text, 'dnsentinel_query_duration_seconds_bucket{le="+Inf"}') == 3, "...with their latency")
+        check((value(text, "dnsentinel_cache_hits_total") or 0) >= 1
+              and (value(text, "dnsentinel_upstream_queries_total") or 0) >= 1, "...and the cache's and resolver's counters")
+        check(value(text, "dnsentinel_query_log_dropped_total") == 0, "...and the query log's")
+        check(scrape("/")[0] == 404, "other paths are 404")
+
+    log = run_daemon(binary, write_config(tmp, telemetry=telemetry), body)
+    files = sorted(f for f in os.listdir(logs) if f.startswith("queries-")) if os.path.isdir(logs) else []
+    lines = [json.loads(line) for f in files for line in open(os.path.join(logs, f))]
+    check(len(files) == 1 and len(lines) == 3, "the query log has a line per query, in today's file")
+    check([line.get("qname") for line in lines] == ["www.example.lab", "www.example.lab", "nothing.example.lab"]
+          and lines[2].get("rcode") == "NXDOMAIN" and lines[0].get("client") == "127.0.0.1",
+          "...the same lines as the event stream")
+    check(any("query log since startup: 3 lines written, 0 lost because the disk fell behind" in line for line in log),
+          "the daemon sums up the query log at exit")
 
 
 def reexec_in_netns():
@@ -891,7 +1008,8 @@ def main():
         for scenario in (resolving_from_the_root, resolving_a_stub_zone,
                          refusing_clients_outside_the_allowed_subnets, rate_limiting_a_flood, blocking_listed_names,
                          serving_stale_during_an_outage, answering_over_tls, answering_over_https,
-                         flagging_generated_names, rejecting_a_bad_config):
+                         flagging_generated_names, streaming_events_and_taking_rules, logging_and_counting_queries,
+                         rejecting_a_bad_config):
             print(scenario.__name__.replace("_", " ") + ":")
             try:
                 scenario(binary, servers, tmp)
